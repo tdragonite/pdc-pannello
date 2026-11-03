@@ -1,7 +1,7 @@
 # Pannello pompa di calore (Samsung EHS) – guida completa
 
-Un pannello web **solo da guardare** (non comanda niente) per la tua pompa di calore Samsung EHS e per lo Smarther 2, che gira sul tuo PC.
-Ha tre pagine (**Dashboard**, **Analisi**, **Efficienza**), una pagina **Impostazioni**, funziona bene su iPhone, ti avvisa su Telegram se qualcosa non va e, se vuoi, lo raggiungi anche da fuori casa.
+Un pannello web per la tua pompa di calore Samsung EHS e per lo Smarther 2, che gira sul tuo PC. **Legge e mostra** tutto (dati, storico, efficienza) e **comanda solo tre cose**: accendere/spegnere riscaldamento, acqua calda e Smarther (dietro un lucchetto, vedi «Accendere e spegnere dal pannello»). Non cambia nessuna impostazione della pompa.
+Ha le pagine **Dashboard**, **Analisi**, **Efficienza**, **Dispositivi** e **Impostazioni** (più il **Changelog**), funziona bene su iPhone, ti avvisa su Telegram se qualcosa non va e, se vuoi, lo raggiungi anche da fuori casa.
 
 Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla oltre a Python. Dati, impostazioni e log stanno nelle sottocartelle della cartella dello script (vedi «Come è organizzata la cartella» nel capitolo 14).
 
@@ -25,6 +25,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 14. [Manutenzione, backup, aggiornamenti](#14-manutenzione-backup-aggiornamenti)
 15. [Se qualcosa non va](#15-se-qualcosa-non-va)
 16. [Sicurezza: cosa è bene sapere](#16-sicurezza-cosa-è-bene-sapere)
+17. [Per chi modifica il codice](#17-per-chi-modifica-il-codice)
 
 ---
 
@@ -65,7 +66,7 @@ Prima di collegare qualsiasi cosa puoi vedere com'è fatto:
 python pdc_pannello.py --demo --porta 7010
 ```
 
-Apri `http://localhost:7010`: trovi 30 giorni di dati inventati, senza password. Premi `Ctrl+C` per chiudere. Non tocca niente di vero (usa un suo file `demo.db`).
+Apri `http://localhost:7010`: trovi 30 giorni di dati inventati, senza password. Premi `Ctrl+C` per chiudere. Non tocca niente di vero (usa un suo file, `dati\demo.db`).
 
 ---
 
@@ -75,7 +76,7 @@ Ci sono due modi per dare accesso al pannello. Puoi preparare tutti e due: **se 
 
 ### 4a. Trovare l'ID della pompa
 
-1. Vai su <https://account.smartthings.com/tokens> → *Generate new token*. Dagli un nome e spunta i permessi **Devices → List all devices** e **See all devices**. Copia il token (si vede una volta sola).
+1. Vai su <https://account.smartthings.com/tokens> → *Generate new token*. Dagli un nome e spunta i permessi **Devices → List all devices** e **See all devices** (se vuoi anche i comandi dal pannello, spunta pure **Control all devices**). Copia il token (si vede una volta sola).
 2. Aprilo in `config.json`, sezione `smartthings`, e incollalo in `"pat"`.
 3. Lancia:
    ```
@@ -94,7 +95,7 @@ Più lungo da preparare, ma poi non ci pensi più.
 > **Due avvertenze oneste.** Samsung ha detto che l'accesso OAuth alle API non sarà più gratuito; non so cosa succeda in concreto: potrebbe non funzionare o chiederti di pagare. Se la creazione dell'app fallisce, resta il PAT. E il *refresh token* è **monouso**: a ogni rinnovo ne arriva uno nuovo e il vecchio muore. Il pannello lo riscrive subito in `config.json`: per questo **non far girare due copie del pannello con lo stesso `config.json`** e non tenere il file aperto nel Blocco note mentre il pannello lavora.
 
 1. Installa la SmartThings CLI (Windows: installer dalla pagina *Releases* di <https://github.com/SmartThingsCommunity/smartthings-cli>; oppure, se hai Node.js, `npm install -g @smartthings/cli`).
-2. Lancia `smartthings apps:create` e rispondi: tipo **OAuth-In App**, nome a piacere, permessi (*scopes*) **`r:devices:*`**, Redirect URI **`https://httpbin.org/get`** (identico), il resto vuoto. Alla fine ti dà **Client ID** e **Client Secret**: il secret si vede **una volta sola**, copialo subito.
+2. Lancia `smartthings apps:create` e rispondi: tipo **OAuth-In App**, nome a piacere, permessi (*scopes*) **`r:devices:*`** (lettura) e, se vuoi accendere/spegnere dal pannello, anche **`x:devices:*`** (comandi), Redirect URI **`https://httpbin.org/get`** (identico), il resto vuoto. Alla fine ti dà **Client ID** e **Client Secret**: il secret si vede **una volta sola**, copialo subito.
 3. Lancia:
    ```
    python pdc_strumenti.py st-oauth
@@ -109,7 +110,7 @@ Più lungo da preparare, ma poi non ci pensi più.
 Serve per temperatura, umidità e richiesta di calore di casa.
 
 1. Vai su <https://dev.netatmo.com> → *My apps* → la tua app → *Token generator*.
-2. Spunta gli **scope** dello Smarther/BTicino/termostato (se non li trovi, tutti quelli di lettura) e genera il token. *Rigenerare i token invalida quelli vecchi.*
+2. Spunta gli **scope** dello Smarther/BTicino: **`read_smarther`** per leggere e, se vuoi accendere/spegnere dal pannello, anche **`write_smarther`**. Genera il token. *Rigenerare i token invalida quelli vecchi.*
 3. In `config.json`, sezione `netatmo`, compila `client_id`, `client_secret`, `access_token`, `refresh_token`. Lascia vuoti `home_id` e `room_id`: il pannello trova la casa da solo e, se `room_id` è vuoto usa la prima stanza che trova. (Con più stanze scrivi in `room_id` l'ID di quella dello Smarther: lo trovi con `python pdc_strumenti.py nt-dump`.)
 4. Anche qui il *refresh token* ruota a ogni rinnovo e il pannello lo riscrive da solo: valgono le stesse avvertenze di sopra (una sola copia, file non aperto).
 
@@ -210,7 +211,6 @@ Tutte le anomalie compaiono sempre anche nel pannello (banner in alto); qui deci
 | `mandata_lontana` | mandata a più di 8 °C dalla curva climatica per 40 minuti |
 | `acs_bassa` | acqua calda sotto 35 °C per 30 minuti |
 | `cop_basso` | COP stimato delle ultime 24 ore sotto 2 |
-| `resistenza_accesa` | resistenza elettrica accesa da 30 minuti |
 | `sbrinamenti_frequenti` | 6 o più sbrinamenti in 3 ore |
 
 **Le soglie sono un punto di partenza, non verità**: dopo qualche settimana guardale con i tuoi dati e ritoccale.
@@ -263,7 +263,7 @@ Cose da sapere:
 
 - Da casa: apri su Safari l'indirizzo `http://192.168.…:7000` che il pannello ha stampato (il telefono deve essere sul wifi di casa). Da fuori: l'indirizzo Cloudflare.
 - Per averlo come un'app: in Safari tocca *Condividi* → *Aggiungi alla schermata Home*. Si apre a schermo intero, con la sua icona.
-- Su telefono i comandi sono in basso (Dashboard, Analisi, Efficienza, Impostazioni, Esci). Nei grafici di Analisi **tocca** per leggere i valori: sono sincronizzati.
+- Su telefono i comandi sono in basso (Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni). Nei grafici di Analisi **tocca** per leggere i valori: sono sincronizzati.
 - Aperto da internet, il pannello usa la connessione protetta (HTTPS) di Cloudflare; da casa è normale HTTP sulla tua rete.
 
 ---
@@ -271,13 +271,18 @@ Cose da sapere:
 ## 11. Come leggere le pagine
 
 **Dashboard** (intervalli 6h / 24h / personalizzato)
-Riscaldamento (mandata, ritorno, ΔT), acqua calda sanitaria, temperatura esterna, energia (e, se hai messo il prezzo, il costo), casa (temperatura, umidità, richiesta di calore dello Smarther), la **linea del tempo** di cosa ha fatto la pompa (casa / acqua calda / riposo), lo stato del sistema (valvola, resistenza, sbrinamento…), i valori di compressore e circuito e la **curva climatica** con i tuoi punti reali.
+Riscaldamento (mandata, ritorno, ΔT), acqua calda sanitaria, temperatura esterna, energia (e, se hai messo il prezzo, il costo), casa (temperatura, umidità, richiesta di calore dello Smarther), la **linea del tempo** di cosa ha fatto la pompa (casa / acqua calda / riposo), lo stato del sistema con gli interruttori (vedi sotto), la scheda **Compressore e circuito** (quando il compressore è fermo mostra «Fermo» e i dati dell'ultimo ciclo: per cosa ha lavorato, quanto è durato, quanta energia ha usato) e la **curva climatica** con i tuoi punti reali.
 
-> **Il compressore arriva in ritardo.** SmartThings consegna i dati del compressore (Hz, pompa, portata) a blocchi di 5 minuti, con qualche minuto di ritardo. Nella scheda *Compressore e circuito* il pannello scrive «dato di N min fa» (in giallo se più di 20). Per non dire «A riposo» mentre la pompa sta partendo, quando il compressore non è ancora arrivato il pannello guarda anche la **temperatura dell'acqua dell'impianto**, che invece è in tempo reale: se sale di almeno 3 °C in 15 minuti, la pompa sta scaldando verso dove punta la valvola (casa o bollitore). Se il compressore smette, lo stato precedente si tiene al massimo 10 minuti. Sotto i valori il pannello scrive anche il **ritardo tipico e massimo** con cui i dati sono arrivati nelle ultime 24 ore (lo misura da solo, dal momento in cui è stato aggiornato in poi).
+> **Il compressore arriva in ritardo.** SmartThings consegna i dati del compressore (Hz, pompa, portata) a blocchi di 5 minuti, con almeno 4-5 minuti di ritardo. Nella scheda *Compressore e circuito* il pannello scrive «dato di N min fa» (in giallo se più di 20) e, sotto, il **ritardo tipico e massimo** misurato nelle ultime 24 ore.
+> Per non dire «A riposo» mentre la pompa sta partendo, né «Riscaldamento» quando si è già fermata, l'indicatore e la linea del tempo guardano anche cose **in tempo reale**: la **temperatura dell'acqua dell'impianto** e la **richiesta di calore dello Smarther**.
+> - *Parte*: l'acqua sale di almeno 1,5 °C in 7 minuti ed è vicina al suo massimo recente → la pompa sta scaldando verso dove punta la valvola (casa o bollitore).
+> - *Si ferma*: l'acqua crolla di almeno 5 °C su due letture di fila, oppure scende di almeno 2 °C mentre lo Smarther ha smesso di chiedere calore. I crolli subito dopo un cambio di valvola (da acqua calda a casa, per esempio) sono normali e si ignorano. Con la pompa in marcia l'acqua oscilla di 2-3 °C: un calo piccolo non basta.
+> - *Campioni «fantasma»*: ogni tanto SmartThings consegna un campione con il compressore acceso mentre l'acqua misurata nello stesso momento dice che è ferma da minuti (la mandata del campione è a più di 5 °C dall'acqua). Questi campioni vengono scartati dall'indicatore e dalla linea del tempo; nei grafici di Analisi restano, perché mostrano i dati così come arrivano.
+> Resta comunque un ritardo di pochi minuti nei momenti di cambio, ed è normale.
 Si aggiorna da sola mentre è aperta: il pallino in alto è verde se i dati sono freschi, giallo se il tempo reale non è collegato o i dati sono vecchi, rosso se c'è un problema.
 
 **Analisi** (6h / 24h / personalizzato)
-I grafici nel dettaglio: temperature, casa, umidità, compressore, potenza, portata, pompa, gas. Le fasce colorate dietro le linee dicono quando scaldava la casa (rosso) o l'acqua (blu).
+I grafici nel dettaglio: temperature, casa (con una striscia rossa quando lo Smarther chiede calore), umidità, potenza, gas di scarico e un unico grafico **Compressore, portata e pompa** (frequenza e target in Hz, pompa in %, portata in L/min su un secondo asse a destra). Le fasce colorate dietro le linee dicono quando scaldava la casa (rosso) o l'acqua (blu). Il grafico mostra i dati di SmartThings così come arrivano, senza correzioni.
 
 **Efficienza** (3 / 7 / 28 giorni)
 COP, energia elettrica, calore prodotto, ore di lavoro, energia e COP giorno per giorno, COP in base alla temperatura esterna e i cicli (numero, durata, quanti troppo brevi).
@@ -292,7 +297,7 @@ La scheda **Salute del bollitore** stima quanto calore perde l'acqua calda di no
 Una scheda per la pompa di calore e una per lo Smarther: identità e modello, **versioni** (firmware del modulo Wi-Fi, software e firmware delle schede della pompa, firmware dello Smarther), identificativi con il pulsante **Copia**, **IP e MAC**, stato Online/Offline e qualità del Wi-Fi dello Smarther. In fondo c'è lo **storico delle versioni**: il pannello segna ogni volta che una versione cambia (per esempio se SmartThings aggiorna la pompa senza dirtelo). Le date partono da quando il pannello ha iniziato a guardare.
 - **IP e MAC**: SmartThings non comunica l'IP della pompa. Scrivilo in *Impostazioni → Dispositivi* (insieme a quello dello Smarther): il pannello ricava il MAC leggendo la tabella di rete del PC. Per lo Smarther il MAC è già l'identificativo del modulo Netatmo. Se non lo trova, la pagina te lo dice.
 - **Modello dello Smarther**: Netatmo dice solo "BNS". In *Impostazioni → Dispositivi* scegli l'articolo che hai (XW8002, XM8002, XG8002 o XW8002W): comparirà anche installazione e colorazione. I dati tecnici sono quelli del catalogo BTicino.
-- **Installatore** (la scheda accanto a *Dispositivi*, indirizzo `#/dispositivi/installatore`): l'elenco, in sola lettura, delle impostazioni installatore (i codici FSV del manuale: curva climatica, acqua calda, riscaldamento…) che la pompa comunica tramite SmartThings, raggruppate per menu, ognuna con il suo nome in italiano. Il pannello non può modificare nulla. Sotto ogni valore c'è l'intervallo ammesso dal manuale Samsung EHS Mono (può cambiare da modello a modello); se un valore ne esce compare «fuori limiti». Se un valore cambia mentre il pannello è acceso, sotto compare quando e quanto valeva prima. *Copia elenco* mette tutto negli appunti, comodo da mandare all'installatore. I codici che la pompa manda e che non conosco compaiono in fondo come «Altri codici», col solo valore.
+- **Installatore** (la scheda accanto a *Dispositivi*, indirizzo `#/dispositivi/installatore`): l'elenco, in sola lettura, delle impostazioni installatore (i codici FSV del manuale: curva climatica, acqua calda, riscaldamento…) che la pompa comunica tramite SmartThings, raggruppate per menu, ognuna con il suo nome in italiano. Il pannello non modifica nessuna di queste impostazioni. Sotto ogni valore c'è l'intervallo ammesso dal manuale Samsung EHS Mono (può cambiare da modello a modello); se un valore ne esce compare «fuori limiti». Se un valore cambia mentre il pannello è acceso, sotto compare quando e quanto valeva prima. *Copia elenco* mette tutto negli appunti, comodo da mandare all'installatore. I codici che la pompa manda e che non conosco compaiono in fondo come «Altri codici», col solo valore.
 - **Loghi**: non li fornisce il pannello. Crea (se non c'è) la cartella **`dati\loghi`** accanto a `pdc_pannello.py` e mettici i tuoi file con questi nomi: `smarther.svg`, `samsung.svg`, `netatmo.svg`, `bticino.svg` (vanno bene anche `.png`, `.webp`, `.jpg`). Compaiono nelle schede e il logo Smarther anche sulla Dashboard. Se un file non c'è si vede il nome scritto. Se un logo è scuro e si perde sul tema scuro, attiva *Mostra i loghi in bianco* in *Impostazioni → Dispositivi*.
 
 **Changelog**
@@ -300,7 +305,7 @@ La cronologia delle versioni, scritta in italiano semplice, con la più recente 
 
 **Impostazioni**
 Divisa in sei tab, con i riquadri che si aprono e si chiudono con un tocco (il pannello ricorda come li hai lasciati):
-- **Stato**: versione, collegamenti, token, database.
+- **Stato**: versione, collegamenti, token, database, aggiornamento a caldo.
 - **Collegamenti**: SmartThings e Netatmo (ID e token), intervalli di lettura, dispositivi (IP, modello, loghi).
 - **Avvisi**: Telegram, silenzio notturno e riepilogo, testi dei messaggi, soglie di ogni allarme.
 - **Accesso**: password del pannello e accesso da internet (Cloudflare, con il pulsante che ti manda il link su Telegram).
@@ -387,7 +392,7 @@ Le modifiche valgono quasi tutte **subito**; fanno eccezione porta, host e inter
 - **Backup automatico:** ogni notte (tra le 3 e le 6; se il pannello era spento, al primo avvio utile) il pannello copia il database e `config.json` nella cartella **`backup`** accanto allo script, con la data nel nome, e tiene le ultime 7 copie. La copia è coerente anche mentre il pannello lavora. Per farla subito: `python pdc_pannello.py backup`. **Attenzione:** la copia sta sullo stesso computer (e `config.json` contiene password e token): ogni tanto copia la cartella su un altro disco o nel cloud, e non condividerla. **Per ripristinare:** ferma il pannello e lancia `python pdc_pannello.py ripristina`: elenca le copie (con data e dimensione), scegli il numero e scrivi SI. Il database attuale viene prima messo da parte nella cartella `backup` (`prima-del-ripristino-…`). Se c'è anche il `config.json` di quel giorno, ti chiede se rimetterlo: di solito conviene di no, perché i token rinnovabili di una copia vecchia possono essere già scaduti.
 - **Registro:** in *Impostazioni → Registro* vedi le ultime righe del registro del pannello (password e token sono nascosti), le dimensioni di database e log e quando è stato fatto l'ultimo backup.
 - **Backup a mano:** copia, **a pannello fermo**, `config.json` e `dati\pdc.db` (e le loro copie `pdc.db-wal`/`pdc.db-shm` se esistono). Basta questo per spostare tutto su un altro PC.
-- **Aggiornare lo script:** ferma il pannello, sostituisci `pdc_pannello.py`, riavvia. `config.json` e lo storico restano; le nuove impostazioni vengono aggiunte da sole.
+- **Aggiornare lo script:** ferma il pannello, sostituisci `pdc_pannello.py`, riavvia. `config.json` e lo storico restano; le nuove impostazioni vengono aggiunte da sole. (Dalla 0.17 c'è anche l'aggiornamento senza fermare la raccolta, qui sotto.)
 - **Spostare su un altro PC:** copia l'intera cartella; se usi Cloudflare ricontrolla il tunnel dalle Impostazioni.
 - **Log:** `log\pdc_pannello.log` (si ruota da solo) e `log\cloudflared.log`.
 - **Aggiornare senza fermare la raccolta (da 0.17):** sostituisci `pdc_pannello.py` **senza riavviare**, poi vai in *Impostazioni → Stato → Aggiornamento*. Il pannello confronta il file nuovo con quello in uso e ti dice cosa è cambiato:
@@ -405,7 +410,7 @@ Le modifiche valgono quasi tutte **subito**; fanno eccezione porta, host e inter
     log\                   pdc_pannello.log, cloudflared.log
     diagnostica\           i file da mandare a chi ti aiuta: diagnostica.json e i dump di pdc_strumenti.py
     cloudflared\           il programma del tunnel e il suo pid
-    docs\                  README.md e PIANO.md (se li vuoi tenere qui)
+    docs\                  README.md, PIANO.md, README_STRUMENTI.md (se li vuoi tenere qui)
   ```
   Se aggiorni da una versione precedente alla 0.16, al primo avvio il pannello sposta da solo database, backup, loghi e log nei posti nuovi e aggiorna `config.json` (solo se avevi i percorsi di prima). Se è acceso un'altra copia, o esistono due database, non sposta niente e te lo dice.
 
@@ -422,7 +427,7 @@ Le modifiche valgono quasi tutte **subito**; fanno eccezione porta, host e inter
 | “Non riesco ad aprire la porta web” | Un altro programma usa la 7000: cambia `generale.porta` in `config.json`. |
 | Non ricordo la password | `python pdc_pannello.py imposta-password` (a pannello fermo). |
 | SmartThings 401 | Token personale scaduto (dura 24 ore): generane uno nuovo, oppure configura OAuth. |
-| SmartThings 403 | Al token mancano i permessi (devices: list e see). |
+| SmartThings 403 | Al token mancano i permessi (devices: list e see; per i comandi anche control / `x:devices:*`). |
 | SmartThings 429 | Troppe richieste: alza `intervallo_pdc_secondi`. |
 | SmartThings 402/“a pagamento” | Il servizio potrebbe essere diventato a pagamento: guarda il messaggio nella Dashboard. |
 | “Pompa offline” | La pdc non risulta connessa a SmartThings (wifi/modulo): controlla nell'app SmartThings. |
@@ -443,3 +448,15 @@ Le modifiche valgono quasi tutte **subito**; fanno eccezione porta, host e inter
 - **`config.json` è riservato**: contiene token SmartThings/Netatmo, il token del bot Telegram e quello del tunnel. Non condividerlo, non metterlo in cartelle sincronizzate pubblicamente.
 - Se pubblichi il pannello su internet, scegli una password lunga e unica. Per una protezione in più puoi aggiungere **Cloudflare Access** (Zero Trust) davanti all'indirizzo: è gratuito per pochi utenti ed è un secondo lucchetto prima ancora di arrivare al login.
 - Il COP, le soglie degli allarmi e le fasce di funzionamento sono **stime ragionevoli, non misure certificate**: servono per capire le tendenze e accorgersi dei guasti, non per diagnosi tecniche.
+
+---
+
+## 17. Per chi modifica il codice
+
+Il programma che avvii (`pdc_pannello.py`) è un file **generato**. I sorgenti veri stanno in `sorgenti/` (una parte per argomento: nucleo, web, Telegram, impostazioni, Cloudflare, manutenzione, dispositivi, controlli, aggiornamento, comandi; in `sorgenti/web/` pagine, stile e script). Per rigenerarlo:
+
+```
+python costruisci.py
+```
+
+Le note tecniche versione per versione (cosa è cambiato, perché, come è fatto il database, come si leggono i dati grezzi) sono in `PIANO.md`. Gli strumenti di appoggio (dump SmartThings/Netatmo, OAuth, esperimenti) sono in `pdc_strumenti.py`, descritti in `README_STRUMENTI.md`.

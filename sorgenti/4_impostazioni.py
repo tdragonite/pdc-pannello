@@ -36,7 +36,6 @@ DESCRIZIONI_ALLARME = {
     "mandata_lontana": "La mandata è lontana da quella prevista dalla curva climatica.",
     "acs_bassa": "L'acqua calda sanitaria è troppo fredda.",
     "cop_basso": "L'efficienza stimata (COP) è bassa.",
-    "resistenza_accesa": "La resistenza elettrica è accesa a lungo (consuma molto).",
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
 }
 

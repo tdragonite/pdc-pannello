@@ -138,10 +138,6 @@
       "sotto": 2.0,
       "ore_minime": 3
     },
-    "resistenza_accesa": {
-      "attivo": true,
-      "minuti": 30
-    },
     "sbrinamenti_frequenti": {
       "attivo": true,
       "quanti": 6,
