@@ -1,0 +1,530 @@
+{
+  "_nota": "File di configurazione: modificalo con il Blocco note e salva; la maggior parte delle modifiche vale subito, senza riavviare. Non condividerlo mai (contiene password e token).",
+  "generale": {
+    "porta": 7000,
+    "host": "0.0.0.0",
+    "porta_lock": 7099,
+    "intervallo_pdc_secondi": 60,
+    "intervallo_netatmo_secondi": 120,
+    "database": "dati/pdc.db",
+    "sessione_giorni": 30
+  },
+  "bollitore": {
+    "_nota": "Litri del bollitore dell'acqua calda: servono solo a stimare in watt la perdita di calore (pagina Efficienza).",
+    "litri": 300
+  },
+  "umidita": {
+    "_nota": "Umidita' in casa (dallo Smarther). Sopra 'giallo' compare il giallo in Dashboard e parte l'avviso Telegram 'Umidita' alta'; sopra 'rosso' il rosso e l'avviso 'molto alta'. Telegram scrive solo se la soglia resta superata per 'minuti'. L'avviso rientra quando scende di 'rientro_punti' sotto la soglia.",
+    "giallo": 60.0,
+    "rosso": 70.0,
+    "minuti": 30,
+    "rientro_punti": 2.0
+  },
+  "tariffa": {
+    "_nota": "Prezzo dell'energia elettrica in euro per kWh (con le tasse, per esempio 0.28). 0 = non mostrare i costi.",
+    "prezzo_kwh": 0.0
+  },
+  "accesso": {
+    "_nota": "Scrivi utente e password in chiaro qui, al prossimo avvio vengono trasformati in un hash e la password in chiaro viene cancellata. Oppure: python pdc_pannello.py imposta-password",
+    "utente": "",
+    "password": "",
+    "password_hash": ""
+  },
+  "smartthings": {
+    "device_id": "",
+    "pat": "",
+    "oauth": {
+      "client_id": "",
+      "client_secret": "",
+      "access_token": "",
+      "refresh_token": "",
+      "expires_at": 0
+    }
+  },
+  "netatmo": {
+    "client_id": "",
+    "client_secret": "",
+    "access_token": "",
+    "refresh_token": "",
+    "expires_at": 0,
+    "home_id": "",
+    "room_id": ""
+  },
+  "dispositivi": {
+    "_nota": "Facoltativo. Gli IP servono solo per mostrare l'IP e ricavare il MAC nella pagina Dispositivi. I loghi si mettono nella cartella 'dati/loghi' (smarther.svg, samsung.svg, ...).",
+    "ip_pdc": "",
+    "ip_smarther": "",
+    "modello_smarther": "",
+    "loghi_bianchi": false
+  },
+  "telegram": {
+    "_nota": "Puoi scrivere bot_token e chat_id qui, OPPURE indicare un tuo file .json che li contiene (file_credenziali, con i nomi delle chiavi). Prova: python pdc_pannello.py telegram-prova",
+    "abilitato": true,
+    "bot_token": "",
+    "chat_id": "",
+    "file_credenziali": "",
+    "chiave_token": "bot_token",
+    "chiave_chat": "chat_id",
+    "nome_impianto": "Pompa di calore",
+    "promemoria_ore": 6,
+    "max_messaggi_ora": 20,
+    "silenzio_notturno": {
+      "attivo": false,
+      "da": "23:00",
+      "a": "07:00",
+      "anche_errori": false,
+      "oscillazione_gradi": 2.0
+    },
+    "riepilogo_mattina": {
+      "attivo": false,
+      "ora": "08:00"
+    },
+    "messaggi": {
+      "_nota": "Testi dei messaggi Telegram (HTML semplice: <b>grassetto</b>, <i>corsivo</i>). Segnaposto: {impianto} {testo} {titolo} {codice} {ora} {data} {durata}. Per cambiare il testo di UN solo allarme usa per_codice, es.: \"per_codice\": {\"casa_fredda\": {\"apertura\": \"Brrr! {testo}\"}}",
+      "apertura_errore": "🚨 <b>{impianto}</b>\n{testo}\n<i>dalle {ora}</i>",
+      "apertura_avviso": "⚠️ <b>{impianto}</b>\n{testo}\n<i>dalle {ora}</i>",
+      "ripristino": "✅ <b>{impianto}</b>\n{titolo}: tutto di nuovo regolare.\n<i>il problema è durato {durata}</i>",
+      "promemoria": "⏰ <b>{impianto}</b>\nCi siamo ancora: {testo}\n<i>da {durata}</i>",
+      "riepilogo": "☀️ <b>{impianto} · ieri, {data}</b>\n⚡ Energia: <b>{energia} kWh</b> · COP <b>{cop}</b>\n🔥 Casa {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli casa)\n🏠 In casa {casa_min}–{casa_max} °C · fuori {esterna} °C\n{anomalie}",
+      "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
+      "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
+      "per_codice": {}
+    }
+  },
+  "allarmi": {
+    "_nota": "Ogni allarme si spegne con \"attivo\": false. I minuti sono 'da quanto tempo la condizione deve durare'. Per spegnere anche gli allarmi di collegamento aggiungi una voce col codice (o con * : \"st_conn_*\"): {\"attivo\": false}. Gli allarmi compaiono sempre anche nel pannello; qui decidi solo cosa va su Telegram.",
+    "nessun_dato": {
+      "attivo": true,
+      "minuti": 20
+    },
+    "pdc_ferma_con_richiesta": {
+      "attivo": true,
+      "minuti": 60
+    },
+    "casa_fredda": {
+      "attivo": true,
+      "sotto_gradi": 17.0,
+      "minuti": 30
+    },
+    "umidita_alta": {
+      "attivo": true
+    },
+    "umidita_molto_alta": {
+      "attivo": true
+    },
+    "cicli_brevi": {
+      "attivo": true,
+      "durata_minima_min": 10,
+      "quanti": 4,
+      "ore": 3
+    },
+    "portata_bassa": {
+      "attivo": true,
+      "sotto_lmin": 6.0,
+      "minuti": 15
+    },
+    "mandata_lontana": {
+      "attivo": true,
+      "scarto_gradi": 8.0,
+      "minuti": 40
+    },
+    "acs_bassa": {
+      "attivo": true,
+      "sotto_gradi": 35.0,
+      "minuti": 30
+    },
+    "cop_basso": {
+      "attivo": true,
+      "sotto": 2.0,
+      "ore_minime": 3
+    },
+    "resistenza_accesa": {
+      "attivo": true,
+      "minuti": 30
+    },
+    "sbrinamenti_frequenti": {
+      "attivo": true,
+      "quanti": 6,
+      "ore": 3
+    }
+  },
+  "cloudflare": {
+    "_nota": "Compilato dalla procedura guidata (Impostazioni > Accesso da internet). Il token del tunnel permette solo di far girare QUEL tunnel: tieni comunque config.json riservato.",
+    "attivo": false,
+    "avvio_automatico": true,
+    "hostname": "",
+    "nome_tunnel": "",
+    "tunnel_id": "",
+    "account_id": "",
+    "zone_id": "",
+    "tunnel_token": "",
+    "porta_servizio": 0,
+    "percorso_cloudflared": "",
+    "protocollo": "auto"
+  },
+  "mappa_ciclo": {
+    "_nota": "valore = (byte + offset) * scala. Fonte: guida di decodifica Dwellsee. Per disattivare un campo metti \"attivo\": false. Dopo ogni modifica: python pdc_pannello.py ridecodifica",
+    "outdoor_28": {
+      "freq_compressore": {
+        "byte": 0,
+        "tipo": "u16",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 200,
+        "nulli": [
+          65535
+        ],
+        "unita": "Hz",
+        "attivo": true
+      },
+      "freq_target": {
+        "byte": 2,
+        "tipo": "u16",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 200,
+        "nulli": [
+          65535
+        ],
+        "unita": "Hz",
+        "attivo": true
+      },
+      "scarico": {
+        "byte": 5,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 150,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "evaporazione": {
+        "byte": 6,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "esterna": {
+        "byte": 8,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -40,
+        "max": 60,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "aspirazione": {
+        "byte": 7,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      }
+    },
+    "outdoor_18": {
+      "freq_compressore": {
+        "byte": 0,
+        "tipo": "u16",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 200,
+        "nulli": [
+          65535
+        ],
+        "unita": "Hz",
+        "attivo": true
+      },
+      "freq_target": {
+        "byte": 2,
+        "tipo": "u16",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 200,
+        "nulli": [
+          65535
+        ],
+        "unita": "Hz",
+        "attivo": true
+      },
+      "scarico": {
+        "byte": 5,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 150,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "evaporazione": {
+        "byte": 6,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "esterna": {
+        "byte": 8,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -40,
+        "max": 60,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      }
+    },
+    "indoor_31": {
+      "ritorno": {
+        "byte": 2,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "mandata": {
+        "byte": 3,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "portata": {
+        "byte": 7,
+        "tipo": "u8",
+        "offset": 0,
+        "scala": 0.1,
+        "min": 0,
+        "max": 60,
+        "nulli": [
+          255
+        ],
+        "unita": "L/min",
+        "attivo": true
+      },
+      "vel_pompa": {
+        "byte": 8,
+        "tipo": "u8",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 100,
+        "nulli": [
+          255
+        ],
+        "unita": "%",
+        "attivo": true
+      },
+      "acs_ciclo": {
+        "byte": 27,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      }
+    },
+    "indoor_36": {
+      "ritorno": {
+        "byte": 2,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "mandata": {
+        "byte": 3,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "portata": {
+        "byte": 7,
+        "tipo": "u8",
+        "offset": 0,
+        "scala": 0.1,
+        "min": 0,
+        "max": 60,
+        "nulli": [
+          255
+        ],
+        "unita": "L/min",
+        "attivo": false
+      },
+      "vel_pompa": {
+        "byte": 8,
+        "tipo": "u8",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 100,
+        "nulli": [
+          255
+        ],
+        "unita": "%",
+        "attivo": true
+      }
+    },
+    "indoor_24": {
+      "evap_ingresso": {
+        "byte": 0,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "evap_uscita": {
+        "byte": 1,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "ritorno": {
+        "byte": 2,
+        "tipo": "u8",
+        "offset": -55,
+        "scala": 1,
+        "min": -20,
+        "max": 100,
+        "nulli": [
+          5,
+          255
+        ],
+        "unita": "°C",
+        "attivo": true
+      },
+      "portata": {
+        "byte": 7,
+        "tipo": "u8",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 60,
+        "nulli": [
+          255
+        ],
+        "unita": "L/min",
+        "attivo": true
+      },
+      "vel_pompa": {
+        "byte": 8,
+        "tipo": "u8",
+        "offset": 0,
+        "scala": 1,
+        "min": 0,
+        "max": 100,
+        "nulli": [
+          255
+        ],
+        "unita": "%",
+        "attivo": true
+      }
+    }
+  },
+  "conservazione": {
+    "_nota": "Gli ultimi 'dati_completi_giorni' giorni restano dettagliati (un punto al minuto circa). Più indietro il pannello tiene una media ogni 'media_minuti' minuti: i grafici vecchi restano, il file non cresce. Lo fa da solo, di notte. Su richiesta: python pdc_pannello.py compatta",
+    "dati_completi_giorni": 365,
+    "media_minuti": 15,
+    "elimina_dati_grezzi_ciclo": true
+  },
+  "backup": {
+    "_nota": "Ogni notte il pannello fa una copia del database (e di config.json) nella cartella indicata (di solito dati/backup) e tiene le ultime 'copie'. La copia e' sullo stesso computer: per essere al sicuro copia ogni tanto la cartella su un altro disco o nel cloud. Su richiesta: python pdc_pannello.py backup",
+    "attivo": true,
+    "cartella": "dati/backup",
+    "copie": 7
+  }
+}
