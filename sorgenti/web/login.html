@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f17">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="PDC">
+<link rel="apple-touch-icon" href="/icona.png">
+<link rel="icon" href="/icona.png">
+<title>Accesso · Pompa di calore</title>
+<link rel="stylesheet" href="/app.css?v={{build}}">
+</head>
+<body class="solo">
+<form class="accesso" method="post" action="/login" autocomplete="on">
+  <img src="/icona.png" alt="" width="72" height="72">
+  <h1>Pompa di calore</h1>
+  <p class="mut">Accedi per vedere i dati</p>
+  <label>Utente<input name="utente" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required autofocus></label>
+  <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+  <p class="errore">{{errore}}</p>
+  <button type="submit">Entra</button>
+</form>
+</body>
+</html>
