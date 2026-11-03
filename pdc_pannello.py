@@ -4488,7 +4488,6 @@ TITOLI = {
     "mandata_lontana": "Mandata lontana dalla curva",
     "acs_bassa": "Acqua calda sanitaria",
     "cop_basso": "Efficienza (COP)",
-    "resistenza_accesa": "Resistenza elettrica",
     "sbrinamenti_frequenti": "Sbrinamenti frequenti",
 }
 
@@ -4523,7 +4522,6 @@ ALLARMI_DEFAULT = {
     "mandata_lontana": {"attivo": True, "scarto_gradi": 8.0, "minuti": 40},
     "acs_bassa": {"attivo": True, "sotto_gradi": 35.0, "minuti": 30},
     "cop_basso": {"attivo": True, "sotto": 2.0, "ore_minime": 3},
-    "resistenza_accesa": {"attivo": True, "minuti": 30},
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
 }
 
@@ -4989,12 +4987,6 @@ class Sentinella(threading.Thread):
             self.imposta("acs_bassa", m >= float(r["minuti"]),
                          f"L'acqua calda è a {num_it(t)} °C (soglia {num_it(r['sotto_gradi'])} °C).")
 
-        if on("resistenza_accesa"):
-            r = al["resistenza_accesa"]
-            m = self.durata("resistenza", txt("pdc.resistenza") == "on", ora)
-            self.imposta("resistenza_accesa", m >= float(r["minuti"]),
-                         f"La resistenza elettrica è accesa da {round(m)} minuti: consuma molto più della pompa.")
-
         if on("sbrinamenti_frequenti"):
             r = al["sbrinamenti_frequenti"]
             da = ora - int(float(r["ore"]) * 3600)
@@ -5155,7 +5147,6 @@ DESCRIZIONI_ALLARME = {
     "mandata_lontana": "La mandata è lontana da quella prevista dalla curva climatica.",
     "acs_bassa": "L'acqua calda sanitaria è troppo fredda.",
     "cop_basso": "L'efficienza stimata (COP) è bassa.",
-    "resistenza_accesa": "La resistenza elettrica è accesa a lungo (consuma molto).",
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
 }
 

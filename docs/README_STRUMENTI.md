@@ -1,6 +1,6 @@
-# Strumenti di appoggio – primo passo
+# Strumenti di appoggio (pdc_strumenti.py)
 
-Questo piccolo script (`pdc_strumenti.py`) serve a **raccogliere i dati veri della tua pompa di calore e dello Smarther**, così il pannello definitivo parte giusto al primo colpo. Fa anche la procedura guidata per avere un token SmartThings che si rinnova da solo.
+Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
 
 Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
 
@@ -20,9 +20,9 @@ Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
 
 ---
 
-## 1. Dump SmartThings (obbligatorio)
+## 1. Dump SmartThings (quando serve capire cosa espone la pompa)
 
-Mi serve per sapere **esattamente come si chiamano** i valori della tua pdc (mandata, ritorno, portata, frequenza del compressore, curva climatica...). Lo script del repo GitHub ne mostra solo una parte.
+Serve a sapere **esattamente come si chiamano** i valori della tua pdc (mandata, ritorno, portata, frequenza del compressore, curva climatica...). Lo script del repo GitHub ne mostra solo una parte.
 
 1. Vai su <https://account.smartthings.com/tokens> → *Generate new token* → dagli un nome → spunta i permessi **Devices: List devices, See devices** → copia il token (si vede una sola volta).
 2. In `config.json`, nella sezione `smartthings`, incolla il token tra le virgolette di `"pat"`. Salva.
@@ -34,7 +34,7 @@ Mi serve per sapere **esattamente come si chiamano** i valori della tua pdc (man
    Il primo trova la pdc e salva il suo `device_id` nel config. Il secondo crea due file nella cartella **`diagnostica`** (accanto allo script):
    - `dump_smartthings_status.json`
    - `dump_smartthings_device.json`
-4. **Allegali in chat.** Sono già ripuliti dai dati personali (id del proprietario e del luogo).
+4. **Allegali a chi ti aiuta.** Sono già ripuliti dai dati personali (id del proprietario e del luogo).
 
 Il token personale (PAT) dura 24 ore, ma per il dump basta.
 
@@ -69,10 +69,10 @@ Se tutto va bene scrive i token in `config.json` e hai finito.
 
 ---
 
-## 3. Dump Netatmo / Smarther (obbligatorio per vedere temperatura e umidità di casa)
+## 3. Dump Netatmo / Smarther (per diagnosticare temperatura, umidità e richiesta di calore)
 
 1. Vai su <https://dev.netatmo.com> → *My apps* → la tua app → *Token generator*.
-2. **Seleziona gli scope** (permessi) che hanno a che fare con lo **Smarther / BTicino / thermostat**. Non so con certezza il nome esatto (forse qualcosa come `read_smarther`): se non li trovi, spunta tutti quelli di lettura. Poi *Generate token*.
+2. **Seleziona gli scope** (permessi) dello Smarther: **`read_smarther`** per leggere e, se vuoi accendere/spegnere dal pannello, anche **`write_smarther`**. Poi *Generate token*.
    > Rigenerare i token **invalida quelli vecchi**.
 3. In `config.json`, sezione `netatmo`, compila: `client_id`, `client_secret`, `access_token`, `refresh_token`. Salva.
 4. Lancia:
@@ -80,20 +80,24 @@ Se tutto va bene scrive i token in `config.json` e hai finito.
    python pdc_strumenti.py nt-dump
    ```
    Stampa gli scope che il token ha davvero, i valori di temperatura/setpoint/caldaia che trova e se trova l'**umidità**. Crea:
-   - `dump_netatmo_homesdata.json`
-   - `dump_netatmo_homestatus_1.json` (e `_2`, ... se hai più case)
+   - `diagnostica/dump_netatmo_homesdata.json`
+   - `diagnostica/dump_netatmo_homestatus_1.json` (e `_2`, ... se hai più case)
 5. **Allegali in chat.** Coordinate, città, email e indirizzi MAC sono già tolti, ma dai comunque un'occhiata con il Blocco note prima di mandarli.
 
 ---
 
-## 4. Cosa mandarmi
+## 4. Cosa mandare a chi ti aiuta
 
 | File | Obbligatorio |
 |---|---|
-| `dump_smartthings_status.json` | sì |
-| `dump_smartthings_device.json` | sì |
-| `dump_netatmo_homesdata.json` | sì (se vuoi lo Smarther) |
-| `dump_netatmo_homestatus_1.json` | sì (se vuoi lo Smarther) |
+Tutti i file stanno nella cartella `diagnostica` accanto allo script.
+
+| File | Quando |
+|---|---|
+| `dump_smartthings_status.json` e `dump_smartthings_device.json` | per capire cosa espone la pompa |
+| `dump_netatmo_homesdata.json` e `dump_netatmo_homestatus_1.json` | per lo Smarther |
+| `diagnostica.json` (lo crea il pannello con `python pdc_pannello.py esporta-diagnostica`) | per problemi sui dati o sull'indicatore |
+| `prova_refresh.json` | dopo `st-prova-refresh` |
 | `config.json` | **MAI** |
 
 ---
