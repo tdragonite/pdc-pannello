@@ -170,6 +170,7 @@ def schema_impostazioni():
                         "campi": campi})
     for s in sezioni:  # in quale tab della pagina sta ogni riquadro
         s["tab"] = TAB_SEZIONI.get(s["id"], "dati")
+    sezioni += sezioni_plugin()
     return sezioni, allarmi
 
 
@@ -250,10 +251,17 @@ def api_impostazioni(app, q):
     for s in sezioni + allarmi:
         for c in s["campi"]:
             v = _leggi_percorso(cfg, c["chiave"])
+            if v is None and c.get("default") is not None:
+                v = c["default"]
             if c["tipo"] == "segreto":
                 c["valore"], c["impostato"] = "", bool(v)
             else:
                 c["valore"] = v if v is not None else ("" if c["tipo"] in ("testo", "lungo", "ora", "scelta") else (False if c["tipo"] == "bool" else 0))
+    cf = cfg.get("cloudflare") or {}
+    base = f"https://{cf['hostname']}" if cf.get("tunnel_token") and cf.get("hostname") else ""      # indirizzo da fuori casa, per i plugin
+    for s in sezioni:
+        if s.get("plugin"):
+            s["plugin"]["base"] = base
     out = cornice(app, ora)
     out.update({"stato": stato_collegamenti(app, ora), "sezioni": sezioni, "allarmi": allarmi,
                 "utente": cfg["accesso"].get("utente") or ""})
@@ -337,6 +345,8 @@ def salva_impostazioni(app, corpo, h):
     app.cfg.aggiorna(scrivi)
     log.info("Impostazioni modificate dal pannello: %s", ", ".join(sorted(k for k in puliti if campi[k]["tipo"] != "segreto"))
              + (" (+ segreti)" if any(campi[k]["tipo"] == "segreto" for k in puliti) else ""))
+    if any(k.startswith("plugin.") for k in puliti):
+        plugin_sincronizza(app)
     riavvio = [k for k in puliti if k.startswith("generale.")]
     return {"ok": True, "salvati": len(puliti), "riavvio": bool(riavvio)}
 

@@ -1726,6 +1726,8 @@ class Gestore(BaseHTTPRequestHandler):
                 if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
                     return self._vai("/")   # gia' dentro (es. icona della Home salvata sulla pagina di login)
                 return self._invia(200, self._pagina("login.html", errore=""))
+            if p.startswith("/plugin/"):      # rotte pubbliche dei plugin (l'autenticazione e' del plugin)
+                return plugin_pubblico(app, self, p, q)
             autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
             if p == "/logout" and self.command == "POST":
                 app.sessioni.elimina(self._cookie("pdc_sid"))

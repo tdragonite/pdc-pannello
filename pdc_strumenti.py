@@ -11,6 +11,7 @@ Fa queste cose, tutte con la sola libreria standard di Python:
   nt-dump      salva i dati dello Smarther letti dalle API Netatmo (idem)
   st-prova-refresh  esperimento: il comando 'refresh' anticipa i dati del ciclo? (pannello fermo)
   rip-diag     diagnostica della «ripartenza prevista» dello Smarther: perche' c'e' o non c'e', quali pause usa
+  nt-webhook-prova  prova i webhook Netatmo: registra un indirizzo temporaneo, ascolta gli eventi dello Smarther e li confronta con homestatus (pannello anche acceso)
   sbrinamenti  elenca gli sbrinamenti trovati nel database, uno per uno, con i cambi di stato grezzi (per controllare il conteggio)
 
 Usa un unico config.json nella stessa cartella dello script (lo stesso che
@@ -21,6 +22,8 @@ Esempi:
     python pdc_strumenti.py st-dump
     python pdc_strumenti.py nt-dump
     python pdc_strumenti.py rip-diag
+    python pdc_strumenti.py nt-webhook-prova --minuti 30
+    python pdc_strumenti.py nt-webhook-prova --metodo nuovo --minuti 20
     python pdc_strumenti.py sbrinamenti --giorni 28
 """
 
@@ -727,6 +730,320 @@ def cmd_nt_dump(cfg, args):
     say("  dump_netatmo_homesdata.json\n  dump_netatmo_homestatus_*.json")
 
 
+
+# --------------------------------------------------------------------------
+# Prova dei webhook Netatmo (sola osservazione: il pannello non viene toccato)
+# --------------------------------------------------------------------------
+
+WH_SEGRETI = ("user_id", "home_id", "home_name", "url")    # tolti dal file da mandare (i MAC li neutralizza sanitize)
+
+
+def wh_firma_ok(corpo, segreto, intestazione):
+    """HMAC-SHA256 del corpo grezzo con il client_secret, in esadecimale minuscolo (come da documentazione Netatmo)."""
+    import hashlib
+    import hmac
+    if not intestazione:
+        return None
+    atteso = hmac.new(segreto.encode(), corpo, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(atteso, intestazione.strip().lower())
+
+
+def wh_ricevitore(porta, segreto, eventi, lock):
+    """Piccolo server HTTP: registra ogni POST (con esito della firma) e risponde sempre 200 entro pochi ms."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            try:
+                n = min(int(self.headers.get("Content-Length") or 0), 262144)
+            except ValueError:
+                n = 0
+            corpo = self.rfile.read(n) if n else b""
+            firma = wh_firma_ok(corpo, segreto, self.headers.get("X-Netatmo-secret"))
+            try:
+                js = json.loads(corpo.decode("utf-8", "replace")) if corpo.strip() else {}
+            except ValueError:
+                js = {"raw": corpo[:300].decode("utf-8", "replace")}
+            with lock:
+                eventi.append({"arrivo": time.time(), "firma": firma, "percorso": self.path, "corpo": js})
+            risp = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(risp)))
+            self.end_headers()
+            self.wfile.write(risp)
+
+        do_GET = do_POST
+
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", porta), H)
+    except OSError as e:     # su Windows alcune porte sono riservate o occupate (WinError 10013/10048): ne scelgo una libera
+        if not porta:
+            raise
+        say(f"  (la porta {porta} non e' utilizzabile: {e.strerror or e}; ne scelgo una libera)")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def wh_trova_cloudflared(cfg):
+    import shutil
+    c = (cfg.get("cloudflare") or {}).get("percorso_cloudflared") or ""
+    if c:
+        p = Path(c)
+        return p if p.is_absolute() else HERE / p
+    nome = "cloudflared.exe" if os.name == "nt" else "cloudflared"
+    loc = HERE / "cloudflared" / nome
+    if loc.exists():
+        return loc
+    t = shutil.which("cloudflared")
+    return Path(t) if t else None
+
+
+def wh_tunnel(exe, porta, attesa=60):
+    """Tunnel temporaneo di Cloudflare (nessun account, indirizzo casuale *.trycloudflare.com). Restituisce (processo, url)."""
+    import subprocess
+    import threading
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    pr = subprocess.Popen([str(exe), "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{porta}"],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+                          creationflags=flags)
+    trovato, righe = [], []
+
+    def leggi():
+        for riga in pr.stdout:
+            righe.append(riga.rstrip())
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", riga)
+            if m and not trovato:
+                trovato.append(m.group(0))
+    threading.Thread(target=leggi, daemon=True).start()
+    t0 = time.time()
+    while time.time() - t0 < attesa and not trovato and pr.poll() is None:
+        time.sleep(0.3)
+    if not trovato:
+        pr.terminate()
+        die("Il tunnel temporaneo di Cloudflare non e' partito (nessun indirizzo trycloudflare.com ricevuto).\n"
+            "Ultime righe di cloudflared:\n  " + "\n  ".join(righe[-8:]))
+    time.sleep(3)    # il nome impiega qualche secondo a essere raggiungibile
+    return pr, trovato[0]
+
+
+def wh_piatto(obj, prefisso=""):
+    return {p: v for p, v in walk(obj, prefisso)}
+
+
+def wh_token(cfg, durata_s, rinnova):
+    """Usa il token del pannello SENZA rinnovarlo (Netatmo cambia il refresh token a ogni rinnovo: farlo mentre il pannello gira lo romperebbe)."""
+    nt = cfg["netatmo"]
+    resta = float(nt.get("expires_at") or 0) - time.time()
+    if rinnova:
+        return nt_access_token(cfg, force=True)
+    if nt.get("access_token") and resta > durata_s + 300:
+        return nt["access_token"]
+    die("Il token Netatmo e' in scadenza (o manca), e rinnovarlo da qui mentre il pannello e' acceso lo metterebbe nei guai.\n"
+        "  - Aspetta qualche minuto e rilancia: il pannello lo rinnova da solo e il nuovo dura circa 3 ore.\n"
+        "  - Oppure FERMA il pannello e rilancia con --rinnova.")
+
+
+def wh_pulisci(obj):
+    if isinstance(obj, dict):
+        return {k: ("<omesso>" if k in WH_SEGRETI else wh_pulisci(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [wh_pulisci(v) for v in obj]
+    return obj
+
+
+def wh_leggi(token, path, params=None):
+    """GET che NON rinnova mai il token (a differenza di nt_get)."""
+    c, js = wh_chiama(token, "GET", path + ("?" + urlencode(params) if params else ""))
+    if c >= 400:
+        say(f"  (Netatmo {path}: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:200]})")
+        return {}
+    return js
+
+
+def wh_chiama(token, metodo, path, dati=None, json_body=None):
+    h = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    corpo = None
+    if json_body is not None:
+        h["Content-Type"] = "application/json"
+        corpo = json.dumps(json_body).encode()
+        dati = None
+    elif dati is not None:
+        h["Content-Type"] = "application/x-www-form-urlencoded"
+    return http(metodo, NT_BASE + path, h, corpo if corpo is not None else dati)
+
+
+def wh_confronta(evento_mod, stato_mod):
+    """Campi dell'evento uguali / diversi / presenti solo in homestatus."""
+    e, s = wh_piatto(evento_mod), wh_piatto(stato_mod)
+    uguali = sorted(k for k in e if k in s and e[k] == s[k])
+    diversi = sorted(k for k in e if k in s and e[k] != s[k])
+    solo_ev = sorted(k for k in e if k not in s)
+    solo_st = sorted(k for k in s if k not in e)
+    return {"uguali": uguali, "diversi": diversi, "solo_nel_webhook": solo_ev, "solo_in_homestatus": solo_st}
+
+
+def cmd_nt_webhook_prova(cfg, args):
+    import threading
+    nt = cfg["netatmo"]
+    token = wh_token(cfg, args.minuti * 60, args.rinnova)
+    segreto = nt.get("client_secret") or ""
+    if not segreto:
+        die("Manca netatmo.client_secret in config.json (serve a controllare la firma dei messaggi).")
+    eventi, lock = [], threading.Lock()
+    rapporto = {"avviato": datetime.now().isoformat(timespec="seconds"), "minuti": args.minuti, "registrazione": None,
+                "eventi": [], "confronti": [], "elenco_prima": None, "elenco_dopo": None, "rimozione": None}
+
+    say("\nElenco dei webhook gia' presenti sul tuo account ...")
+    c0, js0 = wh_chiama(token, "GET", "/webhooks/v1/")
+    rapporto["elenco_prima"] = {"http": c0, "risposta": js0}
+    say(f"  HTTP {c0}: {json.dumps(js0, ensure_ascii=False)[:300]}")
+
+    nuovo = args.metodo == "nuovo"
+    if nuovo:
+        elenco = js0.get("body") if isinstance(js0, dict) else None
+        if c0 >= 400 or elenco != []:
+            die("Con --metodo nuovo parto solo se l'elenco dei webhook e' certamente vuoto (la cancellazione finale con DELETE /webhooks/v1/ "
+                "toglie TUTTI i webhook dell'account). Non lo e' (o non riesco a leggerlo): guarda l'elenco qui sopra.")
+    srv = pr = None
+    registrato = False
+    url = args.url
+    try:
+        srv = wh_ricevitore(args.porta, segreto, eventi, lock)
+        porta = srv.server_address[1]
+        if not url:
+            exe = wh_trova_cloudflared(cfg)
+            if not exe or not Path(exe).exists():
+                die("Non trovo cloudflared. Mettilo nella cartella 'cloudflared' accanto a questo script, oppure scrivi il percorso in "
+                    "config.json (cloudflare -> percorso_cloudflared), oppure passa un indirizzo pubblico tuo con --url.")
+            say(f"\nAvvio il tunnel temporaneo (cloudflared: {exe}) ...")
+            pr, url = wh_tunnel(exe, porta)
+        say(f"  indirizzo pubblico: {url}")
+
+        if nuovo:
+            say("\nRegistro il webhook su Netatmo (POST /webhooks/v1/, servizio nuovo) ...")
+            c1, js1 = wh_chiama(token, "POST", "/webhooks/v1/", json_body={"url": url})
+            rapporto["registrazione"] = {"http": c1, "risposta": js1, "metodo": "/webhooks/v1/"}
+            say(f"  HTTP {c1}: {json.dumps(js1, ensure_ascii=False)[:300]}")
+            if c1 >= 400:
+                die("Netatmo ha rifiutato la registrazione con il servizio nuovo (vedi sopra). Manda l'output a Claude.")
+        else:
+            say("\nRegistro il webhook su Netatmo (POST /api/addwebhook) ...")
+            c1, js1 = wh_chiama(token, "POST", "/api/addwebhook", {"url": url})
+            rapporto["registrazione"] = {"http": c1, "risposta": js1, "metodo": "/api/addwebhook"}
+            say(f"  HTTP {c1}: {json.dumps(js1, ensure_ascii=False)[:300]}")
+        if not nuovo and c1 >= 400:
+            say("  Riprovo con POST /webhooks/v1/ ...")
+            c2, js2 = wh_chiama(token, "POST", "/webhooks/v1/", json_body={"url": url})
+            rapporto["registrazione"] = {"http": c2, "risposta": js2, "metodo": "/webhooks/v1/", "primo_tentativo": {"http": c1, "risposta": js1}}
+            say(f"  HTTP {c2}: {json.dumps(js2, ensure_ascii=False)[:300]}")
+            if c2 >= 400:
+                die("Netatmo ha rifiutato la registrazione in entrambi i modi (vedi sopra). Il tuo account sviluppatore potrebbe non avere ancora "
+                    "i webhook abilitati: scrivi a contact-api@netatmo.com oppure manda questo output a Claude.")
+        registrato = True
+
+        say(f"\nAscolto per {args.minuti} minuti. ORA muovi lo Smarther: cambia la temperatura impostata dall'app, accendi e spegni,")
+        say("aspetta che parta o si fermi il riscaldamento. Ctrl+C per finire prima.\n")
+        home_id = None
+        homes = (wh_leggi(token, "/api/homesdata").get("body") or {}).get("homes") or []
+        if homes:
+            home_id = homes[0]["id"]
+        visti = ultimo_conf = n_conf = 0
+        fine = time.time() + args.minuti * 60
+        try:
+            while time.time() < fine:
+                time.sleep(1)
+                with lock:
+                    nuovi = eventi[visti:]
+                    visti = len(eventi)
+                for ev in nuovi:
+                    corpo = ev["corpo"] if isinstance(ev["corpo"], dict) else {}
+                    mod = (corpo.get("extra_params") or {}).get("modules") or []
+                    tipi = ",".join(sorted({str(m.get("type", "?")) for m in mod if isinstance(m, dict)})) or "-"
+                    f = {True: "firma OK", False: "FIRMA NON VALIDA", None: "senza firma"}[ev["firma"]]
+                    say(f"  {datetime.fromtimestamp(ev['arrivo']).strftime('%H:%M:%S')}  {corpo.get('push_type', '?')}  moduli: {tipi}  [{f}]")
+                    rapporto["eventi"].append(ev)
+                    if corpo.get("push_type") == "device_event" and home_id and n_conf < 12 and time.time() - ultimo_conf > 30:
+                        ultimo_conf, n_conf = time.time(), n_conf + 1
+                        st = (wh_leggi(token, "/api/homestatus", {"home_id": home_id}).get("body") or {}).get("home") or {}
+                        by_id = {m.get("id"): m for m in st.get("modules") or [] if isinstance(m, dict)}
+                        for m in mod:
+                            if isinstance(m, dict) and m.get("id") in by_id:
+                                rapporto["confronti"].append({"tipo": m.get("type"), **wh_confronta(m, by_id[m["id"]])})
+        except KeyboardInterrupt:
+            say("\nInterrotto: faccio pulizia ...")
+    finally:
+        if registrato:
+            say("\nRimuovo il webhook da Netatmo (" + ("DELETE /webhooks/v1/" if nuovo else "POST /api/dropwebhook") + ") ...")
+            try:
+                c3, js3 = wh_chiama(token, "DELETE", "/webhooks/v1/") if nuovo else wh_chiama(token, "POST", "/api/dropwebhook", {})
+                rapporto["rimozione"] = {"http": c3, "risposta": js3}
+                say(f"  HTTP {c3}: {json.dumps(js3, ensure_ascii=False)[:300]}")
+                c4, js4 = wh_chiama(token, "GET", "/webhooks/v1/")
+                rapporto["elenco_dopo"] = {"http": c4, "risposta": js4}
+                if url and url in json.dumps(js4):
+                    say("  ATTENZIONE: il nostro indirizzo risulta ancora registrato. Rilancia con --elimina per riprovare.")
+            except SystemExit:
+                say("  Non sono riuscito a rimuoverlo: rilancia 'nt-webhook-prova --elimina'.")
+        if srv:
+            srv.shutdown()
+        if pr and pr.poll() is None:
+            pr.terminate()
+
+    wh_riepilogo(rapporto)
+    for ev in rapporto["eventi"]:
+        ev["arrivo"] = datetime.fromtimestamp(ev["arrivo"]).isoformat(timespec="seconds")
+    write_dump("webhook_eventi.json", wh_pulisci(rapporto))
+    say("\nFatto. Allega a Claude diagnostica/webhook_eventi.json (e controllalo prima con il Blocco note, NON config.json).")
+
+
+def wh_riepilogo(r):
+    ev = r["eventi"]
+    say("\n=== RIEPILOGO ===")
+    say(f"Eventi ricevuti: {len(ev)}")
+    if not ev:
+        say("Nessuno. Possibili cause: il tunnel temporaneo non e' raggiungibile da Netatmo, la registrazione e' stata ignorata,")
+        say("oppure lo Smarther non ha generato eventi in questi minuti (riprova muovendo la temperatura impostata).")
+        return
+    tipi = {}
+    for e in ev:
+        c = e["corpo"] if isinstance(e["corpo"], dict) else {}
+        tipi[c.get("push_type", "?")] = tipi.get(c.get("push_type", "?"), 0) + 1
+    say("Tipi di evento: " + ", ".join(f"{k} x{v}" for k, v in sorted(tipi.items())))
+    firme = [e["firma"] for e in ev]
+    say(f"Firma: {firme.count(True)} valide, {firme.count(False)} NON valide, {firme.count(None)} assenti")
+    campi = set()
+    ritardi = []
+    for e in ev:
+        c = e["corpo"] if isinstance(e["corpo"], dict) else {}
+        for m in (c.get("extra_params") or {}).get("modules") or []:
+            if isinstance(m, dict):
+                campi.update(m.keys())
+                if isinstance(m.get("last_seen"), (int, float)):
+                    ritardi.append(e["arrivo"] - m["last_seen"])
+    say("Campi presenti nei moduli: " + (", ".join(sorted(campi)) or "nessuno"))
+    if ritardi:
+        ritardi.sort()
+        say(f"Ritardo fra 'last_seen' del modulo e l'arrivo: da {ritardi[0]:.0f} a {ritardi[-1]:.0f} secondi (mediana {ritardi[len(ritardi) // 2]:.0f})")
+    if r["confronti"]:
+        mancanti = set.intersection(*[set(c["solo_in_homestatus"]) for c in r["confronti"]])
+        diversi = set().union(*[set(c["diversi"]) for c in r["confronti"]])
+        say("Campi di homestatus che il webhook NON porta: " + (", ".join(sorted(mancanti)) or "nessuno"))
+        say("Campi che nel webhook erano diversi da homestatus: " + (", ".join(sorted(diversi)) or "nessuno"))
+        if mancanti:
+            say("=> Il webhook da solo non basta: serve ancora leggere homestatus (la sola notifica fa da campanello).")
+        else:
+            say("=> Il webhook porta tutti i campi di homestatus: si potrebbe costruire lo stato dagli eventi.")
+
+
 # --------------------------------------------------------------------------
 
 def main():
@@ -748,6 +1065,14 @@ def main():
     r.add_argument("--finestra", type=int, default=120, help="secondi per ogni giro (default 120)")
     r.add_argument("--pausa", type=int, default=45, help="pausa tra un giro e l'altro, non conteggiata (default 45)")
     r.add_argument("--ogni", type=int, default=10, help="secondi tra una lettura e l'altra (default 10)")
+    w = sub.add_parser("nt-webhook-prova", help="prova i webhook Netatmo con un tunnel temporaneo (il pannello puo' restare acceso)")
+    w.add_argument("--minuti", type=int, default=30, help="quanti minuti restare in ascolto (default 30)")
+    w.add_argument("--porta", type=int, default=0, help="porta locale del ricevitore (default: ne sceglie una libera da sola)")
+    w.add_argument("--url", help="usa questo indirizzo pubblico (che deve arrivare alla --porta di questo PC) invece del tunnel temporaneo")
+    w.add_argument("--metodo", choices=("vecchio", "nuovo"), default="vecchio",
+                   help="vecchio = /api/addwebhook (default); nuovo = servizio /webhooks/v1/ (parte solo se l'elenco dei webhook e' vuoto)")
+    w.add_argument("--rinnova", action="store_true", help="rinnova il token Netatmo: SOLO a pannello fermo")
+    w.add_argument("--elimina", action="store_true", help="non ascolta: toglie da Netatmo un webhook rimasto registrato")
     g = sub.add_parser("rip-diag", help="diagnostica della ripartenza prevista dello Smarther (legge il database, pannello anche acceso)")
     g.add_argument("--db", help="percorso del database (di solito lo trova da solo)")
     g.add_argument("--ultime", type=int, default=15, help="quante pause mostrare, le ultime (default 15)")
@@ -764,9 +1089,19 @@ def main():
         (cmd_rip_diag if args.cmd == "rip-diag" else cmd_sbrinamenti)(None, args)
         return
     cfg = load_cfg()
+    if args.cmd == "nt-webhook-prova" and args.elimina:
+        if args.metodo == "nuovo":
+            c, js = wh_chiama(wh_token(cfg, 0, args.rinnova), "DELETE", "/webhooks/v1/")
+            say(f"DELETE /webhooks/v1/: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
+        else:
+            c, js = wh_chiama(wh_token(cfg, 0, args.rinnova), "POST", "/api/dropwebhook", {})
+            say(f"dropwebhook: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
+        c, js = wh_chiama(wh_token(cfg, 0, args.rinnova), "GET", "/webhooks/v1/")
+        say(f"webhook rimasti: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
+        return
     {"st-devices": cmd_st_devices, "st-oauth": cmd_st_oauth,
      "st-dump": cmd_st_dump, "nt-dump": cmd_nt_dump,
-     "st-prova-refresh": cmd_st_prova_refresh}[args.cmd](cfg, args)
+     "st-prova-refresh": cmd_st_prova_refresh, "nt-webhook-prova": cmd_nt_webhook_prova}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

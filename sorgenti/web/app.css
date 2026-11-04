@@ -319,9 +319,9 @@ a{color:var(--acs)}
 .dev-st{display:grid;gap:4px;justify-items:end}
 .dev-gr{margin-top:12px}
 .dev-gr h3{margin:0 0 2px}
-.dev .riga b{max-width:68%;word-break:break-word;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
-.dev .riga b .val-c{font-variant-numeric:tabular-nums}
-.dev .riga{align-items:flex-start}
+.dev .riga b,.plg .riga b{max-width:68%;word-break:break-word;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.dev .riga b .val-c,.plg .riga b .val-c{font-variant-numeric:tabular-nums}
+.dev .riga,.plg .riga{align-items:flex-start}
 .nota-r{font-weight:400;font-size:12px;text-align:right}
 .cv{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:4px 8px}
 .copia{font:inherit;font-size:11.5px;font-weight:600;color:var(--mut);background:var(--card2);border:1px solid var(--linea);border-radius:8px;padding:2px 9px;cursor:pointer}
@@ -339,7 +339,8 @@ a{color:var(--acs)}
 .fsv-gr>summary .d{font-weight:400;font-size:12.5px;color:var(--mut)}
 .fsv-gr[open]>summary{margin-bottom:6px}
 .fsv-id{display:inline-block;min-width:42px;margin-right:8px;font-style:normal;font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:var(--mut2)}
-.dev .riga>span:first-child{max-width:62%}
+.dev .riga>span:first-child,.plg .riga>span:first-child{max-width:62%}
+details.riq>summary .pill{margin-left:auto}
 .rosso{color:#ff6b6b}
 details.riq>summary::after,.fsv-gr>summary .d::after,.cl-vecchie>summary::before,.come-b::after,.tile[data-come] small::after{content:"";display:inline-block;flex:none;width:var(--chv,7px);height:var(--chv,7px);border:solid currentColor;border-width:0 var(--chw,2px) var(--chw,2px) 0;transform:rotate(-45deg);transition:transform .15s}
 details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[open]>summary::before,.come-b.on::after,.tile[data-come].on small::after{transform:rotate(45deg)}
@@ -398,7 +399,6 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 .conf-d.buono{color:var(--ok,#62eba6)}.conf-d.cattivo{color:var(--casa,#ff6b57)}
 .nota.conf-nota{margin-top:0}
 .conf-t{display:block;margin-top:4px;color:var(--mut);font-size:12px}
-#imp-tabs .sub-tabs{margin-bottom:14px}
 .azioni-t{display:flex;gap:8px}
 .azioni-t .sec{padding:6px 12px;font-size:13px}
 .reg-filtro{display:flex;align-items:center;gap:8px;margin:12px 0 8px;font-size:14px;color:var(--mut)}
@@ -409,7 +409,7 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 /* Impostazioni: tab e riquadri collassabili */
 #imp-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
 #imp-tabs::-webkit-scrollbar{display:none}
-#imp-tabs .sub-tabs{display:flex;width:max-content;min-width:100%}
+#imp-tabs .sub-tabs{margin-bottom:14px;display:flex;width:max-content;min-width:100%}
 #imp-tabs .sub-tabs a{white-space:nowrap;padding:7px 14px}
 .imp-tab[hidden]{display:none}
 .imp-tab>details.riq{margin-bottom:12px}
