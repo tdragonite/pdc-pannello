@@ -3827,6 +3827,12 @@ def accesso_configurato(app):
     return bool(acc.get("utente") and acc.get("password_hash"))
 
 
+def cookie_sessione(token, giorni, https):
+    """Il cookie di accesso (unico punto: login e rinnovo)."""
+    ck = f"pdc_sid={token}; Path=/; Max-Age={int(giorni) * 86400}; HttpOnly; SameSite=Lax"
+    return ck + "; Secure" if https else ck
+
+
 class Sessioni:
     def __init__(self, db):
         self.db = db
@@ -5476,7 +5482,11 @@ class Gestore(BaseHTTPRequestHandler):
             if p == "/manifest.webmanifest":
                 return self._invia(200, json.dumps(MANIFEST), "application/manifest+json")
             if p == "/login":
-                return self._login(app) if self.command == "POST" else self._invia(200, self._pagina("login.html", errore=""))
+                if self.command == "POST":
+                    return self._login(app)
+                if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
+                    return self._vai("/")   # gia' dentro (es. icona della Home salvata sulla pagina di login)
+                return self._invia(200, self._pagina("login.html", errore=""))
             autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
             if p == "/logout" and self.command == "POST":
                 app.sessioni.elimina(self._cookie("pdc_sid"))
@@ -5562,9 +5572,7 @@ class Gestore(BaseHTTPRequestHandler):
             app.limite.ok(ip)
             giorni = int(app.cfg.leggi()["generale"]["sessione_giorni"])
             tok = app.sessioni.crea(giorni)
-            ck = f"pdc_sid={tok}; Path=/; Max-Age={giorni * 86400}; HttpOnly; SameSite=Lax"
-            if e_https(self):
-                ck += "; Secure"
+            ck = cookie_sessione(tok, giorni, e_https(self))
             log.info("accesso web eseguito da %s", ip)
             return self._vai("/", [("Set-Cookie", ck)])
         app.limite.fallito(ip)
