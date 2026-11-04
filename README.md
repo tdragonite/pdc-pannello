@@ -28,6 +28,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 17. [Per chi modifica il codice](#17-per-chi-modifica-il-codice)
 18. [Integrazioni (plugin)](#18-integrazioni-plugin)
 19. [Alexa (il plugin per le Routine)](#19-alexa-il-plugin-per-le-routine)
+20. [Widget per iPhone (plugin e script Scriptable)](#20-widget-per-iphone-plugin-e-script-scriptable)
 
 ---
 
@@ -308,13 +309,16 @@ Una scheda per la pompa di calore e una per lo Smarther: identità e modello, **
 - **Installatore** (la scheda accanto a *Dispositivi*, indirizzo `#/dispositivi/installatore`): l'elenco, in sola lettura, delle impostazioni installatore (i codici FSV del manuale: curva climatica, acqua calda, riscaldamento…) che la pompa comunica tramite SmartThings, raggruppate per menu, ognuna con il suo nome in italiano. Il pannello non modifica nessuna di queste impostazioni. Sotto ogni valore c'è l'intervallo ammesso dal manuale Samsung EHS Mono (può cambiare da modello a modello); se un valore ne esce compare «fuori limiti». Se un valore cambia mentre il pannello è acceso, sotto compare quando e quanto valeva prima. *Copia elenco* mette tutto negli appunti, comodo da mandare all'installatore. I codici che la pompa manda e che non conosco compaiono in fondo come «Altri codici», col solo valore.
 - **Loghi**: non li fornisce il pannello. Crea (se non c'è) la cartella **`dati\loghi`** accanto a `pdc_pannello.py` e mettici i tuoi file con questi nomi: `smarther.svg`, `samsung.svg`, `netatmo.svg`, `bticino.svg` (vanno bene anche `.png`, `.webp`, `.jpg`). Compaiono nelle schede e il logo Smarther anche sulla Dashboard. Se un file non c'è si vede il nome scritto. Se un logo è scuro e si perde sul tema scuro, attiva *Mostra i loghi in bianco* in *Impostazioni → Dispositivi*.
 
+**Umidità esterna** (dalla 0.21)
+Facoltativa. Nella card Esterna della Dashboard, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink); se appare l'avviso «Dato delle… (PdC ferma)» prende il suo posto, senza cambiare le dimensioni della card. Per accenderla: lancia `python pdc_strumenti.py meteo-prova "<indirizzo della pagina della stazione>"` (capitolo 8 di `README_STRUMENTI.md`), copia l'**indirizzo dei dati** che stampa e incollalo in *Impostazioni → Collegamenti → Stazione meteo vicina*. Il pannello la rilegge ogni 10 minuti; se la stazione non manda dati da più di un'ora, l'umidità sparisce. Con il campo vuoto la funzione è spenta e la Dashboard resta identica. Non viene salvata né disegnata in grafici: è solo il valore di adesso. La temperatura esterna resta quella della sonda della pompa.
+
 **Changelog**
-La cronologia delle versioni, scritta in italiano semplice, con la più recente in alto. Sul computer si apre dalla voce piccola «Changelog» sopra «Esci»; sul telefono, per non affollare la barra in basso, dal link «Changelog» accanto alla versione in *Impostazioni → Stato*.
+La cronologia delle versioni, scritta in italiano semplice, con la più recente in alto. Dalla 0.21.1 ha due tab: **Pannello** e **Plugin** (la cronologia di ogni plugin, tutti insieme o uno alla volta). Sul computer si apre dalla voce piccola «Changelog» sopra «Esci»; sul telefono, per non affollare la barra in basso, dal link «Changelog» accanto alla versione in *Impostazioni → Stato*.
 
 **Impostazioni**
 Divisa in sette tab, con i riquadri che si aprono e si chiudono con un tocco (il pannello ricorda come li hai lasciati; sugli schermi larghi i riquadri chiusi stanno su due colonne, quelli aperti più larghi passano a tutta riga):
 - **Stato**: versione, collegamenti, token, database, aggiornamento a caldo.
-- **Collegamenti**: SmartThings e Netatmo (ID e token), dati più freschi, login del pannello, intervalli di lettura, dispositivi (IP, modello, loghi).
+- **Collegamenti**: SmartThings e Netatmo (ID e token), dati più freschi, stazione meteo vicina (dalla 0.21), login del pannello, intervalli di lettura, dispositivi (IP, modello, loghi).
 - **Avvisi**: Telegram, silenzio notturno e riepilogo, testi dei messaggi, soglie di ogni allarme.
 - **Integrazioni** (dalla 0.20): i plugin, come Alexa (capitoli 18 e 19).
 - **Accesso**: password del pannello e accesso da internet (Cloudflare, con il pulsante che ti manda il link su Telegram).
@@ -490,7 +494,7 @@ Le pagine e i dati che il pannello manda al browser sono compressi (gzip), così
 
 ## 19. Alexa (il plugin per le Routine)
 
-*Dalla 0.20, plugin `alexa.py` versione 1.3.1.* Con una **skill personale** di Alexa (visibile solo al tuo account Amazon) e le **Routine** puoi chiedere al pannello cose come «che temperatura c'è» o «il riscaldamento è acceso», e accendere o spegnere lo Smarther, senza pronunciare il nome della skill: è la Routine a dirlo per te. I file stanno nella cartella `plugin_esempio`: `alexa.py` (il plugin), `alexa_modello_it.json` (il modello della skill), `ALEXA_FRASI.md` (l'elenco completo di frasi e risposte) e `ALEXA_CHANGELOG.md` (la cronologia del plugin).
+*Dalla 0.20, plugin `alexa.py` versione 1.4.0.* Con una **skill personale** di Alexa (visibile solo al tuo account Amazon) e le **Routine** puoi chiedere al pannello cose come «che temperatura c'è» o «il riscaldamento è acceso», e accendere o spegnere lo Smarther, senza pronunciare il nome della skill: è la Routine a dirlo per te. I file stanno nella cartella `plugin_esempio`: `alexa.py` (il plugin), `alexa_modello_it.json` (il modello della skill), `ALEXA_FRASI.md` (l'elenco completo di frasi e risposte) e `ALEXA_CHANGELOG.md` (la cronologia del plugin).
 
 **Cosa serve**: il pannello raggiungibile da internet (capitolo 9, Cloudflare) e un account sviluppatore Amazon gratuito (developer.amazon.com; chiede la verifica dell'identità).
 
@@ -531,3 +535,8 @@ Il pannello limita comunque dimensione e frequenza delle richieste (capitolo 16)
 | Non arriva niente a Alexa dopo il passaggio ad «Attiva» | Rimetti *Solo avviso* e leggi nello stato il motivo scritto fra parentesi dopo «firma NON valida». |
 | Il contatore non sale | Ricarica la scheda Integrazioni; controlla il tunnel (capitolo 9) e che l'interruttore del plugin sia acceso. |
 
+## 20. Widget per iPhone (plugin e script Scriptable)
+
+Il plugin `widget.py` (versione 1.1.0) crea un indirizzo pubblico, di sola lettura, con i pochi dati che servono al widget: temperatura e umidità di casa, termostato (chiama / riparte / non chiama), stato della pompa di calore e acqua calda, temperatura e umidità di fuori. Lo script `widget_scriptable.js` li disegna come widget medio nell'app gratuita **Scriptable**. Si installa come gli altri plugin (Impostazioni → Integrazioni), si copia l'indirizzo in «Indirizzi pubblici» e si incolla nello script.
+
+**Sicurezza**: l'indirizzo contiene un segreto casuale; in più il campo **Token del widget** (da 24 a 64 caratteri) va scritto uguale anche nello script (costante `TOKEN`): senza il token l'indirizzo risponde 404, quindi aprirlo da un browser non mostra niente. Il widget può solo leggere. Per cambiare segreto o token basta scriverne uno nuovo, ricaricare i plugin e aggiornare lo script. La cronologia del plugin sta in `WIDGET_CHANGELOG.md`.

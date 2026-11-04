@@ -9,6 +9,8 @@
 # Cosa deve contenere un plugin (INTERFACCIA 1):
 #   INFO  = {"titolo": "Alexa", "versione": "1.0", "interfaccia": 1, "descrizione": "..."}
 #   CAMPI = [{"chiave": "segreto", "tipo": "segreto", "et": "...", "aiuto": "...", "default": ...}, ...]   (facoltativo)
+#   CHANGELOG = [{"v": "1.1", "data": "2026-11-04T18:00", "titolo": "...", "righe": [["n", "Titoletto", "Una frase."], ...]}, ...]   (facoltativo)
+#       la cronologia del plugin, la piu' recente in alto: compare in Changelog > Plugin. Tipo riga: n = Novita', m = Migliorato, s = Sistemato.
 #   def avvia(ctx): ...        (deve tornare subito; per lavori lunghi si usa un thread)
 #   def ferma(ctx): ...        (facoltativa)
 # Il campo «attivo» (interruttore) lo aggiunge il pannello: un plugin nuovo parte SPENTO.
@@ -33,6 +35,7 @@ class Plug:
         self.nome, self.file = nome, file
         self.modulo = None
         self.info, self.campi = {}, []
+        self.changelog = []
         self.sha = ""
         self.stato, self.errore = "errore", ""
         self.avviato = False
@@ -104,6 +107,22 @@ def _riassunto(e):
     return f"{type(e).__name__}: {e}"[:300]
 
 
+def _pulisci_changelog(grezzo):
+    """La cronologia dichiarata da un plugin, ripulita (testi corti, limiti). Mai eccezioni: se e' sbagliata, resta vuota."""
+    out = []
+    try:
+        for c in list(grezzo or [])[:60]:
+            righe = [[str(x[0]) if str(x[0]) in ("n", "m", "s") else "m", str(x[1])[:80], str(x[2])[:600]]
+                     for x in list(c.get("righe") or [])[:12] if isinstance(x, (list, tuple)) and len(x) >= 3]
+            data = str(c.get("data", ""))[:16]
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2})?", data):
+                data = ""
+            out.append({"v": str(c.get("v", ""))[:20], "data": data, "titolo": str(c.get("titolo", ""))[:80], "righe": righe})
+    except Exception:
+        return []
+    return out
+
+
 def _leggi_plugin(f):
     """Carica il file di un plugin SENZA avviarlo. Mai eccezioni: l'errore finisce nel Plug."""
     p = Plug(f.stem, f)
@@ -132,6 +151,7 @@ def _leggi_plugin(f):
                           "aiuto": str(c.get("aiuto", "")), "default": c.get("default"),
                           **{k: c[k] for k in ("min", "max", "opzioni") if k in c}})
         p.campi, p.modulo = campi, modulo
+        p.changelog = _pulisci_changelog(getattr(modulo, "CHANGELOG", None))
         p.stato = "spento"
     except BaseException as e:            # anche SystemExit: un plugin non deve mai fermare il pannello
         if isinstance(e, KeyboardInterrupt):
@@ -226,6 +246,14 @@ def plugin_ricarica(app):
         return len(PLUGIN)
 
 
+@api("/api/plugin/changelog")
+def api_plugin_changelog(app, q):
+    """Le cronologie dei plugin, per la tab Changelog > Plugin."""
+    with _lock_plugin:
+        return {"plugin": [{"nome": p.nome, "titolo": p.info.get("titolo") or p.nome, "versione": p.info.get("versione", ""),
+                            "changelog": p.changelog} for p in PLUGIN.values() if p.changelog]}
+
+
 def sezioni_plugin():
     """I riquadri di Impostazioni > Integrazioni: uno per plugin, con interruttore e campi (stessa forma delle altre sezioni)."""
     out = []
@@ -262,6 +290,8 @@ def plugin_pubblico(app, h, p, q):
     voce = PLUGIN_ROTTE.get(p)
     plug = PLUGIN.get(voce[0]) if voce else None
     if not voce or not plug or not plug.avviato:
+        if _troppo_veloce("-", ip_client(h)):      # anche gli indirizzi sbagliati hanno un limite: niente tentativi a raffica
+            return h._json({"errore": "troppe richieste"}, 429)
         return h._invia(404, "Non trovato", "text/plain; charset=utf-8")
     _, funzione, metodi = voce
     if h.command not in metodi:

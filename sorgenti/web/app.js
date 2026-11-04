@@ -113,7 +113,7 @@ function mostraPagina() {
     vistaImp();
   }
   else if (S.pagina === 'dispositivi') { $('#pagina').innerHTML = '<div id="dsp"><div class="card vuoto">Carico…</div></div>'; }
-  else if (S.pagina === 'changelog') { $('#pagina').innerHTML = disegnaChangelog(); window.scrollTo(0, 0); }
+  else if (S.pagina === 'changelog') { clDati = null; vistaChangelog(); }
   else { $('#pagina').innerHTML = '<div id="eff"><div class="card vuoto">Calcolo in corso…</div></div>'; }
 }
 
@@ -193,7 +193,8 @@ function disegna() {
 
   set('e-t', num(e.temp)); set('e-mn', gr(e.min)); set('e-mx', gr(e.max)); html('e-sp', spark(e.spark)); meteoRiga(d.meteo);
   badge('e-b', 'Temperatura', 'tema', 'Temperatura dell\'aria esterna');
-  html('e-n', e.ts && d.ora - e.ts > 7200 ? avviso('Dato delle ' + hhmm(e.ts) + ' (PdC ferma)', 'warn') : '');
+  html('e-n', e.ts && d.ora - e.ts > 7200 ? avviso('Dato delle ' + hhmm(e.ts) + ' (PdC ferma)', 'warn')
+    : e.umidita != null ? `<span class="um-n" title="Umidità dell'aria esterna (stazione meteo vicina)">Umidità <b>${num(e.umidita, 0)}%</b></span>` : '');   // l'avviso, quando c'è, prende il posto dell'umidità
 
   set('w-t', num(w.kwh, w.kwh != null && w.kwh < 10 ? 2 : 1)); set('w-per', periodo(d)); set('w-pw', w.potenza_w == null ? '—' : num(w.potenza_w, 0) + ' W');
   { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); } }
@@ -933,6 +934,15 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', alexa: '🔊', live: '↻'};
 const CHANGELOG = [
+  {v: '0.21.1', quando: '4 novembre 2026', titolo: 'Changelog dei plugin', righe: [
+    ['n', 'Tab «Plugin» nel Changelog', 'Il Changelog ha due tab: Pannello (come prima) e Plugin, con la cronologia di ogni plugin, tutti insieme in ordine di data o uno alla volta con il filtro. La versione che hai installata è segnata «Installato».'],
+    ['m', 'Pannello più veloce da fuori', 'Le pagine (app.js e app.css) si scaricano una volta sola e, se non cambiano, il browser riceve soltanto «invariato»: meno dati sul tunnel e caricamento più rapido, soprattutto da telefono.'],
+    ['m', 'Indirizzi dei plugin più protetti', 'Anche i tentativi su indirizzi sbagliati hanno un limite al minuto, come quelli giusti.'],
+    ['m', 'Plugin nuovi senza lavoro in più', 'Ogni plugin porta la sua cronologia nel proprio file (lista CHANGELOG): un plugin nuovo compare da solo nella tab.'],
+  ]},
+  {v: '0.21', quando: '4 novembre 2026', titolo: 'Umidità esterna', righe: [
+    ['n', 'Umidità esterna', 'Nella card Esterna, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink). Sta nella riga degli avvisi: se appare «Dato delle… (PdC ferma)» prende il suo posto. Le dimensioni della Dashboard non cambiano. Si accende incollando l’indirizzo dei dati in Impostazioni → Collegamenti; senza indirizzo o senza dato non compare niente.'],
+  ]},
   {v: '0.20', quando: '4 novembre 2026', titolo: 'Integrazioni e Alexa', righe: [
     ['n', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», con interruttore, campi e stato. Un plugin nuovo parte spento, si ricarica con un tasto e, se si rompe, non ferma mai il pannello.'],
     ['n', 'Alexa', 'Il primo plugin: con le Routine di Alexa chiedi temperatura e umidità, se il riscaldamento è acceso e quando riparte, cosa fa la PdC, acqua calda e mandata, oppure accendi e spegni lo Smarther. Non devi pronunciare il nome della skill.'],
@@ -1032,17 +1042,62 @@ const CHANGELOG = [
   ]},
 ];
 
-function disegnaChangelog() {
+function disegnaChangelogPannello() {
   const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
   const voce = (c, attuale) => `<section class="cl-v${attuale ? ' att' : ''}"><div class="cl-h"><span class="cl-n">${esc(c.v)}</span>` +
     `${attuale ? '<span class="pill en">Attuale</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.quando ? `<span class="cl-d">${esc(c.quando)}</span>` : ''}</div>` +
     `<ul>${c.righe.map(riga).join('')}</ul></section>`;
   const recenti = CHANGELOG.filter((c, k) => k < 3), prima = CHANGELOG.filter((c, k) => k >= 3 && !c.antico), antiche = CHANGELOG.filter(c => c.antico);
   const breve = `<div class="cl-breve"><div class="eti">In breve</div>${CL_BREVE.map(b => `<div class="cl-bi">${CL_IC[b[0]] ? `<span class="cl-ic">${CL_IC[b[0]]}</span>` : iconaMeteo(b[0], 22)}<span><b>${esc(b[1])}</b> ${esc(b[2])}</span></div>`).join('')}</div>`;
-  return `<div class="changelog">${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
+  return `${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
     `<details class="cl-vecchie"><summary>Versioni precedenti</summary>${prima.map(c => voce(c)).join('')}` +
-    `<div class="eti">Le prime versioni</div>${antiche.map(c => voce(c)).join('')}</details></div></div>`;
+    `<div class="eti">Le prime versioni</div>${antiche.map(c => voce(c)).join('')}</details></div>`;
 }
+
+// Changelog: due tab, Pannello (qui sopra) e Plugin (la cronologia che ogni plugin dichiara nel suo file, dall'API)
+S.clPlugin = S.clPlugin || '';      // filtro della tab Plugin: '' = tutti, altrimenti il nome del plugin
+let clDati = null;
+const MESI_IT = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
+const dataIt = d => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(d || ''); return m ? `${+m[3]} ${MESI_IT[+m[2] - 1]} ${m[1]}` : ''; };
+function disegnaChangelogPlugin() {
+  if (!clDati) return '<div class="card vuoto">Carico…</div>';
+  const plug = clDati.plugin || [];
+  if (!plug.length) return '<div class="card vuoto">Nessun plugin con una cronologia. Un plugin la dichiara con la lista <code>CHANGELOG</code> nel suo file.</div>';
+  const filtro = plug.some(p => p.nome === S.clPlugin) ? S.clPlugin : '';
+  const chips = `<div class="chips cl-filtro">${[['', 'Tutti']].concat(plug.map(p => [p.nome, p.titolo])).map(([k, t]) =>
+    `<button data-clp="${esc(k)}" class="${k === filtro ? 'on' : ''}">${esc(t)}</button>`).join('')}</div>`;
+  const voci = [];
+  for (const p of plug) if (!filtro || p.nome === filtro) for (const c of p.changelog) voci.push({p, c});
+  voci.sort((a, b) => (b.c.data || '').localeCompare(a.c.data || ''));   // stabile: a pari data resta l'ordine del plugin
+  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
+  const corpo = voci.map(({p, c}) => {
+    const att = c.v === p.versione;
+    return `<section class="cl-v${att ? ' att' : ''}"><div class="cl-h">${filtro ? '' : `<span class="pill up">${esc(p.titolo)}</span>`}<span class="cl-n">${esc(c.v)}</span>` +
+      `${att ? '<span class="pill en">Installato</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.data ? `<span class="cl-d">${esc(dataIt(c.data))}</span>` : ''}</div>` +
+      `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+  }).join('');
+  return `${chips}<div class="cl-tl">${corpo}</div>`;
+}
+function vistaChangelog() {
+  const plugin = S.sub === 'plugin';
+  const tabs = `<nav class="sub-tabs cl-tabs" aria-label="Sezioni"><a href="#/changelog" class="${plugin ? '' : 'on'}">Pannello</a><a href="#/changelog/plugin" class="${plugin ? 'on' : ''}">Plugin</a></nav>`;
+  $('#pagina').innerHTML = `<div class="changelog">${tabs}${plugin ? disegnaChangelogPlugin() : disegnaChangelogPannello()}</div>`;
+  window.scrollTo(0, 0);
+  if (plugin && !clDati) caricaChangelogPlugin();
+}
+async function caricaChangelogPlugin() {
+  try {
+    const r = await fetch('/api/plugin/changelog', {credentials: 'same-origin', cache: 'no-store'});
+    if (r.status === 401) { location.href = '/login'; return; }
+    clDati = r.ok ? await r.json() : {plugin: []};
+  } catch (e) { clDati = {plugin: []}; }
+  if (S.pagina === 'changelog' && S.sub === 'plugin') { const y = window.scrollY; vistaChangelog(); window.scrollTo(0, y); }
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('button[data-clp]');
+  if (!b || S.pagina !== 'changelog') return;
+  S.clPlugin = b.dataset.clp; vistaChangelog();
+});
 
 // ---------- Efficienza ----------
 const euro = v => v == null ? '—' : v.toLocaleString('it-IT', {style: 'currency', currency: 'EUR'});
@@ -1519,12 +1574,14 @@ function pluginTab(d) {
 function disegnaImpostazioni(d) {
   const box = $('#imp'); if (!box) return;
   const stato_ = $('#imp-stato'); if (stato_) stato_.innerHTML = statoImpostazioni(d.stato);
+  { const z = $('#stz-st'); if (z) z.textContent = d.stato.stazione || ''; }                 // riga di stato della stazione meteo vicina
   if (box.dataset.pronto && S.sporco) return;            // non cancellare quello che stai scrivendo
   if (box.dataset.pronto === '1' && !S.ricarica) return;
   S.ricarica = false; box.dataset.pronto = '1';
   const sez = t => d.sezioni.filter(s => s.tab === t).sort((a, b) => (a.id === 'testi') - (b.id === 'testi')).map((s, i) => riquadro('s-' + s.id, s.titolo, `
       ${s.nota ? `<p class="nota-sez">${esc(s.nota)}</p>` : ''}
       <div class="campi">${s.campi.map(campoHtml).join('')}</div>
+      ${s.id === 'stazione' ? `<p class="nota-sez" id="stz-st">${esc(d.stato.stazione || '')}</p>` : ''}
       ${s.prova ? '<div class="azioni"><button type="button" class="sec" id="b-prova">Invia messaggio di prova</button><small class="mut">Usa i valori già salvati: salva prima.</small></div>' : ''}`, i === 0)).join('');
   const all = d.allarmi.map(a => `
     <details class="allarme"><summary><span class="t">${esc(a.titolo)}</span><span class="d">${esc(a.descrizione)}</span></summary>
@@ -1842,6 +1899,7 @@ function avvia() {
     else if (p === S.pagina && sub !== S.sub) {
       S.sub = sub;
       if (p === 'impostazioni') vistaImp();
+      else if (p === 'changelog') vistaChangelog();
       else if (S.dati) { const b = $('#dsp'); if (b) b.dataset.h = ''; disegna(); }
     }
   });

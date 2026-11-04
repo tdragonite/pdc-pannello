@@ -87,9 +87,11 @@ main{min-width:0;padding:22px 26px 40px}
 .sub b{color:var(--txt);font-variant-numeric:tabular-nums}
 .flash{animation:flash .9s ease-out}
 .card .nota{margin-top:8px;color:var(--mut2);font-size:12px}
+.card .nota .um-n{display:block;color:var(--mut);font-size:12.5px;line-height:15px}
+.card .nota .um-n b{color:var(--txt);font-variant-numeric:tabular-nums}
 .card .nota:empty{display:none}
-.card .nota:has(.ora-n){margin-top:6px}
-@media (min-width:761px){#c-n{display:block;min-height:15px;margin-top:6px}} /* PC: riga sempre riservata, la card non cambia altezza */
+.card .nota:has(.ora-n,.um-n){margin-top:6px}
+@media (min-width:761px){#c-n,#e-n{display:block;min-height:15px;margin-top:6px}} /* PC: riga sempre riservata, la card non cambia altezza */
 .ora-n{display:flex;align-items:center;gap:7px;line-height:1.3}
 .ora-n .ck{flex:none;box-sizing:border-box;width:11px;height:11px;border-radius:50%;border:1.5px solid #fff;position:relative}
 .ora-n .ck:before,.ora-n .ck:after{content:"";position:absolute;background:#fff}
@@ -514,3 +516,11 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 .exp svg{flex:none;color:var(--mut)}
 .exp b{display:block;font-size:14px}.exp small{display:block;margin-top:1px;color:var(--mut);font-size:12px}
 @media(max-width:560px){.exp{grid-template-columns:1fr}}
+
+/* Changelog: tab Pannello / Plugin e filtro per plugin */
+.cl-tabs{display:flex;width:max-content;min-width:100%;margin-bottom:0}
+.cl-tabs a{white-space:nowrap}
+.cl-filtro{width:max-content;max-width:100%;overflow-x:auto;scrollbar-width:none}
+.cl-filtro::-webkit-scrollbar{display:none}
+.cl-filtro button{white-space:nowrap;flex:none}
+.cl-v .cl-h .pill.up{align-self:center}

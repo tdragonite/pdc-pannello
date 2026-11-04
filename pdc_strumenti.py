@@ -13,6 +13,7 @@ Fa queste cose, tutte con la sola libreria standard di Python:
   rip-diag     diagnostica della «ripartenza prevista» dello Smarther: perche' c'e' o non c'e', quali pause usa
   nt-webhook-prova  prova i webhook Netatmo: registra un indirizzo temporaneo, ascolta gli eventi dello Smarther e li confronta con homestatus (pannello anche acceso)
   sbrinamenti  elenca gli sbrinamenti trovati nel database, uno per uno, con i cambi di stato grezzi (per controllare il conteggio)
+  meteo-prova  prova a leggere umidita' e temperatura da una pagina WeatherLink "embeddable" (stazione meteo vicina), senza chiavi
 
 Usa un unico config.json nella stessa cartella dello script (lo stesso che
 usera' poi il pannello vero). I token rinnovati vengono riscritti li' dentro.
@@ -23,8 +24,9 @@ Esempi:
     python pdc_strumenti.py nt-dump
     python pdc_strumenti.py rip-diag
     python pdc_strumenti.py nt-webhook-prova --minuti 30
-    python pdc_strumenti.py nt-webhook-prova --metodo nuovo --minuti 20
+    python pdc_strumenti.py nt-webhook-prova --metodo nuovo --minuti 15
     python pdc_strumenti.py sbrinamenti --giorni 28
+    python pdc_strumenti.py meteo-prova "https://www.weatherlink.com/embeddablePage/show/<codice>/summary"
 """
 
 import argparse
@@ -37,7 +39,7 @@ import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parent
@@ -309,7 +311,7 @@ def cmd_st_prova_refresh(cfg, args):
     giri = max(2, args.giri + args.giri % 2)           # numero pari: meta' con refresh, meta' senza
     tipi = ["refresh"] * (giri // 2) + ["controllo"] * (giri // 2)
     random.shuffle(tipi)
-    say(f"\nATTENZIONE: il pannello deve essere FERMO (usa lo stesso token).")
+    say("\nATTENZIONE: il pannello deve essere FERMO (usa lo stesso token).")
     say(f"Faro' {giri} giri da {args.finestra} s ciascuno (circa {giri * (args.finestra + args.pausa) // 60} minuti in tutto, pause comprese), "
         f"in ordine casuale: meta' con il refresh, meta' senza.")
     say("L'ordine e' mescolato a caso apposta, cosi' non si confonde il refresh con un arrivo casuale.\n")
@@ -771,7 +773,8 @@ def wh_ricevitore(porta, segreto, eventi, lock):
             except ValueError:
                 js = {"raw": corpo[:300].decode("utf-8", "replace")}
             with lock:
-                eventi.append({"arrivo": time.time(), "firma": firma, "percorso": self.path, "corpo": js})
+                eventi.append({"arrivo": time.time(), "firma": firma, "percorso": self.path, "corpo": js,
+                               "da": (self.headers.get("CF-Connecting-IP") or self.client_address[0]), "agente": (self.headers.get("User-Agent") or "")[:60]})
             risp = b'{"status":"ok"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -891,6 +894,37 @@ def wh_confronta(evento_mod, stato_mod):
     return {"uguali": uguali, "diversi": diversi, "solo_nel_webhook": solo_ev, "solo_in_homestatus": solo_st}
 
 
+WH_SALTA = ("last_seen", "time_server", "wifi_strength", "rf_strength", "last_user_interaction", "last_bilan", "uptime", "last_activity")
+
+
+def wh_stato_piatto(home):
+    """Lo stato di casa come {campo: valore}, senza i campi che cambiano a ogni lettura."""
+    return {k: v for k, v in walk(home) if not k.split(".")[-1].split("[")[0] in WH_SALTA}
+
+
+def wh_sonda(token, home_id, prima, rapporto):
+    """Legge homestatus e registra (con l'ora) cio' che e' cambiato dall'ultima volta. Restituisce il nuovo stato piatto."""
+    home = (wh_leggi(token, "/api/homestatus", {"home_id": home_id}).get("body") or {}).get("home")
+    if not isinstance(home, dict):
+        return prima
+    ora = datetime.now()
+    nuovo = wh_stato_piatto(home)
+    if prima is not None:
+        for k in sorted(set(prima) | set(nuovo)):
+            if prima.get(k) != nuovo.get(k):
+                rapporto["cambiamenti_netatmo"].append({"arrivo": ora.timestamp(), "campo": k, "prima": prima.get(k), "dopo": nuovo.get(k)})
+                say(f"  {ora.strftime('%H:%M:%S')}  Netatmo vede: {k}: {prima.get(k)} -> {nuovo.get(k)}")
+    return nuovo
+
+
+def wh_controlla_registro(token, url, rapporto):
+    c, js = wh_chiama(token, "GET", "/webhooks/v1/")
+    presente = bool(url and url in json.dumps(js))
+    rapporto["controlli_registro"].append({"ora": datetime.now().isoformat(timespec="seconds"), "http": c, "presente": presente})
+    if c >= 400 or not presente:
+        say(f"  {datetime.now().strftime('%H:%M:%S')}  ATTENZIONE: il webhook non risulta piu' registrato (HTTP {c})")
+
+
 def cmd_nt_webhook_prova(cfg, args):
     import threading
     nt = cfg["netatmo"]
@@ -900,7 +934,8 @@ def cmd_nt_webhook_prova(cfg, args):
         die("Manca netatmo.client_secret in config.json (serve a controllare la firma dei messaggi).")
     eventi, lock = [], threading.Lock()
     rapporto = {"avviato": datetime.now().isoformat(timespec="seconds"), "minuti": args.minuti, "registrazione": None,
-                "eventi": [], "confronti": [], "elenco_prima": None, "elenco_dopo": None, "rimozione": None}
+                "eventi": [], "confronti": [], "elenco_prima": None, "elenco_dopo": None, "rimozione": None,
+                "cambiamenti_netatmo": [], "controlli_registro": []}
 
     say("\nElenco dei webhook gia' presenti sul tuo account ...")
     c0, js0 = wh_chiama(token, "GET", "/webhooks/v1/")
@@ -958,9 +993,18 @@ def cmd_nt_webhook_prova(cfg, args):
             home_id = homes[0]["id"]
         visti = ultimo_conf = n_conf = 0
         fine = time.time() + args.minuti * 60
+        sonda = int(getattr(args, "sonda", 20) or 0)
+        stato_nt = None
+        prox_sonda, prox_reg = time.time(), time.time() + 60
         try:
             while time.time() < fine:
                 time.sleep(1)
+                if sonda and home_id and time.time() >= prox_sonda:
+                    stato_nt = wh_sonda(token, home_id, stato_nt, rapporto)
+                    prox_sonda = time.time() + sonda
+                if time.time() >= prox_reg:
+                    wh_controlla_registro(token, url, rapporto)
+                    prox_reg = time.time() + 120
                 with lock:
                     nuovi = eventi[visti:]
                     visti = len(eventi)
@@ -999,7 +1043,7 @@ def cmd_nt_webhook_prova(cfg, args):
             pr.terminate()
 
     wh_riepilogo(rapporto)
-    for ev in rapporto["eventi"]:
+    for ev in rapporto["eventi"] + rapporto["cambiamenti_netatmo"]:
         ev["arrivo"] = datetime.fromtimestamp(ev["arrivo"]).isoformat(timespec="seconds")
     write_dump("webhook_eventi.json", wh_pulisci(rapporto))
     say("\nFatto. Allega a Claude diagnostica/webhook_eventi.json (e controllalo prima con il Blocco note, NON config.json).")
@@ -1008,6 +1052,21 @@ def cmd_nt_webhook_prova(cfg, args):
 def wh_riepilogo(r):
     ev = r["eventi"]
     say("\n=== RIEPILOGO ===")
+    camb = r.get("cambiamenti_netatmo") or []
+    gruppi = []
+    for c in camb:                       # i cambiamenti letti a meno di 15 secondi l'uno dall'altro sono un solo gesto
+        if not gruppi or c["arrivo"] - gruppi[-1][-1]["arrivo"] > 15:
+            gruppi.append([])
+        gruppi[-1].append(c)
+    utili = [e for e in ev if isinstance(e["corpo"], dict) and e["corpo"].get("push_type") not in ("webhook_activation", "webhook_deletion")]
+    abbinati = sum(1 for g in gruppi if any(0 <= e["arrivo"] - g[0]["arrivo"] <= 90 or 0 <= g[0]["arrivo"] - e["arrivo"] <= 30 for e in utili))
+    say(f"Cambiamenti visti da Netatmo (homestatus): {len(gruppi)} ({len(camb)} campi). Eventi webhook oltre all'attivazione: {len(utili)}. "
+        f"Cambiamenti con un evento vicino: {abbinati}.")
+    reg = r.get("controlli_registro") or []
+    if reg:
+        say(f"Controlli del registro webhook: {sum(1 for x in reg if x['presente'])} su {len(reg)} con il webhook ancora registrato.")
+    if gruppi and not utili:
+        say("=> Netatmo ha visto i tuoi gesti ma non ha mandato nessun evento: guarda i controlli del registro; se era ancora registrato, scrivi a contact-api@netatmo.com.")
     say(f"Eventi ricevuti: {len(ev)}")
     if not ev:
         say("Nessuno. Possibili cause: il tunnel temporaneo non e' raggiungibile da Netatmo, la registrazione e' stata ignorata,")
@@ -1044,6 +1103,135 @@ def wh_riepilogo(r):
             say("=> Il webhook porta tutti i campi di homestatus: si potrebbe costruire lo stato dagli eventi.")
 
 
+
+# --------------------------------------------------------------------------
+# meteo-prova: la stazione meteo vicina (WeatherLink, pagina "embeddable")
+# --------------------------------------------------------------------------
+
+METEO_UA = "Mozilla/5.0 (compatible; pdc-strumenti/1.0)"
+METEO_CHIAVI = re.compile(r"hum|temp|dew|rain|wind|bar|press|time|date|updat|ts$|stamp|name|title", re.I)
+
+
+def meteo_scarica(url, max_byte=2_000_000):
+    """Scarica un indirizzo: (http, content-type, testo) oppure (None, errore, '')."""
+    try:
+        with urlopen(Request(url, headers={"User-Agent": METEO_UA, "Accept": "application/json, text/html, */*"}), timeout=15) as r:
+            return r.status, r.headers.get("Content-Type", ""), r.read(max_byte).decode("utf-8", "replace")
+    except HTTPError as e:
+        try:
+            corpo = e.read(2000).decode("utf-8", "replace")
+        except Exception:
+            corpo = ""
+        return e.code, e.headers.get("Content-Type", "") if e.headers else "", corpo
+    except (URLError, OSError, ValueError) as e:
+        return None, f"{type(e).__name__}: {e}", ""
+
+
+def meteo_valori(obj, percorso="", out=None):
+    """Percorre un JSON e raccoglie i campi che sembrano temperatura, umidita', orario..."""
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            meteo_valori(v, f"{percorso}.{k}" if percorso else str(k), out)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:40]):
+            meteo_valori(v, f"{percorso}[{i}]", out)
+    elif isinstance(obj, (int, float, str)) and METEO_CHIAVI.search(percorso.rsplit(".", 1)[-1]):
+        out.append((percorso, obj))
+    return out
+
+
+def cmd_meteo_prova(cfg, args):
+    url = args.url.strip()
+    m = re.search(r"^(https?://[^/]+)/embeddablePage/show/([0-9a-fA-F]{32})", url)
+    if not m:
+        die("L'indirizzo non sembra una pagina WeatherLink 'embeddable'. Deve essere del tipo "
+            "https://www.weatherlink.com/embeddablePage/show/<32 caratteri>/summary")
+    base, codice = m.group(1), m.group(2)
+    rapporto = {"url": url, "candidati": []}
+
+    say(f"1) Leggo la pagina {url} ...")
+    http, tipo, html = meteo_scarica(url)
+    say(f"   HTTP {http}, {tipo}, {len(html)} caratteri")
+    if http is None:
+        die("Non riesco a raggiungere la pagina (vedi sopra). Controlla la connessione e riprova.")
+    titolo = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+    if titolo:
+        say(f"   Titolo della pagina: {titolo.group(1).strip()}")
+        rapporto["titolo"] = titolo.group(1).strip()
+
+    # 2) indirizzi candidati: quello classico + qualunque riferimento a getData / api trovato nella pagina e nei suoi script
+    cand = [f"{base}/embeddablePage/getData/{codice}"]
+    script = re.findall(r'<script[^>]+src="([^"]+)"', html, re.I)
+    testi = [html]
+    for sc in script[:12]:
+        if sc.startswith("//"):
+            sc = "https:" + sc
+        elif sc.startswith("/"):
+            sc = base + sc
+        if not sc.startswith("http") or "googletagmanager" in sc or "google-analytics" in sc:
+            continue
+        h, _, t = meteo_scarica(sc, 3_000_000)
+        if h == 200:
+            testi.append(t)
+    trovati = set()
+    for t in testi:
+        for r in re.findall(r"""["'`]((?:https?:)?/{0,2}[\w./:-]*(?:getData|embeddablePage|/api/|/v1/|/v2/)[\w./:?=&%-]*)["'`]""", t):
+            trovati.add(r)
+    rapporto["riferimenti_trovati"] = sorted(trovati)[:40]
+    say(f"2) Riferimenti a dati/API trovati nella pagina e negli script: {len(trovati)}")
+    for r in sorted(trovati)[:25]:
+        say("     " + r)
+    for r in sorted(trovati):
+        if "getData" in r or "embeddablePage" in r:
+            u = r if r.startswith("http") else (base + r if r.startswith("/") else None)
+            if u:
+                u = u.replace("{token}", codice).replace("${token}", codice)
+                if u.rstrip("/").endswith(("getData", "getdata")):
+                    u = u.rstrip("/") + "/" + codice
+                if u not in cand and "{" not in u and "$" not in u:
+                    cand.append(u)
+
+    say("3) Provo gli indirizzi candidati:")
+    buono = None
+    for u in cand[:8]:
+        h, tipo, corpo = meteo_scarica(u)
+        riga = {"url": u, "http": h, "tipo": tipo, "byte": len(corpo)}
+        say(f"   {riga['url']}  ->  HTTP {h}, {tipo}, {len(corpo)} caratteri")
+        js = None
+        if h == 200:
+            try:
+                js = json.loads(corpo)
+            except ValueError:
+                say("      (non e' JSON; inizio: " + corpo[:120].replace("\n", " ") + ")")
+        if js is not None:
+            valori = meteo_valori(js)
+            riga["valori"] = valori[:60]
+            say(f"      JSON valido: {len(valori)} campi di interesse")
+            if buono is None:
+                buono = (u, js, valori)
+        rapporto["candidati"].append(riga)
+
+    if buono:
+        u, js, valori = buono
+        say("\n4) Campi che sembrano temperatura, umidita', orario (primi 40):")
+        for k, v in valori[:40]:
+            say(f"     {k} = {v}")
+        hum = [(k, v) for k, v in valori if re.search(r"hum", k, re.I) and isinstance(v, (int, float, str))]
+        say("\n=> Umidita' trovata: " + (", ".join(f"{k}={v}" for k, v in hum[:6]) if hum else "NESSUN campo con 'hum': guarda l'elenco qui sopra."))
+        ult = js.get("lastReceived") if isinstance(js, dict) else None
+        if isinstance(ult, (int, float)) and ult > 1e11:          # millisecondi dal 1970
+            minuti = (time.time() - ult / 1000) / 60
+            say(f"   Ultimo dato ricevuto dalla stazione: {datetime.fromtimestamp(ult / 1000):%d/%m/%Y %H:%M} ({minuti:.0f} minuti fa)")
+        say("\n>>> INDIRIZZO DEI DATI da incollare in Impostazioni del pannello (se la stazione cambia, rilancia questo comando e incolla il nuovo):")
+        say("\n    " + u + "\n")
+        rapporto["json_completo"] = js if len(json.dumps(js)) < 200_000 else "troppo grande"
+    else:
+        say("\n=> Nessun indirizzo JSON leggibile: la stazione potrebbe non offrire i dati senza chiavi.")
+    write_dump("meteo_prova.json", rapporto)
+    say("\nFatto. Allega a Claude diagnostica/meteo_prova.json (non contiene password ne' token).")
+
+
 # --------------------------------------------------------------------------
 
 def main():
@@ -1067,6 +1255,7 @@ def main():
     r.add_argument("--ogni", type=int, default=10, help="secondi tra una lettura e l'altra (default 10)")
     w = sub.add_parser("nt-webhook-prova", help="prova i webhook Netatmo con un tunnel temporaneo (il pannello puo' restare acceso)")
     w.add_argument("--minuti", type=int, default=30, help="quanti minuti restare in ascolto (default 30)")
+    w.add_argument("--sonda", type=int, default=20, help="ogni quanti secondi leggere anche homestatus per vedere i tuoi gesti (default 20, 0 = mai)")
     w.add_argument("--porta", type=int, default=0, help="porta locale del ricevitore (default: ne sceglie una libera da sola)")
     w.add_argument("--url", help="usa questo indirizzo pubblico (che deve arrivare alla --porta di questo PC) invece del tunnel temporaneo")
     w.add_argument("--metodo", choices=("vecchio", "nuovo"), default="vecchio",
@@ -1081,12 +1270,15 @@ def main():
     b.add_argument("--db", help="percorso del database (di solito lo trova da solo)")
     b.add_argument("--giorni", type=int, default=7, help="quanti giorni guardare (default 7)")
     b.add_argument("--salva", action="store_true", help="salva anche il rapporto in diagnostica/sbrinamenti.json")
+    mp = sub.add_parser("meteo-prova", help="prova a leggere umidita' e temperatura da una pagina WeatherLink 'embeddable' (nessuna chiave, config.json non serve)")
+    mp.add_argument("url", help="indirizzo della pagina, tipo https://www.weatherlink.com/embeddablePage/show/<codice>/summary")
+    mp.add_argument("--salva", action="store_true", help="(sempre attivo, il rapporto va in diagnostica/meteo_prova.json)")
     args = ap.parse_args()
     if not args.cmd:
         ap.print_help()
         return
-    if args.cmd in ("rip-diag", "sbrinamenti"):        # non serve config.json e non ne crea
-        (cmd_rip_diag if args.cmd == "rip-diag" else cmd_sbrinamenti)(None, args)
+    if args.cmd in ("rip-diag", "sbrinamenti", "meteo-prova"):        # non serve config.json e non ne crea
+        {"rip-diag": cmd_rip_diag, "sbrinamenti": cmd_sbrinamenti, "meteo-prova": cmd_meteo_prova}[args.cmd](None, args)
         return
     cfg = load_cfg()
     if args.cmd == "nt-webhook-prova" and args.elimina:

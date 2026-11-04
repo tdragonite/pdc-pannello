@@ -1,6 +1,6 @@
 # Strumenti di appoggio (pdc_strumenti.py)
 
-Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`) vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
+Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`) vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6), **provare a leggere una stazione meteo vicina** (`meteo-prova`, capitolo 8) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
 
 Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
 
@@ -136,9 +136,11 @@ Netatmo ridurra' i limiti del polling dal 1 marzo 2027 e propone i webhook (il s
 python pdc_strumenti.py nt-webhook-prova
 ```
 
-1. Lancia il comando (di default resta in ascolto 30 minuti; `--minuti 10` per una prova breve).
+1. Lancia il comando (di default resta in ascolto 30 minuti; `--minuti 15` basta per la prova).
 2. Quando compare "Ascolto per ...", muovi lo Smarther: cambia la temperatura impostata dall'app BTicino, accendi e spegni, aspetta una partenza o uno stop del riscaldamento. Vedrai comparire gli eventi riga per riga.
 3. A fine tempo c'e' un riepilogo e il file `diagnostica/webhook_eventi.json` (user_id, home_id e indirizzi sono gia' omessi): controllalo con il Blocco note e mandalo a Claude.
+
+**Dal 4 novembre** il comando guarda anche *dalla parte di Netatmo*: ogni 20 secondi (`--sonda 30` per cambiare, `--sonda 0` per spegnere) legge `homestatus` e scrive con l'ora ogni cosa che cambia («Netatmo vede: rooms[0].therm_setpoint_temperature: 21 -> 22»), e ogni 2 minuti controlla con `GET /webhooks/v1/` che il webhook sia ancora registrato. Nel riepilogo finale confronta i due lati: quanti tuoi gesti ha visto Netatmo e quanti eventi sono arrivati (il file `webhook_eventi.json` ha le sezioni `cambiamenti_netatmo` e `controlli_registro`). Cosi' si capisce se un evento manca perche' Netatmo non lo manda o perche' non arriva a noi.
 
 Cosa guarda: quali tipi di evento arrivano, con che ritardo, quali campi portano (temperatura, setpoint, umidita', richiesta di calore) e, dopo ogni evento, li confronta con quello che dice `homestatus` (al massimo 12 confronti, per non consumare richieste).
 
@@ -160,6 +162,16 @@ python pdc_strumenti.py rip-diag --salva         scrive anche diagnostica/rip_di
 ```
 
 Legge `dati/pdc.db` (come `sbrinamenti`, anche a pannello acceso; serve `pdc_pannello.py` nella stessa cartella) e usa le stesse funzioni del pannello. Stampa i dati dello Smarther che ci sono nel database, poi le pause del riscaldamento trovate nello storico, una per riga: «OK» con la velocita' di discesa della temperatura (`k`) oppure «scartata» con il motivo (pausa troppo corta, la temperatura non scende, la pausa non e' finita, buchi nei dati). Servono almeno 5 pause valide per una stima. Con `--salva` scrive il rapporto in `diagnostica/rip_diag.json`: mandalo a chi ti aiuta.
+
+## 8. Stazione meteo vicina (meteo-prova, novembre 2026)
+
+Prova a leggere umidità (e temperatura) da una pagina **WeatherLink** pubblica di una stazione meteo vicina, senza chiavi. Serve per capire se i dati della pagina sono leggibili da un programma, prima di aggiungere l'«umidità esterna» al pannello.
+
+```
+python pdc_strumenti.py meteo-prova "https://www.weatherlink.com/embeddablePage/show/<codice>/summary"
+```
+
+Non usa `config.json` e non tocca il pannello. Fa tre cose: legge la pagina (titolo e script), cerca al suo interno gli indirizzi da cui prende i dati, poi prova gli indirizzi trovati (compreso quello classico `.../embeddablePage/getData/<codice>`). Se uno risponde con un JSON, stampa i campi che sembrano temperatura, umidità e orario. Se trova i dati, stampa in fondo l'**indirizzo dei dati** (quello grezzo, non quello della pagina) con l'ora dell'ultimo dato ricevuto dalla stazione: è quello da incollare nelle impostazioni del pannello; se la stazione cambia, rilancia il comando e incolla il nuovo. Alla fine scrive `diagnostica/meteo_prova.json`: mandalo a chi ti aiuta (non contiene password né token, solo dati pubblici della stazione).
 
 ## Esperimento: il comando "refresh" anticipa i dati del ciclo?
 
