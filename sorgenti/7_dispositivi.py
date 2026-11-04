@@ -255,6 +255,7 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
             _riga("Richiesta di calore", "Sì" if richiesta == 1.0 else "No" if richiesta == 0.0 else None, "b",
                   "warn" if richiesta == 1.0 else "no"),
             _riga("Modalità", MODI_SMARTHER.get(modo, modo)),
+            (lambda vn: _riga("Programma orario", vn[0], nota=vn[1]))(_testo_programma(t("info.nt.programma"))),
             wifi,
         ]},
         {"titolo": "Identificativi", "righe": [
@@ -272,6 +273,47 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
     return {"id": "smarther", "titolo": "Termostato", "sotto": "via Netatmo",
             "loghi": ["smarther"], "marca": "Smarther",
             "stato": {"testo": testo, "cls": cls}, "ultimo_dato": r[1] if r else None, "gruppi": gruppi}
+
+
+GIORNI_BREVI = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+
+
+def _testo_programma(raw):
+    """Programma dello Smarther in una frase: 'sempre 20°' oppure i giorni raggruppati con le fasce."""
+    if not raw:
+        return None, ""
+    try:
+        p = json.loads(raw)
+    except ValueError:
+        return None, ""
+    if p.get("errore"):
+        return "Formato non riconosciuto", ""
+    fasce = p.get("fasce") or []
+    if not fasce:
+        return "Non disponibile", "Lo Smarther non ha restituito nessun programma orario."
+    g = lambda v: (f"{v:.1f}".rstrip("0").rstrip(".")).replace(".", ",") + "°"
+    nome = f"«{p['nome']}»" if p.get("nome") else "A fasce"
+    temps = {x[1] for x in fasce}
+    if len(temps) == 1:
+        return f"Fisso a {g(fasce[0][1])}", "Stessa temperatura 24 ore su 24, 7 giorni su 7: nessuna fascia."
+    giorni = []
+    for d in range(7):
+        prima = [x for x in fasce if x[0] < d * 1440]
+        riga = [(x[0] % 1440, x[1]) for x in fasce if d * 1440 <= x[0] < (d + 1) * 1440]
+        if (not riga or riga[0][0] > 0) and (prima or fasce):
+            riga.insert(0, (0, (prima[-1] if prima else fasce[-1])[1]))
+        giorni.append(" ".join(f"{m // 60:02d}:{m % 60:02d} {g(t)}" for m, t in riga))
+    gruppi = []
+    for d, txt in enumerate(giorni):
+        if gruppi and gruppi[-1][1] == txt and gruppi[-1][0][-1] == d - 1:
+            gruppi[-1][0].append(d)
+        else:
+            gruppi.append(([d], txt))
+    parti = []
+    for dd, txt in gruppi:
+        nome_g = GIORNI_BREVI[dd[0]] if len(dd) == 1 else f"{GIORNI_BREVI[dd[0]]}–{GIORNI_BREVI[dd[-1]]}"
+        parti.append(f"{nome_g}: {txt}")
+    return nome, " · ".join(parti)
 
 
 STORICO_SERIE = {
@@ -442,7 +484,7 @@ _FSV_VALORI = {
     "2081": {1: "Pavimento radiante", 2: "Ventilconvettori"},
     "3042": {0: "Domenica", 1: "Lunedì", 2: "Martedì", 3: "Mercoledì", 4: "Giovedì", 5: "Venerdì", 6: "Sabato",
              7: "Ogni giorno"},
-    "3071": {0: "Verso l'ambiente (casa)", 1: "Verso il bollitore"},
+    "3071": {0: "Verso il riscaldamento", 1: "Verso il bollitore"},
     "5043": {0: "Bassa", 1: "Alta"},
     "5094": {0: "Solo pompa di calore (55 °C)", 1: "Pompa e resistenza (70 °C)"},
 }

@@ -5,7 +5,7 @@ Un solo file Python, nessuna dipendenza oltre a Python 3.9+.
 
 - `pdc_pannello.py` – il pannello (**file generato**, è quello da avviare)
 - `sorgenti/` – i sorgenti veri; `python costruisci.py` li riunisce in `pdc_pannello.py`
-- `pdc_strumenti.py` – strumenti di appoggio (dump SmartThings/Netatmo, OAuth, esperimento `st-prova-refresh`)
+- `pdc_strumenti.py` – strumenti di appoggio (dump SmartThings/Netatmo, OAuth, `st-prova-refresh`, `rip-diag`, `sbrinamenti`)
 - `config.example.json` – modello vuoto di configurazione: copialo come `config.json` e compilalo
 - `docs/` – guida completa (`README.md`), note tecniche per versione (`PIANO.md`), guida degli strumenti
 - `extra/` – script di prova vari

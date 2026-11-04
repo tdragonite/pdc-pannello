@@ -25,7 +25,7 @@ TITOLI = {
     "st_pat": "Token personale SmartThings",
     "st_pdc_offline": "Pompa di calore offline",
     "st_ciclo_formato": "Formato dei dati ciclo",
-    "nessun_dato": "Dati dalla pdc",
+    "nessun_dato": "Dati dalla PdC",
     "pdc_ferma_con_richiesta": "Pompa ferma con richiesta di calore",
     "casa_fredda": "Temperatura in casa",
     "umidita_alta": "Umidità alta",
@@ -36,6 +36,8 @@ TITOLI = {
     "acs_bassa": "Acqua calda sanitaria",
     "cop_basso": "Efficienza (COP)",
     "sbrinamenti_frequenti": "Sbrinamenti frequenti",
+    "sbrinamento_inizio": "Sbrinamento iniziato",
+    "sbrinamento_fine": "Sbrinamento finito",
 }
 
 MESSAGGI_DEFAULT = {
@@ -48,9 +50,11 @@ MESSAGGI_DEFAULT = {
     "promemoria": "⏰ <b>{impianto}</b>\nCi siamo ancora: {testo}\n<i>da {durata}</i>",
     "riepilogo": "☀️ <b>{impianto} · ieri, {data}</b>\n"
                  "⚡ Energia: <b>{energia} kWh</b> · COP <b>{cop}</b>\n"
-                 "🔥 Casa {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli casa)\n"
+                 "🔥 Riscaldamento {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli)\n"
                  "🏠 In casa {casa_min}–{casa_max} °C · fuori {esterna} °C\n{anomalie}",
     "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
+    "sbrinamento_inizio": "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}.",
+    "sbrinamento_fine": "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}.",
     "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
     "per_codice": {},
 }
@@ -70,6 +74,8 @@ ALLARMI_DEFAULT = {
     "acs_bassa": {"attivo": True, "sotto_gradi": 35.0, "minuti": 30},
     "cop_basso": {"attivo": True, "sotto": 2.0, "ore_minime": 3},
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
+    "sbrinamento_inizio": {"attivo": True},     # non sono anomalie: avvisi informativi, sempre senza suoneria
+    "sbrinamento_fine": {"attivo": True},
 }
 
 TELEGRAM_DEFAULT = {
@@ -194,10 +200,11 @@ class Telegram:
             return f"{valori['impianto']}: {valori['testo']}"
 
     # ----- coda -----
-    def accoda(self, tipo, codice, livello, testo, ritardo=0, durata_s=0, extra=None, forza=False):
+    def accoda(self, tipo, codice, livello, testo, ritardo=0, durata_s=0, extra=None, forza=False, muto=False):
         with self.lock:
             self.coda.append({"due": time.time() + ritardo, "tipo": tipo, "codice": codice, "livello": livello,
-                              "testo": testo, "durata_s": durata_s, "extra": extra, "tentativi": 0, "forza": forza})
+                              "testo": testo, "durata_s": durata_s, "extra": extra, "tentativi": 0, "forza": forza,
+                              "muto": muto})
 
     def ascolta(self, tipo, codice, livello, testo):
         """Registrato in Eventi.ascoltatori: arriva da tutte le anomalie (script, collegamenti, sentinella)."""
@@ -310,7 +317,7 @@ class Telegram:
                 self._togli(e)
                 continue
             testo = self.formatta(e["tipo"], e["codice"], e["livello"], e["testo"], e["durata_s"], e["extra"])
-            ok, msg = self.invia_ora(testo, self.silenzioso(e["livello"]))
+            ok, msg = self.invia_ora(testo, e.get("muto") or self.silenzioso(e["livello"]))
             if ok:
                 self.ult_invio.append(time.time())
                 self._togli(e)
@@ -397,12 +404,14 @@ class Sentinella(threading.Thread):
         self.falso_da = {}    # codice -> da quando la condizione e' falsa
         self.ult_cop = 0
         self.cop_cond = False
+        self.sbr_primo = True   # primo controllo dopo l'avvio: uno sbrinamento gia' in corso non si riannuncia
 
     def run(self):
         self.fermo.wait(45)    # lascia partire i raccoglitori
         while not self.fermo.is_set():
             try:
                 self.valuta()
+                self.avvisa_sbrinamento()
                 self.app.eventi.chiudi("pannello_script")
                 if getattr(self.app, "telegram", None):
                     self.app.telegram.promemoria_aperti()
@@ -556,6 +565,42 @@ class Sentinella(threading.Thread):
             self.imposta("cop_basso", valido and self.cop_cond,
                          f"Negli ultimi giorni il COP stimato è {num_it(cop, 2)} (soglia {num_it(r['sotto'])}): "
                          "la pompa rende meno del solito.")
+
+    # ----- sbrinamento: due avvisi informativi (inizio e fine), sempre senza suoneria -----
+    def avvisa_sbrinamento(self):
+        """Segue lo stato pdc.sbrinamento. L'inizio dello sbrinamento annunciato resta in 'tg_sbr_inizio': dopo un riavvio
+        non si riannuncia l'inizio, ma la fine si'. Non sono anomalie: niente eventi, niente promemoria."""
+        db, tg = self.app.db, self.app.telegram
+        ora = int(time.time())
+        r = {x[0]: x for x in db.ultimi()}.get("pdc.sbrinamento")
+        primo, self.sbr_primo = self.sbr_primo, False
+        if not r or r[3] not in ("on", "off") or ora - r[1] > 900:
+            return
+        try:
+            inizio = int(db.meta_get("tg_sbr_inizio", "0") or 0)
+        except ValueError:
+            inizio = 0
+        if inizio and ora - inizio > 3 * 3600:      # dimenticato da ore (pannello spento): non si racconta
+            inizio = 0
+            db.meta_set("tg_sbr_inizio", "0")
+        if r[3] == "on" and not inizio:
+            on_ts = [t for t, v in q_cambi(db, "pdc.sbrinamento", ora - 6 * 3600, ora) if v == "on"]
+            inizio = on_ts[-1] if on_ts else ora
+            db.meta_set("tg_sbr_inizio", str(inizio))
+            if not primo and tg.allarme_attivo("sbrinamento_inizio"):
+                est = {x[0]: x for x in db.ultimi()}.get("ciclo.esterna")
+                est_t = f"{num_it(est[2], 0)} °C" if est and est[2] is not None and ora - est[1] <= 1800 else "n.d."
+                tg.accoda("sbrinamento_inizio", "sbrinamento_inizio", "info", "", extra={"esterna": est_t,
+                          "ora": time.strftime("%H:%M", time.localtime(inizio))}, muto=True)
+        elif r[3] == "off" and inizio:
+            db.meta_set("tg_sbr_inizio", "0")
+            if tg.allarme_attivo("sbrinamento_fine"):
+                x = [e for e in elenco_sbrinamenti(db, inizio - 1, ora, ora)["elenco"] if not e["incorso"]]
+                minuti = x[0]["min"] if x else max(1, round((ora - inizio) / 60))
+                kwh = x[0]["kwh"] if x else None
+                tg.accoda("sbrinamento_fine", "sbrinamento_fine", "info", "", extra={
+                    "durata": f"{minuti} min",
+                    "consumo": f"consumo circa {num_it(kwh, 2)} kWh" if kwh is not None else "consumo non disponibile"}, muto=True)
 
     # ----- riepilogo del mattino -----
     # ----- cosa e' successo durante il silenzio notturno -----

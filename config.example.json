@@ -39,6 +39,11 @@
       "access_token": "",
       "refresh_token": "",
       "expires_at": 0
+    },
+    "refresh": {
+      "_nota": "Facoltativo. SmartThings consegna i dati del compressore con 4-5 minuti di ritardo. Con 'attivo' il pannello, SOLO mentre la pompa lavora, le chiede di aggiornarsi (comando 'refresh') ogni 'ogni_secondi' secondi. Non cambia nessuna impostazione della pompa; serve il permesso di comando del token (x:devices:*).",
+      "attivo": false,
+      "ogni_secondi": 60
     }
   },
   "netatmo": {
@@ -88,7 +93,9 @@
       "riepilogo": "☀️ <b>{impianto} · ieri, {data}</b>\n⚡ Energia: <b>{energia} kWh</b> · COP <b>{cop}</b>\n🔥 Casa {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli casa)\n🏠 In casa {casa_min}–{casa_max} °C · fuori {esterna} °C\n{anomalie}",
       "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
       "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
-      "per_codice": {}
+      "per_codice": {},
+      "sbrinamento_inizio": "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}.",
+      "sbrinamento_fine": "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}."
     }
   },
   "allarmi": {
@@ -142,6 +149,12 @@
       "attivo": true,
       "quanti": 6,
       "ore": 3
+    },
+    "sbrinamento_inizio": {
+      "attivo": true
+    },
+    "sbrinamento_fine": {
+      "attivo": true
     }
   },
   "cloudflare": {

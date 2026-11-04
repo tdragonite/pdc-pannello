@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.17"
+VERSIONE = "0.19"
 
 import argparse
 import base64
@@ -262,6 +262,11 @@ TEMPLATE = {
                  "L'avviso rientra quando scende di 'rientro_punti' sotto la soglia.",
         "giallo": 60.0, "rosso": 70.0, "minuti": 30, "rientro_punti": 2.0,
     },
+    "meteo": {
+        "_nota": "Posizione per il meteo del giorno nella Dashboard (card Esterna), da Open-Meteo. Ora c'è Cirié. Per toglierlo svuota le due coordinate ('').",
+        "latitudine": 45.23,
+        "longitudine": 7.60,
+    },
     "tariffa": {
         "_nota": "Prezzo dell'energia elettrica in euro per kWh (con le tasse, per esempio 0.28). 0 = non mostrare i costi.",
         "prezzo_kwh": 0.0,
@@ -276,6 +281,12 @@ TEMPLATE = {
         "pat": "",
         "oauth": {"client_id": "", "client_secret": "", "access_token": "",
                   "refresh_token": "", "expires_at": 0},
+        "refresh": {
+            "_nota": "Facoltativo. SmartThings consegna i dati del compressore con 4-5 minuti di ritardo. Con 'attivo' il pannello, "
+                     "SOLO mentre la pompa lavora, le chiede di aggiornarsi (comando 'refresh') ogni 'ogni_secondi' secondi. "
+                     "Non cambia nessuna impostazione della pompa; serve il permesso di comando del token (x:devices:*).",
+            "attivo": False, "ogni_secondi": 60,
+        },
     },
     "netatmo": {"client_id": "", "client_secret": "", "access_token": "", "refresh_token": "",
                 "expires_at": 0, "home_id": "", "room_id": ""},
@@ -792,6 +803,39 @@ def estrai_netatmo(js, room_id, ts):
     return rec
 
 
+def _programma_smarther(home, mod):
+    """Programma orario dello Smarther da /api/homesdata: {"nome", "fasce": [[minuti da lunedi' 00:00, temperatura], ...]}.
+    Senza programma (o in un formato che non conosco) 'fasce' e' vuoto."""
+    scheda = None
+    for sc in home.get("schedules") or []:
+        if sc.get("type", "therm") == "therm" and (sc.get("selected") or scheda is None):
+            scheda = sc
+            if sc.get("selected"):
+                break
+    if not scheda:
+        return {"nome": None, "fasce": []}
+    stanza = str(mod.get("room_id")) if mod else None
+    zone = {}
+    for z in scheda.get("zones") or []:
+        temp = None
+        rt = z.get("rooms_temp") or []
+        r = next((x for x in rt if str(x.get("room_id")) == stanza), rt[0] if rt else None)
+        if r is not None:
+            temp = r.get("temp")
+        if temp is None:
+            rr = z.get("rooms") or []
+            r2 = next((x for x in rr if str(x.get("id")) == stanza), rr[0] if rr else None)
+            if r2 is not None:
+                temp = r2.get("therm_setpoint_temperature")
+        zone[z.get("id")] = temp
+    fasce = []
+    for t in sorted(scheda.get("timetable") or [], key=lambda x: x.get("m_offset", 0)):
+        temp = zone.get(t.get("zone_id"))
+        if temp is not None:
+            fasce.append([int(t.get("m_offset", 0)), float(temp)])
+    return {"nome": scheda.get("name"), "fasce": fasce}
+
+
 def estrai_netatmo_casa(js):
     """Dati descrittivi (cambiano di rado) da /api/homesdata: nome del modulo, stanza, data di installazione."""
     rec = Rec()
@@ -808,6 +852,10 @@ def estrai_netatmo_casa(js):
     s("info.nt.casa", home.get("name"))
     s("info.nt.modo_termico", home.get("therm_mode"))
     s("info.nt.controllo", home.get("temperature_control_mode"))
+    try:
+        s("info.nt.programma", json.dumps(_programma_smarther(home, mod), ensure_ascii=False))
+    except Exception:
+        s("info.nt.programma", '{"errore": true}')   # accessorio: la riga dice 'formato non riconosciuto'
     if mod:
         s("info.nt.nome", mod.get("name"))
         s("info.nt.installato", mod.get("setup_date"))
@@ -898,6 +946,8 @@ class ServizioST(Raccoglitore):
         super().__init__(app, "st")
         self.passi = 0
         self.offline = 0
+        # stato del "refresh" (vedi _refresh): lo legge la Dashboard
+        self.refresh_info = {"stato": "spento", "inviati": 0, "ultimo": None, "messaggio": None, "bloccato_fino": 0}
 
     def intervallo(self):
         # SmartThings concede circa 12 richieste/minuto: sotto i 20 secondi non scendiamo
@@ -922,11 +972,11 @@ class ServizioST(Raccoglitore):
             for comp in d.get("components", []) for c in comp.get("capabilities", []))]
         if len(ehs) != 1:
             elenco = ", ".join(f"{d.get('label') or d.get('name')} ({d['deviceId']})" for d in items)
-            raise ErroreConfig("SmartThings: non riesco a capire quale sia la pdc. Scrivi il device_id in "
+            raise ErroreConfig("SmartThings: non riesco a capire quale sia la PdC. Scrivi il device_id in "
                                "config.json (smartthings -> device_id). Dispositivi: " + elenco)
         dev = ehs[0]["deviceId"]
         self.app.cfg.aggiorna(lambda raw: raw.setdefault("smartthings", {}).update(device_id=dev))
-        log.info("pdc trovata e salvata in config.json")
+        log.info("PdC trovata e salvata in config.json")
         return dev
 
     def passo(self):
@@ -939,7 +989,7 @@ class ServizioST(Raccoglitore):
         self._misura_ritardo(rec, ts)
         if rec.problemi:
             self.app.eventi.apri("st_ciclo_formato", "Formato dei dati ciclo non riconosciuto "
-                                 f"({rec.problemi[0]}): forse un aggiornamento della pdc. Fammi vedere "
+                                 f"({rec.problemi[0]}): forse un aggiornamento della PdC. Fammi vedere "
                                  "diagnostica.json.", "avviso")
         elif rec.ciclo:
             self.app.eventi.chiudi("st_ciclo_formato")
@@ -950,7 +1000,69 @@ class ServizioST(Raccoglitore):
             self._info_dispositivo(dev, ts)
         self.passi += 1
         self._controlla_pat()
+        try:
+            self._refresh(dev, ts)
+        except Exception:   # e' un extra: non deve mai rovinare la lettura normale
+            log.exception("refresh: errore inatteso (ignorato)")
         return cambiati
+
+    def _pdc_lavora(self, ts):
+        """La pompa sta lavorando (o sta per partire / appena finito)? Si guarda solo cio' che e' gia' nel database:
+        compressore in marcia in un campione recente, Smarther che chiede calore, acqua dell'impianto che si muove."""
+        with closing(self.app.db._c()) as c:
+            def ultimo(serie, da):
+                r = c.execute("SELECT valore FROM misure WHERE serie=? AND ts>=? ORDER BY ts DESC LIMIT 1", (serie, da)).fetchone()
+                return r[0] if r else None
+            hz = ultimo("ciclo.freq_compressore", ts - 900)
+            if hz is not None and hz > 0:
+                return True
+            if ultimo("casa.richiesta_calore", ts - 300) == 1.0:
+                return True
+            acqua = [v for (v,) in c.execute("SELECT valore FROM misure WHERE serie='risc.acqua' AND ts>=?", (ts - 420,))]
+        return len(acqua) >= 3 and max(acqua) - min(acqua) >= 1.5
+
+    def _refresh(self, dev, ts):
+        """Se attivato in config.json (smartthings.refresh), mentre la pompa lavora manda ogni N secondi il comando 'refresh':
+        la pdc consegna subito i campioni del ciclo che ha (dalle prove: 4 volte su 7 entro 10 secondi, a volte freschi, a volte
+        arretrati). Subito dopo si rilegge. Se il token non ha il permesso di comando, o SmartThings protesta, si smette per un po'."""
+        info = self.refresh_info
+        cfg = (self.app.cfg.leggi()["smartthings"].get("refresh")) or {}
+        if not cfg.get("attivo"):
+            info.update(stato="spento", messaggio=None)
+            return
+        if info["bloccato_fino"] > ts:
+            return
+        ogni = max(30, int(cfg.get("ogni_secondi") or 60))
+        if info["ultimo"] and ts - info["ultimo"] < ogni - 5:
+            return
+        if not self._pdc_lavora(ts):
+            info.update(stato="a riposo", messaggio=None)
+            return
+        corpo = json.dumps({"commands": [{"component": "main", "capability": "refresh", "command": "refresh"}]}).encode()
+        try:
+            token = self.app.token_st.get()
+            code, js = http_json("POST", f"{ST_API}/devices/{dev}/commands",
+                                 {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                                  "Accept": "application/json"}, corpo)
+        except Exception as e:
+            info.update(stato="errore", messaggio=str(e)[:120], bloccato_fino=ts + 300)
+            return
+        if code == 401 and not self.app.token_st.usa_pat():
+            self.app.token_st.invalida()
+            info.update(stato="errore", bloccato_fino=ts + 120, messaggio="token SmartThings da rinnovare, riprovo")
+        elif code in (401, 403):
+            info.update(stato="permesso", bloccato_fino=ts + 3600,
+                        messaggio="il token SmartThings non ha il permesso di comando (x:devices:*)")
+            log.warning("refresh: %s; riprovo tra un'ora", info["messaggio"])
+        elif code == 429:
+            info.update(stato="errore", bloccato_fino=ts + 300, messaggio="troppe richieste a SmartThings")
+        elif code >= 400:
+            info.update(stato="errore", bloccato_fino=ts + 300, messaggio=f"SmartThings ha risposto {code}")
+        else:
+            info.update(stato="attivo", ultimo=ts, messaggio=None, inviati=info["inviati"] + 1)
+            t = threading.Timer(12, self.sveglia.set)   # i dati arrivano in ~10 secondi: rileggi subito dopo
+            t.daemon = True
+            t.start()
 
     def _misura_ritardo(self, rec, ts):
         """Diagnostica: quanto e' vecchio il campione del ciclo quando ARRIVA (serie diag.ritardo_ciclo, in secondi)."""
@@ -1256,6 +1368,7 @@ class App:
 # ==========================================================================
 
 import bisect
+import gzip
 import hmac
 import math
 import queue
@@ -1268,8 +1381,9 @@ from urllib.parse import parse_qs, urlparse
 WEB_ASSETS = {
     'app.css': r''':root{
   --bg:#0b0f17; --bg2:#0f1521; --card:#121a28; --card2:#172033; --linea:rgba(255,255,255,.07);
-  --txt:#e8edf5; --mut:#8793a8; --mut2:#5d6a80;
+  --txt:#eef2f8; --mut:#a9b4c7; --mut2:#8491a8;
   --casa:#ff6b57; --acs:#4da3ff; --est:#34d3b0; --en:#ffb547; --amb:#a78bfa; --ok:#62eba6; --warn:#ffb547; --bad:#ff5d6c;
+  --c-casa:255,107,87; --c-acs:77,163,255; --c-est:52,211,176; --c-en:255,181,71; --c-bad:255,93,108; --c-ok:98,235,166;
   --r:16px; --sab:env(safe-area-inset-bottom,0px); --sat:env(safe-area-inset-top,0px);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -1321,14 +1435,15 @@ main{min-width:0;padding:22px 26px 40px}
 .custom label{display:grid;gap:4px;font-size:12px;color:var(--mut)}
 .custom input{font-size:16px;background:var(--bg2);border:1px solid var(--linea);color:var(--txt);border-radius:10px;padding:9px 10px;color-scheme:dark}
 .custom button{border:0;border-radius:10px;padding:11px 16px;background:var(--acs);color:#06101d;font-weight:650;cursor:pointer}
-.avviso{display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:12px;margin-bottom:10px;font-size:14px;
-  background:rgba(255,93,108,.1);border:1px solid rgba(255,93,108,.35)}
-.avviso.warn{background:rgba(255,181,71,.09);border-color:rgba(255,181,71,.35)}
+.avviso{--c:var(--c-bad);display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:12px;margin-bottom:10px;font-size:14px;
+  background:rgba(var(--c),.09);border:1px solid rgba(var(--c),.3)}
+.avviso.warn{--c:var(--c-en)}
 .avviso small{display:block;color:var(--mut)}
 
 /* ---------- schede ---------- */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px;margin-bottom:16px}
-.card{background:linear-gradient(180deg,var(--card2),var(--card) 55%);border:1px solid var(--linea);border-radius:var(--r);padding:15px 16px;
+.cards.c5{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.card{background:linear-gradient(180deg,var(--card2),var(--card) 55%);border:1px solid var(--linea);border-radius:var(--r);padding:15px 16px 9px;
   position:relative;overflow:hidden;min-width:0}
 .card.acc::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:var(--acc)}
 .ch{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
@@ -1353,6 +1468,39 @@ main{min-width:0;padding:22px 26px 40px}
 .sub b{color:var(--txt);font-variant-numeric:tabular-nums}
 .flash{animation:flash .9s ease-out}
 .card .nota{margin-top:8px;color:var(--mut2);font-size:12px}
+.card .nota:empty{display:none}
+.card .nota:has(.ora-n){margin-top:6px}
+@media (min-width:761px){#c-n{display:block;min-height:15px;margin-top:6px}} /* PC: riga sempre riservata, la card non cambia altezza */
+.ora-n{display:flex;align-items:center;gap:7px;line-height:1.3}
+.ora-n .ck{flex:none;box-sizing:border-box;width:11px;height:11px;border-radius:50%;border:1.5px solid #fff;position:relative}
+.ora-n .ck:before,.ora-n .ck:after{content:"";position:absolute;background:#fff}
+.ora-n .badge{margin:-3px 0;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.ora-n .ck:before{left:50%;top:1.5px;width:1.5px;height:3.5px;margin-left:-.75px}
+.ora-n .ck:after{left:50%;top:50%;width:3px;height:1.5px;margin-top:-.75px}
+
+/* meteo nella scheda Esterna; il dettaglio e' un pannello sospeso */
+/* nell'angolo in alto a destra della scheda (spazio vuoto): non allunga mai la scheda; si adatta alla larghezza */
+.card:has(> .mt-bl){container-type:inline-size}
+.mt-bl{position:absolute;right:6px;top:9px;display:flex;flex-direction:column;align-items:flex-end;gap:1px;padding:2px 5px;background:none;border:0;border-radius:10px;color:inherit;cursor:pointer;text-align:right;line-height:1.2;white-space:nowrap}
+.mt-bl[hidden]{display:none}
+.mt-bl:hover{background:rgba(255,255,255,.05)}
+.mt-g{font-size:13px;color:var(--txt);font-variant-numeric:tabular-nums}
+/* il blocco e' alto e stretto; sotto certe larghezze lascia cadere prima la frase di pioggia, poi la forchetta, per non toccare il badge */
+@container (max-width:178px){ .mt-pi{display:none} }
+@container (max-width:146px){ .mt-g{display:none} }
+.mt-i{flex:none;display:block}
+.mt-n{stroke:#b3bfd6;fill:var(--card)}.mt-s{stroke:var(--en)}.mt-l{stroke:#d6dcff}.mt-p{stroke:#4da3ff}.mt-f{stroke:var(--en)}.mt-v{stroke:#dff0ff;stroke-width:3.2}
+.mt-pi{font-size:11px;font-weight:600}
+.mt-pi.certa{color:#6cb4ff}.mt-pi.possibile{color:var(--warn)}.mt-pi.nessuna{color:var(--mut2);font-weight:500}
+.mt-pan{position:fixed;z-index:60;padding:12px 14px;border-radius:14px;background:#0a0f19;border:1px solid rgba(255,255,255,.12);box-shadow:0 14px 40px rgba(0,0,0,.6);font-size:12.5px;font-variant-numeric:tabular-nums}
+.mt-pan .eti{margin-bottom:4px}
+.mt-r{display:grid;grid-template-columns:20px 46px 34px 1fr;gap:10px;align-items:center;padding:3px 0;color:var(--mut)}
+.mt-r b{color:var(--txt);text-align:right}
+.mt-mm{white-space:nowrap;text-align:right}
+.mt-r.certa .mt-mm{color:#6cb4ff}.mt-r.possibile .mt-mm{color:var(--warn)}.mt-r.nessuna .mt-mm{color:var(--mut2)}
+.mt-fo{margin-top:8px;padding-top:8px;border-top:1px solid var(--linea);color:var(--mut2);font-size:11.5px;line-height:1.55;display:flex;flex-direction:column}
+.mt-fo span{white-space:nowrap}
+.mt-fo a{color:var(--mut);text-decoration:underline}
 
 .grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:14px;margin-top:16px;align-items:start}
 .colonna{display:grid;gap:14px;min-width:0}
@@ -1369,32 +1517,49 @@ main{min-width:0;padding:22px 26px 40px}
 .tile small{display:block;color:var(--mut);font-size:11.5px}
 .tile b{font-size:19px;font-variant-numeric:tabular-nums}.tile i{font-style:normal;color:var(--mut);font-size:12px;margin-left:2px}
 .tile.vecchio b{color:var(--mut)}
+.card:has(#cicli){container-type:inline-size}
+.cg{margin-top:10px;display:grid;grid-template-columns:122px 1fr;align-items:center;gap:0 10px}@container (max-width:400px){.cg{display:block}}.cg h3{margin:0;line-height:1.3;display:flex;align-items:center;gap:7px}
+.cg h3 i{width:8px;height:8px;border-radius:50%;background:rgb(var(--c))}
+.cg .tiles{margin-top:0}@container (max-width:400px){.cg .tiles{margin-top:6px}}
 
 /* ---------- timeline ---------- */
 .tlw{position:relative;margin-top:6px;touch-action:pan-y}
 .tlw svg{width:100%;height:46px;display:block;border-radius:10px;background:var(--bg2)}
 .assi{display:flex;justify-content:space-between;color:var(--mut2);font-size:11.5px;margin-top:5px;font-variant-numeric:tabular-nums}
+@media (max-width:513px){.tlw,.assi{margin-left:-6px;margin-right:-6px}}   /* telefono: barra e orari a 8 px dal bordo, uguali a destra e a sinistra */
 .legenda{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:10px;font-size:12.5px;color:var(--mut)}
 .legenda i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
-.riep{font-size:12.5px;color:var(--mut);display:flex;gap:12px;flex-wrap:wrap}
+.riep{font-size:12.5px;color:var(--mut);display:flex;gap:4px 12px;flex-wrap:wrap}
 .riep b{font-variant-numeric:tabular-nums}
+@media (max-width:760px){.riep{font-size:12px;gap:4px 9px}}
 .tip{position:absolute;top:-4px;transform:translate(-50%,-100%);background:#05080d;border:1px solid var(--linea);border-radius:9px;
   padding:6px 10px;font-size:12px;white-space:nowrap;pointer-events:none;z-index:4;box-shadow:0 6px 20px rgba(0,0,0,.5)}
 
 /* ---------- grafici ---------- */
 .gr{margin-top:14px}
-.grw{overflow:hidden;touch-action:pan-y}
+.grw{overflow:hidden}.grw,#g-en,#g-cop,#g-bin{touch-action:pan-y}
 .grw svg,#g-en svg,#g-cop svg,#g-bin svg{display:block;max-width:100%}
 .gr text,#eff svg text{fill:var(--mut2);font-size:11px;font-family:inherit}
-.gr .cur-t{fill:var(--txt);font-size:11px}
+.gr .cur-t,#eff .cur-t{pointer-events:none}
+.gr .cur-bg,#eff .cur-bg{fill:var(--bg2);stroke:rgba(255,255,255,.16);stroke-width:1}
+.gr .cur-tx,#eff .cur-tx{fill:var(--txt);font-size:11.5px;font-variant-numeric:tabular-nums}
+.gr .cur-tx .nd{fill:var(--mut)}
+.bordo-vuoto{stroke:#8793a8;stroke-opacity:.4;stroke-width:1;stroke-dasharray:3 3}
 .gl{stroke:rgba(255,255,255,.06)}.gv{stroke:rgba(255,255,255,.035)}
-.cur{stroke:rgba(255,255,255,.55);stroke-width:1}
+.cur{stroke:rgba(255,255,255,.32);stroke-width:1}
 .legg{display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:flex-end;font-size:12.5px;color:var(--mut)}
 .legg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
 .legg b{color:var(--txt);font-variant-numeric:tabular-nums}
+.legg i.tp{width:11px;height:2px;border-radius:1px;background:#fff;opacity:.85;vertical-align:3px}
+.legg i.tp2{width:12px;height:0;border-radius:0;border-top:2px dashed var(--mut);background:none;vertical-align:3px}
+.legg i.an{background:var(--warn)}
+.tip-l{stroke:rgba(255,255,255,.9);stroke-width:2;stroke-linecap:round}
+.tip-a{fill:var(--warn)}
 #eff svg .vt{fill:var(--txt);font-size:10.5px}
 #eff svg .ass{fill:var(--mut)}
-.nota-fondo{color:var(--mut2);font-size:12.5px;margin:14px 2px 4px}
+.nota.f{color:var(--mut2);font-size:12px;line-height:1.5;margin:14px 2px 4px}
+.nota.f span{display:block;text-wrap:balance}
+@media (max-width:760px){.nota.f span{text-wrap:pretty}.nota.f span+span{margin-top:4px}}
 .grid2.uguali{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 #eff .grid2,#eff>.avviso,#eff>.card{margin-top:14px}
 @media (max-width:900px){.grid2.uguali{grid-template-columns:1fr}}
@@ -1403,19 +1568,10 @@ main{min-width:0;padding:22px 26px 40px}
 #imp .card{margin-bottom:14px}
 .sez-t{margin:22px 2px 10px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
 .nota-sez{color:var(--mut);font-size:13px;margin:6px 0 4px}
-.campi{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px 18px;margin-top:12px}
-.campo{display:grid;gap:5px;align-content:start}
-.campo>label{font-size:13px;color:var(--mut)}
 .campo input[type=text],.campo input[type=password],.campo input[type=time],.campo textarea{width:100%;font:inherit;font-size:16px;background:var(--bg2);
   border:1px solid var(--linea);color:var(--txt);border-radius:10px;padding:10px 12px;color-scheme:dark}
-.campo textarea{resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:13.5px;line-height:1.45}
+.campo textarea{display:block;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:13.5px;line-height:1.45}
 .campo input:focus,.campo textarea:focus{outline:2px solid color-mix(in srgb,var(--acs) 60%,transparent);outline-offset:0}
-.campo .aiuto{color:var(--mut2);font-size:12px}
-.campo .err{color:var(--bad);font-size:12.5px;min-height:0}
-.campo:has(textarea){grid-column:1/-1}
-.riga-sw{grid-template-columns:1fr auto;align-items:center}
-.riga-sw>label{font-size:14px;color:var(--txt)}
-.riga-sw .aiuto,.riga-sw .err{grid-column:1/-1}
 .sw{position:relative;display:inline-block;width:46px;height:28px}
 .sw input{opacity:0;width:0;height:0;position:absolute}
 .sw span{position:absolute;inset:0;background:#2a3547;border-radius:99px;transition:.2s;cursor:pointer}
@@ -1442,6 +1598,10 @@ button:disabled{opacity:.5;cursor:default}
 .barra-salva span{flex:1;color:var(--warn);font-size:14px}
 .pill.bad,.pill.off{background:#ff4d5e;color:#fff;font-weight:700}
 .pill.warn{background:#ffc83d;color:#1a1200;font-weight:700}
+.pill.en{background:var(--en);color:#0b0f17;font-weight:700}
+.pill.tg{background:rgba(var(--c),.16);color:rgb(var(--c));font-size:11px;font-weight:700}
+.pill.up{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:3px 9px;background:rgba(138,147,166,.18);color:var(--mut)}
+.cl-h .pill{align-self:center}.cl-v li .pill{display:block;text-align:center;padding:1px 0}
 .sep{color:var(--mut2);margin:0 1px}
 #toast{position:fixed;left:50%;bottom:calc(90px + var(--sab));transform:translate(-50%,20px);background:#05080d;border:1px solid var(--linea);border-radius:12px;
   padding:11px 16px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:30;max-width:90vw;box-shadow:0 8px 30px rgba(0,0,0,.6)}
@@ -1460,10 +1620,28 @@ a{color:var(--acs)}
 .curva svg{width:100%;height:auto;display:block;margin-top:6px}
 .curva text{fill:var(--mut);font-size:11px;font-family:inherit}
 .curva .ass{fill:var(--mut2);font-size:11px}
-.box2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-.box2 div{border-radius:12px;padding:10px 12px;font-size:13px;border:1px solid var(--linea)}
-.box2 .f{background:rgba(77,163,255,.1)}.box2 .m{background:rgba(52,211,176,.1)}.box2 .o{background:rgba(255,107,87,.1);grid-column:1/-1}
-.box2 small{display:block;color:var(--mut)}.box2 b{font-size:15px}
+.box2,.exp{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.bx{border-radius:12px;border:1px solid var(--linea);min-width:0}
+.tn{background:rgba(var(--c),.09)}
+.c-casa{--c:var(--c-casa)}.c-acs{--c:var(--c-acs)}.c-est{--c:var(--c-est)}.c-en{--c:var(--c-en)}.c-bad{--c:var(--c-bad)}.c-ok{--c:var(--c-ok)}
+.eti{font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--mut2);font-weight:600}
+.box2 small{display:block}
+.box2>.bx{padding:8px 12px 9px}
+.box2 p{margin:2px 0 0;display:flex;flex-wrap:wrap;align-items:baseline;gap:0 9px}
+.box2 b{font-size:20px;font-weight:700;letter-spacing:-.5px;line-height:1.15;font-variant-numeric:tabular-nums}
+.box2 span{font-size:12px;color:var(--mut)}
+.box2>.bx:nth-child(3){grid-column:1/-1}
+.box2 strong{font-weight:700;color:var(--txt)}
+.nota-cv{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:3px;color:var(--mut2);font-size:12px;line-height:1.45}
+.nota-cv li{display:flex;gap:9px;align-items:center}
+.nota-cv i{flex:none}
+.nota-cv .lg{width:18px;height:3px;border-radius:2px;background:linear-gradient(90deg,#4da3ff,#34d3b0)}
+.nota-cv .pt{width:8px;height:8px;margin:0 5px;border-radius:50%;background:rgba(255,107,87,.7)}
+.nota-cv .av{width:8px;height:8px;margin:0 5px;border-radius:50%;background:var(--warn)}
+.nota-cv .in,.avviso .in{box-sizing:border-box;width:11px;height:11px;margin:0 3.5px;border-radius:50%;border:1.5px solid var(--mut2);position:relative}
+.nota-cv .in:after,.avviso .in:after{content:"";position:absolute;left:50%;top:2px;width:1.5px;height:4px;margin-left:-.75px;background:var(--mut2)}
+.avviso .in{display:block;margin-top:4px}
+.nota-cv.lun{margin:14px 2px 4px}.nota-cv.lun li{align-items:flex-start}.nota-cv.lun .in{margin-top:3px}.nota-cv.lun .tt{display:none}@media (hover:none){.nota-cv.lun .tt{display:flex}}
 .vuoto{color:var(--mut);padding:30px 6px;text-align:center}
 
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(98,235,166,.55)}70%{box-shadow:0 0 0 7px rgba(98,235,166,0)}100%{box-shadow:0 0 0 0 rgba(52,211,176,0)}}
@@ -1486,11 +1664,11 @@ a{color:var(--acs)}
   .chips{width:100%}.chips button{flex:1;padding:9px 6px}
   .cards{grid-template-columns:1fr 1fr;gap:10px}
   .cards .card:last-child:nth-child(odd){grid-column:1/-1}
-  .card{padding:13px 13px}
+  .card{padding:13px 13px 8px}
   .val{flex-direction:column;align-items:flex-start;gap:6px}
   .val .n{font-size:30px}
   .spark{max-width:none;width:100%;height:30px;flex:none}
-  .box2{grid-template-columns:1fr}.box2 .o{grid-column:auto}
+  .box2{grid-template-columns:1fr}.box2>.bx:nth-child(3){grid-column:auto}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 
@@ -1519,10 +1697,9 @@ a{color:var(--acs)}
 .dev-logo.in-riga{height:12px;max-width:90px;vertical-align:middle}
 .dev-logo.bianco,.logo-et.bianco{filter:brightness(0) invert(1)}
 .dev-marca{font-weight:700;font-size:15px;letter-spacing:.02em;padding:6px 10px;border-radius:10px;background:var(--card2);flex:none}
-.dev-altre{display:flex;align-items:center;gap:6px;margin-top:3px;font-size:12px}
 .dev-st{display:grid;gap:4px;justify-items:end}
 .dev-gr{margin-top:12px}
-.dev-gr h3{margin:0 0 2px;font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--mut2)}
+.dev-gr h3{margin:0 0 2px}
 .dev .riga b{max-width:68%;word-break:break-word;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
 .dev .riga b .val-c{font-variant-numeric:tabular-nums}
 .dev .riga{align-items:flex-start}
@@ -1545,8 +1722,10 @@ a{color:var(--acs)}
 .fsv-id{display:inline-block;min-width:42px;margin-right:8px;font-style:normal;font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:var(--mut2)}
 .dev .riga>span:first-child{max-width:62%}
 .rosso{color:#ff6b6b}
-.fsv-gr>summary .d::after{content:'';display:inline-block;width:7px;height:7px;margin:0 3px 3px 12px;border:solid currentColor;border-width:0 2px 2px 0;transform:rotate(45deg);transition:transform .15s}
-.fsv-gr:not([open])>summary .d::after{transform:rotate(-45deg);margin-bottom:0}
+details.riq>summary::after,.fsv-gr>summary .d::after,.cl-vecchie>summary::before,.come-b::after,.tile[data-come] small::after{content:"";display:inline-block;flex:none;width:var(--chv,7px);height:var(--chv,7px);border:solid currentColor;border-width:0 var(--chw,2px) var(--chw,2px) 0;transform:rotate(-45deg);transition:transform .15s}
+details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[open]>summary::before,.come-b.on::after,.tile[data-come].on small::after{transform:rotate(45deg)}
+.fsv-gr>summary .d::after{margin:0 3px 3px 12px}
+.fsv-gr:not([open])>summary .d::after{margin-bottom:0}
 
 /* ---------- comandi accendi/spegni ---------- */
 .cmd{display:inline-flex;align-items:center;gap:12px}
@@ -1557,17 +1736,40 @@ a{color:var(--acs)}
 .pager button{width:34px;height:30px;border-radius:9px;border:1px solid var(--linea);background:var(--card);color:var(--testo,inherit);font-size:18px;line-height:1;cursor:pointer}
 .pager button:disabled{opacity:.35;cursor:default}
 .vecchio-et{color:var(--warn,#ffb547)}
-.esporta a{color:var(--acqua,#4da3ff);text-decoration:underline}
 .nav a.mini{font-size:13px;padding:8px 12px;color:var(--mut);opacity:.8}
 .nav a.mini svg{width:17px;height:17px}
 .nav a.mini.on{opacity:1}
 .lnk{color:var(--acs,#4da3ff);text-decoration:none;font-weight:600}
-.changelog{display:flex;flex-direction:column;gap:14px;max-width:760px}
-.cl .ch h2{font-size:17px}.cl-t{font-weight:500;color:var(--mut);font-size:14px}
-.cl ul{margin:6px 0 0;padding-left:20px;display:flex;flex-direction:column;gap:6px;color:var(--txt);font-size:14px;line-height:1.45}
-.cl-vecchie>summary{cursor:pointer;color:var(--mut);padding:6px 2px;font-size:14px;font-weight:600}
-.cl-vecchie[open]>summary{margin-bottom:10px}
-.cl-vecchie .cl{margin-bottom:14px}
+.changelog{display:flex;flex-direction:column;gap:22px;max-width:760px}
+.cl-breve{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--linea);border-radius:var(--r);padding:14px 18px;display:grid;gap:10px}
+.cl-bi{display:flex;align-items:flex-start;gap:12px;font-size:14px;color:var(--mut);line-height:1.4}
+.cl-bi b{color:var(--txt)}
+.cl-bi b::after{content:" —";font-weight:400;color:var(--mut2)}
+.cl-bi .mt-i,.cl-ic{flex:none;width:22px;height:22px;margin-top:-1px}
+.cl-ic{display:inline-grid;place-items:center;border-radius:7px;background:rgba(255,255,255,.07);color:var(--txt);font-weight:700;font-size:14px}
+/* linea del tempo: un pallino per versione */
+.cl-tl{position:relative;display:flex;flex-direction:column;gap:26px;padding-left:26px}
+.cl-tl::before{content:"";position:absolute;left:6px;top:8px;bottom:8px;width:2px;background:linear-gradient(180deg,var(--en),rgba(255,255,255,.1) 160px);border-radius:2px}
+.cl-v{position:relative}
+.cl-v::before{content:"";position:absolute;left:-26px;top:7px;width:14px;height:14px;border-radius:50%;background:var(--bg2);border:2px solid #4b5a78}
+.cl-v.att::before{border-color:var(--en);background:var(--en);box-shadow:0 0 0 4px rgba(255,181,71,.18)}
+.cl-h{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;margin-bottom:8px}
+.cl-n{font-size:22px;font-weight:700;letter-spacing:-.4px;font-variant-numeric:tabular-nums}
+.cl-ti{font-size:15px;font-weight:600;color:var(--mut)}
+.cl-d{margin-left:auto;font-size:12.5px;color:var(--mut2);white-space:nowrap}
+.cl-v ul{list-style:none;margin:0;padding:0;display:grid;gap:7px}
+.cl-v li{font-size:14px;line-height:1.5;color:var(--mut);display:grid;grid-template-columns:78px 1fr;gap:0 12px;align-items:baseline}
+.cl-v li b{color:var(--txt);font-weight:650}
+.cl-tx::before{content:none}
+.cl-tx b::after{content:" —";font-weight:400;color:var(--mut2)}
+.cl-vecchie{display:flex;flex-direction:column;gap:26px}
+.cl-vecchie>summary{cursor:pointer;color:var(--mut);font-size:14px;font-weight:600;list-style:none;padding:2px 0 0}
+.cl-vecchie>summary::before{margin:0 10px 1px 2px}
+.cl-vecchie[open]>summary{margin-bottom:22px}
+.cl-vecchie>.cl-v{margin-bottom:26px}
+.cl-vecchie>.cl-v:last-child{margin-bottom:0}
+.cl-vecchie>.eti{margin:0 0 20px}
+@media (max-width:700px){.cl-v li{display:block}.cl-v li .pill{display:inline-block;padding:1px 8px;margin-right:9px;vertical-align:1px}.cl-d{margin-left:0;flex-basis:100%}}
 @media (max-width:760px){.nav a.mini{display:none}}
 #dsp>article.card{margin-bottom:14px}#dsp>article.card:last-child{margin-bottom:0}
 .chips .conf-btn{margin-left:4px;border-left:1px solid var(--linea);border-radius:0 9px 9px 0;padding-left:16px}
@@ -1575,7 +1777,7 @@ a{color:var(--acs)}
 .conf-r b{color:var(--txt);font-weight:600}
 .conf-d{font-weight:700;color:var(--mut)}
 .conf-d.buono{color:var(--ok,#62eba6)}.conf-d.cattivo{color:var(--casa,#ff6b57)}
-.conf-nota{margin-top:0}
+.nota.conf-nota{margin-top:0}
 .conf-t{display:block;margin-top:4px;color:var(--mut);font-size:12px}
 #imp-tabs .sub-tabs{margin-bottom:14px}
 .azioni-t{display:flex;gap:8px}
@@ -1592,12 +1794,17 @@ a{color:var(--acs)}
 #imp-tabs .sub-tabs a{white-space:nowrap;padding:7px 14px}
 .imp-tab[hidden]{display:none}
 .imp-tab>details.riq{margin-bottom:12px}
+details.riq{padding-block:12px}
+@media (max-width:760px){details.riq{padding-block:10.5px}}
 details.riq>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px}
 details.riq>summary::-webkit-details-marker{display:none}
-details.riq>summary::after{content:"";flex:none;width:8px;height:8px;margin:0 4px 3px 0;border:solid var(--mut);border-width:0 2px 2px 0;transform:rotate(-45deg);transition:transform .15s}
-details.riq[open]>summary::after{transform:rotate(45deg);margin-bottom:6px}
-details.riq[open]>summary{padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--linea)}
-details.riq .riq-c>.nota-sez:first-child{margin-top:0}
+details.riq>summary::after{margin:0 4px 0 0;color:var(--mut)}
+details.riq[open]>summary::after{margin-bottom:4px}
+details.riq[open]>summary{padding-bottom:8px;margin-bottom:0;border-bottom:1px solid var(--linea)}
+details.riq .campi>.campo:first-child{padding-top:8px}
+details.riq .campi>.campo:last-child{padding-bottom:0}
+details.riq[open]{padding-bottom:7px}
+details.riq .riq-c>.nota-sez:first-child,details.riq .riq-c>h2:first-child+.nota-sez{margin-top:14px}
 #cf h2{display:none}
 #cf .ch{justify-content:flex-end}
 .lista-allarmi{display:grid;gap:8px}
@@ -1618,16 +1825,76 @@ details.riq .riq-c>.nota-sez:first-child{margin-top:0}
 #c-um.um-rosso{color:var(--bad)}
 
 .fermo-t{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
-.fermo-p{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:3px 9px;border-radius:999px;background:rgba(138,147,166,.18);color:var(--mut,#8a93a6)}
 .fermo-q{font-size:14px;color:var(--mut,#8a93a6)}
 .tile .t-txt{font-size:17px;font-weight:600}.tile .t-txt i{font-size:12px;font-style:normal;opacity:.7}
-.fermo-w{grid-column:1/-1}.fermo-g{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px}
+.fermo-w{grid-column:1/-1}.fermo-g{display:flex;gap:10px;margin-top:10px}
 .fermo-w .tile .t-txt{font-size:15px;white-space:nowrap}
-.fermo-g{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1fr)}
-@media(max-width:560px){.fermo-g{gap:8px}.fermo-w .tile{padding:10px 10px}.fermo-w .tile .t-txt{font-size:14px}.fermo-w .tile .t-txt i{font-size:11px}}
-p.nota-sez#prest-rit{display:flex;flex-wrap:wrap;gap:2px 16px}.nw{white-space:nowrap}#prest-rit b{color:var(--fg,#e8ecf4);font-weight:650}
+@media(max-width:560px){.fermo-w .tile{padding:10px 10px}.fermo-w .tile .t-txt{font-size:14px}.fermo-w .tile .t-txt i{font-size:11px}}
+p.nota-sez#prest-rit{display:flex;flex-wrap:wrap;gap:2px 16px}.nw{white-space:nowrap}
+#prest-rit .rt-t{flex-basis:100%}
+#prest-rit .rf{display:inline-flex;align-items:center;gap:7px}
+#prest-rit .rf i{width:7px;height:7px;border-radius:50%;flex:none}#prest-rit b{color:var(--fg,#e8ecf4);font-weight:650}
 p.nota-sez#prest-rit>span:first-child{flex-basis:100%}
 .agg-corpo p{margin:10px 0 6px;line-height:1.5}.agg-ok b{color:var(--ok,#62eba6)}.agg-riavvio b{color:var(--warn,#ffc83d)}
+
+button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;color:#fff!important}button.pericolo.sec{background:transparent!important;color:#ff8a96!important}
+
+.campo input.mono{font-family:ui-monospace,Consolas,monospace;font-size:13.5px;letter-spacing:-.2px}
+.campo input::placeholder{color:var(--mut2)}
+
+/* ---------- campi delle impostazioni: elenco ordinato, valori corti in linea ---------- */
+.campi{display:flex;flex-direction:column;margin-top:6px}
+.campo{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"et ctl" "ai ai" "er er";column-gap:16px;row-gap:0;align-items:center;padding:13px 0;border-bottom:1px solid var(--linea)}
+.campo:last-child{border-bottom:0}
+.campo>label{grid-area:et;font-size:15px;line-height:1.3;color:var(--txt)}
+.campo>input,.campo>select,.campo>textarea,.campo>.sw{grid-area:ctl}
+.campo .aiuto{grid-area:ai;margin-top:3px;color:var(--mut2);font-size:13px;line-height:1.45;max-width:62ch}
+.campo .err{grid-area:er;margin-top:3px;color:var(--bad);font-size:13px;min-height:0}
+.campo .err:empty{display:none}
+/* campi lunghi: etichetta sopra, controllo a tutta larghezza */
+.campo.lg{grid-template-columns:1fr;grid-template-areas:"et" "ctl" "ai" "er";row-gap:0;align-items:start}
+.campo.lg>label{font-size:14px;color:var(--mut)}
+.campo.lg>input,.campo.lg>textarea{width:100%;margin-top:6px}.campo.lg .aiuto,.campo.lg .err{margin-top:6px}
+/* campi corti: in linea, a destra */
+.campo.in>input[type=text]{width:112px;text-align:right;padding:8px 12px;font-variant-numeric:tabular-nums}
+.campo.in>input[type=time]{width:auto;padding:8px 10px;text-align:center}
+.campo.in>select{width:auto;max-width:220px;padding:8px 10px}
+.campo.in>.sw{justify-self:end}
+@media (max-width:420px){.campo>label{font-size:14.5px}.campo.in>input[type=text]{width:92px}.campo.in>select{max-width:170px}}
+
+/* riquadri delle impostazioni: due colonne indipendenti su schermi larghi (nessun buco tra un riquadro e l'altro) */
+.imp-cols{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
+.imp-col{display:contents}
+#imp .imp-cols>details.riq,#imp .imp-col>details.riq,#imp .imp-tab>details.riq{margin-bottom:0}
+#imp .imp-tab>.imp-cols,#imp .imp-tab>details.riq{margin-bottom:12px}
+@media (min-width:1100px){
+  .imp-cols{flex-direction:row;align-items:flex-start;gap:14px}
+  .imp-col{display:flex;flex-direction:column;gap:12px;flex:1 1 0;min-width:0}
+}
+.imp-tab>details.riq.largo .campi{display:flex}
+@media (min-width:1100px){
+  .imp-tab>details.riq.largo:has(textarea) .campi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px}
+  .imp-tab>details.riq.largo[data-id=allarmi] .lista-allarmi{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+/* riquadri dell'ultimo ciclo: si dividono sempre tutta la larghezza, qualunque sia il loro numero */
+.fermo-g>.tile{flex:1 1 0;min-width:0}
+.fermo-g>.tile:first-child{flex-grow:1.5}
+
+.cg .tile,.tc .tile{background:rgba(var(--c),.09);border-color:rgba(var(--c),.3)}
+.come-b{font:inherit;font-size:12px;line-height:inherit;font-weight:400;color:var(--acs);background:none;border:0;padding:0;cursor:pointer;white-space:nowrap}
+.come-b::after{--chv:5px;--chw:1.5px;margin-left:4px;vertical-align:0}
+.come-b.on::after{vertical-align:2px}
+.come-b:hover{text-decoration:underline}
+.come-t{margin:6px 0 0 27px;color:var(--mut2);font-size:12px;line-height:1.45;text-wrap:pretty}
+.come-t[hidden]{display:none}
+.tile[data-come]{cursor:pointer}.tile[data-come] small::after{--chv:5px;--chw:1.5px;margin-left:5px;vertical-align:1px}.tile[data-come].on small::after{vertical-align:2px}.tile[data-come] i{vertical-align:3px}.tile i b{font-size:inherit;font-weight:600;color:var(--txt)}
+.come-t.sbr{margin:0;font-size:14px;color:var(--txt)}.come-t.sbr>:last-child{margin-top:10px;border:1px solid var(--linea);border-radius:12px;overflow:hidden}.come-t.sbr .tile{text-align:center}.sr{display:grid;grid-template-columns:100px 56px 56px 56px;justify-content:space-evenly;gap:6px;text-align:center;white-space:nowrap;padding:8px 12px;font-variant-numeric:tabular-nums}.sr:nth-child(even){background:var(--bg2)}.sr>:only-child{grid-column:1/-1}
+.nota-cv.alto{margin:0 2px 6px}.come-t.alto{margin:0 2px 14px 29px}
+.exp a{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;border:1px solid var(--linea);background:var(--bg2);color:var(--txt);text-decoration:none}
+.exp a:hover{background:rgba(255,255,255,.08)}
+.exp svg{flex:none;color:var(--mut)}
+.exp b{display:block;font-size:14px}.exp small{display:block;margin-top:1px;color:var(--mut);font-size:12px}
+@media(max-width:560px){.exp{grid-template-columns:1fr}}
 ''',
     'app.js': r'''// impronta di questa versione dello script: la prende dall'indirizzo con cui e' stato caricato (app.js?v=...)
 window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch (e) { return ''; } })();
@@ -1644,6 +1911,8 @@ const ls = {
 const num = (v, d = 1) => (v == null || isNaN(v)) ? '—' : Number(v).toLocaleString('it-IT', {minimumFractionDigits: d, maximumFractionDigits: d});
 const gr = v => v == null ? '—' : num(v) + '°';
 const hhmm = t => new Date(t * 1000).toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'});
+// scritta sotto i valori di una card, nel box colorato dei badge (bad = rosso, warn = giallo)
+const avviso = (t, col) => `<span class="ora-n"><span class="badge on" style="--acc:var(--${col})">${t}</span></span>`;
 const dm = t => new Date(t * 1000).toLocaleString('it-IT', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
 const durata = m => m < 90 ? `${m} min` : `${num(m / 60, 1)} h`;
 
@@ -1700,13 +1969,13 @@ function costruisci() {
     if (e.target.dataset.conf) { S.confronto = !S.confronto; chips(); carica(); return; }  // non si ricorda: a ogni apertura e' spento
     const r = e.target.dataset.r; if (!r) return;
     if (S.pagina === 'efficienza') { S.rangeEff = r; ls.set('rangeEff', r); chips(); carica(); return; }
-    S.range = r; ls.set('range', r); chips();
+    S.range = r; S.zoom = null; ls.set('range', r); chips();
     if (r === 'custom') apriCustom(); else { $('#custom').hidden = true; carica(); }
   });
   $('#c-ok').addEventListener('click', () => {
     const da = new Date($('#c-da').value).getTime() / 1000, a = new Date($('#c-a').value).getTime() / 1000;
     if (!isFinite(da) || !isFinite(a) || a <= da) { alert('Controlla le date: "A" deve venire dopo "Da".'); return; }
-    S.custom = {da: Math.floor(da), a: Math.floor(a)}; ls.set('custom', S.custom); carica();
+    S.custom = {da: Math.floor(da), a: Math.floor(a)}; S.zoom = null; ls.set('custom', S.custom); carica();
   });
 }
 
@@ -1731,7 +2000,7 @@ function chips() {
 function mostraPagina() {
   $('#titolo').textContent = TITOLI[S.pagina];
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.p === S.pagina));
-  chips(); S.dati = null; S.dpag = null;
+  chips(); S.dati = null; S.dpag = null; S.zoom = null;
   { const st = document.querySelector('.stato'); if (st) st.hidden = S.pagina === 'changelog'; }
   $('#custom').hidden = !(S.pagina !== 'efficienza' && S.pagina !== 'impostazioni' && S.pagina !== 'dispositivi' && S.pagina !== 'changelog' && S.range === 'custom');
   S.sporco = false; S.mod = {};
@@ -1747,17 +2016,17 @@ function mostraPagina() {
 }
 
 function scheletro() {
-  const sc = (id, cls, acc, et, extra) => `
+  const sc = (id, cls, acc, et, extra, fine = '') => `
   <article class="card acc" style="--acc:var(--${acc})">
     <div class="ch ch-st"><span class="et" id="${id}-et">${et}</span><span class="badge" id="${id}-b"></span></div>
     <div class="val"><div class="n"><span id="${id}-t">—</span><i>${cls}</i></div><div class="spark" id="${id}-sp"></div></div>
-    <div class="sub">${extra}</div><div class="nota" id="${id}-n"></div>
+    <div class="sub">${extra}</div><div class="nota" id="${id}-n"></div>${fine}
   </article>`;
   return `
   <div class="cards">
     ${sc('r', '°C', 'casa', 'Riscaldamento', '<span>Target <b id="r-tg">—</b></span><span>Ritorno <b id="r-rt">—</b></span><span>ΔT <b id="r-dt">—</b></span>')}
     ${sc('a', '°C', 'acs', 'Acqua calda', '<span>Target <b id="a-tg">—</b></span><span>Modo <b id="a-md">—</b></span>')}
-    ${sc('e', '°C', 'est', 'Esterna', '<span>Min <b id="e-mn">—</b></span><span>Max <b id="e-mx">—</b></span>')}
+    ${sc('e', '°C', 'est', 'Esterna', '<span>Min <b id="e-mn">—</b></span><span>Max <b id="e-mx">—</b></span>', '<button type="button" class="mt-bl" id="e-mt" data-meteo hidden aria-label="Dettaglio meteo"></button>')}
     ${sc('w', 'kWh', 'en', 'Energia', '<span id="w-per">Periodo</span><span>Ora <b id="w-pw">—</b></span><span id="w-eur-s" hidden>Costo <b id="w-eur">—</b></span>')}
     ${sc('c', '°C', 'amb', 'Casa · Smarther', '<span>Umidità <b id="c-um">—</b></span><span>Target <b id="c-tg">—</b></span>')}
   </div>
@@ -1820,9 +2089,9 @@ function disegna() {
     {attivo: 'Il compressore sta scaldando il bollitore', standby: 'Acqua calda attiva ma non sta scaldando: è già alla temperatura impostata', spento: 'La produzione di acqua calda è spenta'}[a.stato]);
   html('a-sp', spark(a.spark));
 
-  set('e-t', num(e.temp)); set('e-mn', gr(e.min)); set('e-mx', gr(e.max)); html('e-sp', spark(e.spark));
+  set('e-t', num(e.temp)); set('e-mn', gr(e.min)); set('e-mx', gr(e.max)); html('e-sp', spark(e.spark)); meteoRiga(d.meteo);
   badge('e-b', 'Temperatura', 'tema', 'Temperatura dell\'aria esterna');
-  set('e-n', e.ts && d.ora - e.ts > 7200 ? 'Ultimo dato delle ' + hhmm(e.ts) + ' (pdc ferma)' : '');
+  html('e-n', e.ts && d.ora - e.ts > 7200 ? avviso('Dato delle ' + hhmm(e.ts) + ' (PdC ferma)', 'warn') : '');
 
   set('w-t', num(w.kwh, w.kwh != null && w.kwh < 10 ? 2 : 1)); set('w-per', periodo(d)); set('w-pw', w.potenza_w == null ? '—' : num(w.potenza_w, 0) + ' W');
   { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); } }
@@ -1835,7 +2104,8 @@ function disegna() {
   badge('c-b', c.temp == null ? '' : (c.richiesta ? 'Richiesta calore' : 'Nessuna richiesta'), c.richiesta ? 'caldo' : 'riposo',
     c.temp == null ? '' : (c.richiesta ? 'Lo Smarther sta chiedendo di scaldare la casa' : 'Lo Smarther non chiede calore: casa a temperatura o fuori fascia oraria'));
   html('c-sp', spark(c.spark));
-  set('c-n', c.temp == null ? 'Smarther non collegato' : (c.ts && d.ora - c.ts > 900 ? 'Ultimo dato delle ' + hhmm(c.ts) : ''));
+  html('c-n', c.temp == null ? avviso('Smarther non collegato', 'bad') : (c.ts && d.ora - c.ts > 900) ? avviso('Ultimo dato delle ' + hhmm(c.ts), 'warn')
+    : c.riparte ? `<span class="ora-n"><i class="ck"></i><span class="badge on">Riparte intorno alle ${hhmm(c.riparte)}</span></span>` : '');
 
   timeline(d.modi, d.da, d.a);
   sistema(d);
@@ -1865,8 +2135,10 @@ function tooltipTimeline(e) {
   const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), t = da + f * span;
   const s = m.segmenti.find(x => t >= x[0] && t <= x[1]); if (!s) return;
   const tip = $('#tip');
-  tip.innerHTML = `<b style="color:${s[2] === 'nodati' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(s[0])}–${hhmm(s[1])} (${durata(Math.round((s[1] - s[0]) / 60))})`;
-  tip.hidden = false; tip.style.left = Math.max(70, Math.min(r.width - 70, f * r.width)) + 'px';
+  tip.innerHTML = `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(s[0])}–${hhmm(s[1])} (${durata(Math.round((s[1] - s[0]) / 60))})`;
+  tip.hidden = false;
+  const mezzo = tip.offsetWidth / 2 + 2;   // larghezza vera del tooltip: sta sempre dentro la barra
+  tip.style.left = Math.max(mezzo, Math.min(r.width - mezzo, f * r.width)) + 'px';
 }
 
 function riga(k, v) { return `<div class="riga"><span>${k}</span><b>${v}</b></div>`; }
@@ -1923,13 +2195,23 @@ function sistema(d) {
   html('sistema', [
     ...COMANDI_UI.map(([k, n]) => rigaCmd(k, n, s)),
     riga('Modo acqua calda', esc(d.acs.modo || '—')),
-    riga('Valvola deviatrice', s.valvola === 'room' ? 'Verso la casa' : s.valvola ? 'Verso il bollitore' : '—'),
+    riga('Valvola deviatrice', s.valvola === 'room' ? 'Verso il riscaldamento' : s.valvola ? 'Verso il bollitore' : '—'),
     riga('Sbrinamento', s.sbrinamento ? '<span class="pill warn">IN CORSO</span>' : 'No'),
     riga('Collegamento SmartThings', online(s.salute === 'online' ? true : s.salute ? false : null)),
     riga('Collegamento Smarther', online(s.smarther === 'si' ? true : s.smarther ? false : null)),
   ].join(''));
 }
 
+function notaRefresh(f) {
+  if (!f || !f.attivo) return '';
+  const col = f.stato === 'permesso' || f.stato === 'errore' ? 'var(--warn,#ffc83d)' : f.stato === 'attivo' ? 'var(--ok,#62eba6)' : 'var(--mut2)';
+  const t = f.stato === 'attivo' ? `refresh attivo ogni ${f.ogni} s`
+    : f.stato === 'a riposo' ? 'refresh pronto (parte quando la pompa lavora)'
+    : f.stato === 'permesso' ? 'refresh fermo: ' + (f.messaggio || 'manca il permesso di comando')
+    : f.stato === 'errore' ? 'refresh in pausa: ' + (f.messaggio || 'errore')
+    : 'refresh attivo';
+  return `<span class="rf"><i style="background:${col}"></i>${esc(t)}</span>`;
+}
 function prestazioni(d) {
   const p = d.prestazioni, vecchio = !d.prestazioni_ts || d.ora - d.prestazioni_ts > 900;
   const attivo = (p.freq_compressore || 0) > 0;
@@ -1947,12 +2229,13 @@ function prestazioni(d) {
     const dur = minuti >= 90 ? num(minuti / 60, 1) + ' ore' : minuti + ' min';
     const giorno = u && !stesso ? new Date(u.inizio * 1000).toLocaleDateString('it-IT', {day: '2-digit', month: '2-digit'}) + ' ' : '';
     const tile = (et, v) => `<div class="tile"><small>${et}</small><b class="t-txt">${v}</b></div>`;
-    html('prest', `<div class="fermo-w"><div class="fermo-t"><span class="fermo-p">Fermo</span><span class="fermo-q">${u ? `Ultimo ciclo · ${giorno}${hhmm(u.inizio)}–${hhmm(u.fine)}` : 'Nessun ciclo negli ultimi 3 giorni'}</span></div>` +
+    html('prest', `<div class="fermo-w"><div class="fermo-t"><span class="pill up">Fermo</span><span class="fermo-q">${u ? `Ultimo ciclo · ${giorno}${hhmm(u.inizio)}–${hhmm(u.fine)}` : 'Nessun ciclo negli ultimi 3 giorni'}</span></div>` +
       (u ? `<div class="fermo-g">${tile('Per', u.modo === 'acs' ? 'Acqua calda' : 'Riscaldamento')}${tile('Durata', dur)}${u.kwh != null ? tile('Energia', num(u.kwh, 1) + ' <i>kWh</i>') : ''}</div>` : '') + '</div>');
     if (rt) rt.textContent = '';
     return;
   }
-  if (rt) rt.innerHTML = r ? `<span>Ritardo dei dati · ultime 24 ore</span><span class="nw">tipico <b>${num(r.tipico_min, 1)} min</b></span><span class="nw">massimo <b>${num(r.max_min, 1)} min</b></span>` : '';
+  const rf = notaRefresh(d.refresh);
+  if (rt) rt.innerHTML = (r ? `<span class="rt-t">Ritardo dei dati · ultime 24 ore</span><span class="nw">tipico <b>${num(r.tipico_min, 1)} min</b></span><span class="nw">massimo <b>${num(r.max_min, 1)} min</b></span>` : '') + rf;
   const t = (et, v, u, dec = 0) => `<div class="tile ${vecchio ? 'vecchio' : ''}"><small>${et}</small><b>${v == null ? '—' : num(v, dec)}</b><i>${u}</i></div>`;
   html('prest', t('Compressore', p.freq_compressore, 'Hz') + t('Pompa', p.vel_pompa, '%') + t('Portata', p.portata, 'L/min', 1) +
     (p.scarico == null ? '' : t('Gas di scarico', p.scarico, '°C')) + `<div class="tile"><small>Potenza</small><b>${d.energia.potenza_w == null ? '—' : num(d.energia.potenza_w, 0)}</b><i>W</i></div>`);
@@ -1960,15 +2243,15 @@ function prestazioni(d) {
 
 function nice(a, b, step) { const o = []; for (let v = Math.ceil(a / step) * step; v <= b + 1e-9; v += step) o.push(v); return o; }
 function curva(c) {
-  if (!c) { html('curva', '<div class="vuoto">Le impostazioni della curva non sono ancora state lette dalla pdc.</div>'); return; }
-  const W = 480, H = 300, L = 46, R = 16, T = 16, B = 44;
+  if (!c) { html('curva', '<div class="vuoto">Le impostazioni della curva non sono ancora state lette dalla PdC.</div>'); return; }
+  const W = 480, H = 300, L = 46, R = 0, T = 16, B = 44;   // R = 0: la fine del grafico sta sul bordo dei riquadri sotto (l'ultimo numero dell'asse finisce sul bordo)
   const xs = [-10, 25, c.basso.esterna - 3, c.alto.esterna + 3, ...c.punti.map(p => p[0])];
   const ys = [20, 60, c.alto.mandata - 4, c.basso.mandata + 6, ...c.punti.map(p => p[1])];
   const x0 = Math.floor(Math.min(...xs) / 5) * 5, x1 = Math.ceil(Math.max(...xs) / 5) * 5;
   const y0 = Math.floor(Math.min(...ys) / 10) * 10, y1 = Math.ceil(Math.max(...ys) / 10) * 10;
   const X = v => L + (v - x0) / (x1 - x0) * (W - L - R), Y = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
   let g = '';
-  nice(x0, x1, 5).forEach(v => { g += `<line x1="${X(v)}" x2="${X(v)}" y1="${T}" y2="${H - B}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${X(v)}" y="${H - B + 16}" text-anchor="middle">${v}°</text>`; });
+  nice(x0, x1, 5).forEach(v => { g += `<line x1="${X(v)}" x2="${X(v)}" y1="${T}" y2="${H - B}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${X(v)}" y="${H - B + 16}" text-anchor="${X(v) > W - 12 ? 'end' : 'middle'}">${v}°</text>`; });   // l'ultimo numero finisce sul bordo, non sporge
   nice(y0, y1, 10).forEach(v => { g += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${v}°</text>`; });
   const A = c.basso, Z = c.alto;
   const pts = c.punti.map(p => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.6" fill="#ff6b57" fill-opacity=".38"/>`).join('');
@@ -1987,13 +2270,18 @@ function curva(c) {
     <defs><linearGradient id="gc" x1="0" x2="1"><stop offset="0" stop-color="#4da3ff"/><stop offset="1" stop-color="#34d3b0"/></linearGradient></defs>
     ${ora_}${lab(A.esterna, A.mandata, num(A.mandata, 0) + '°C', '#4da3ff')}${lab(Z.esterna, Z.mandata, num(Z.mandata, 0) + '°C', '#34d3b0')}
     <text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">Temperatura esterna (°C)</text>
-    <text transform="translate(12 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">Mandata (°C)</text></svg>
+    <text transform="translate(8.5 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">Mandata (°C)</text>
+</svg>
     <div class="box2">
-      <div class="f"><small>Freddo</small>a ${num(A.esterna, 0)}°C esterni · mandata <b>${num(A.mandata, 0)}°C</b></div>
-      <div class="m"><small>Mite</small>a ${num(Z.esterna, 0)}°C esterni · mandata <b>${num(Z.mandata, 0)}°C</b></div>
-      ${c.ora.esterna != null ? `<div class="o"><small>Adesso</small>esterna ${num(c.ora.esterna)}°C → mandata prevista <b>${num(c.ora.mandata)}°C</b></div>` : ''}
+      <div class="bx tn c-acs"><small class="eti">Freddo</small><p><b>${num(A.mandata, 0)}°C</b><span>mandata a <strong>${num(A.esterna, 0)}°C</strong> esterni</span></p></div>
+      <div class="bx tn c-est"><small class="eti">Mite</small><p><b>${num(Z.mandata, 0)}°C</b><span>mandata a <strong>${num(Z.esterna, 0)}°C</strong> esterni</span></p></div>
+      ${c.ora.esterna != null ? `<div class="bx tn c-casa"><small class="eti">Adesso</small><p><b>${num(c.ora.mandata)}°C</b><span>mandata prevista a <strong>${num(c.ora.esterna)}°C</strong> esterni</span></p></div>` : ''}
     </div>
-    <div class="nota" style="margin-top:10px;color:var(--mut2);font-size:12px">La linea è calcolata dalle impostazioni della pdc (FSV 2011, 2012, 2021, 2022); un eventuale offset impostato sul pannello non si può leggere. I puntini sono le mandate misurate durante il riscaldamento nel periodo scelto.</div>`);
+    <ul class="nota-cv">
+      <li><i class="lg"></i>Linea dalle impostazioni della PdC</li>
+      <li><i class="pt"></i>Puntini: mandate misurate mentre scaldava</li>
+      <li><i class="in"></i>Offset del pannello non leggibile</li>
+    </ul>`);
 }
 
 function avvisi() {
@@ -2063,23 +2351,35 @@ function scheletroAnalisi() {
   return `<div class="card"><div class="ch"><h2>Modo di funzionamento</h2><div class="riep" id="tl-riep"></div></div>
     <div class="tlw" id="tlw"><div id="tl"></div><div class="tip" id="tip" hidden></div></div><div class="assi" id="assi"></div></div>
     <div id="grafici"></div>
-    <p class="nota-fondo">Le zone colorate dietro le linee indicano quando la pdc scalda la casa (rosso) o l'acqua (blu). Tocca o passa il mouse su un grafico per leggere i valori: i grafici sono sincronizzati.</p>`;
+    <ul class="nota-cv lun"><li><i class="in"></i><span>Le zone colorate dietro le linee indicano quando la PdC scalda la casa (rosso) o l'acqua (blu); le righe oblique grigie, i periodi senza dati.</span></li>
+      <li><i class="in"></i><span>Tocca o passa il mouse su un grafico per leggere i valori: i grafici sono sincronizzati.</span></li>
+      <li class="tt"><i class="in"></i><span>Su telefono: pizzica con due dita per ingrandire il tempo, trascina con un dito per spostarti, doppio tocco per tornare alla vista intera.</span></li></ul>`;
 }
 
-function disegnaAnalisi(d) {
+// zoom sul tempo (due dita): finestra [da, a] dentro i dati gia' scaricati; ogni linea tiene un punto in piu' per lato
+function vistaZoom(o) {
+  const z = S.zoom;
+  if (!z || z.da < o.da - 1 || z.a > o.a + 1 || z.a - z.da >= (o.a - o.da) * 0.98) { S.zoom = null; return o; }
+  const m = Math.max((o.passo || 60) * 4, 1000);
+  return {...o, pieno: o, da: z.da, a: z.a, grafici: o.grafici.map(g => ({...g, linee: g.linee.map(l => ({...l, punti: l.punti.filter(p => p[0] >= z.da - m && p[0] <= z.a + m)}))}))};
+}
+function disegnaAnalisi(p) {
+  const d = vistaZoom(p.pieno || p); S.dati = d;
   timeline(d.modi, d.da, d.a);
   const box = $('#grafici');
-  const firma = d.da + ':' + d.a + ':' + d.ora + ':' + box.clientWidth;
+  const firma = d.da + ':' + d.a + ':' + d.ora + ':' + box.clientWidth + ':' + (S.zoom ? 'z' : '');
   if (box.dataset.f === firma) return;
   box.dataset.f = firma;
-  const W = Math.max(280, box.clientWidth || 600), H = 168;
+  const y0 = window.scrollY;
+  const W = Math.max(280, box.clientWidth || 600), H = 168, tel = W < 480, Ws = tel ? W - 11 : W - 32;   // telefono: il grafico esce dal padding della card
   box.innerHTML = d.grafici.filter(g => g.linee.length).map(g => `
     <article class="card gr" data-g="${g.id}">
       <div class="ch"><h2>${g.titolo}</h2><div class="legg" data-l="${g.id}"></div></div>
-      <div class="grw">${graficoLineare(g, d, W - 32, H)}</div>
+      <div class="grw"${tel ? ' style="margin:0 -6px 0 -9px"' : ''}>${graficoLineare(g, d, Ws, H)}</div>
     </article>`).join('') || '<div class="card vuoto">Nessun dato in questo periodo.</div>';
-  S.grafici = d.grafici; S.gW = W - 32;
+  S.grafici = d.grafici; S.gW = Ws;
   d.grafici.forEach(g => legenda(g, null));
+  if (window.scrollY !== y0) window.scrollTo(0, y0);
 }
 
 // linea a gradini: ogni valore dura fino a meta' strada dal punto successivo; dove c'e' un buco i pezzi si staccano
@@ -2110,8 +2410,21 @@ function percorsoGradini(punti, X, Y, buco, mezzo, area, base) {
   return s;
 }
 
+let cvTesto = null;
+function largTesto(t) {   // larghezza vera di un testo dei grafici (11 px, stesso font della pagina) misurata dal browser
+  try {
+    if (!cvTesto) { cvTesto = document.createElement('canvas').getContext('2d'); cvTesto.font = '11px ' + getComputedStyle(document.body).fontFamily; }
+    return cvTesto.measureText(t).width;
+  } catch (_) { return t.length * 6.5; }
+}
+// colonna dei numeri dell'asse verticale, larga quanto serve. Telefono: stima (2 cifre ≈ 21 px); PC: misura vera col font della pagina,
+// cosi' la prima cifra cade sulla prima lettera del titolo
+function colonnaNumeri(et, tel) {
+  return tel ? Math.ceil(Math.max(...et.map(t => t.length)) * 6.5) + 8 : Math.ceil(Math.max(...et.map(largTesto))) + 4;
+}
 function graficoLineare(g, d, W, H) {
-  const doppio = g.linee.some(l => l.asse === 1), L = 40, R = doppio ? 40 : 8, T = 8, B = 22, pw = W - L - R, ph = H - T - B;
+  const doppio = g.linee.some(l => l.asse === 1), tel = W < 480, T = 8, B = 22, ph = H - T - B;
+  let L = 40, R = 8, pw = W - L - R;
   const range = a => {
     let lo = Infinity, hi = -Infinity;
     g.linee.filter(l => (l.asse || 0) === a).forEach(l => l.punti.forEach(p => { if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; }));
@@ -2121,16 +2434,37 @@ function graficoLineare(g, d, W, H) {
   if (g.id === 'circuito' || g.id === 'pot') lo = Math.min(lo, 0);
   const soglie = g.id === 'umid' ? (d.soglie_umidita || []).filter(v => hi > v - 10 && v > 0) : [];  // le linee delle soglie si vedono solo se i dati ci si avvicinano
   soglie.forEach(v => { if (v > hi) hi = v; });
-  const sc = scalaNice(lo, hi, 4), X = t => L + (t - d.da) / (d.a - d.da) * pw, Y = v => T + ph - (v - sc.lo) / (sc.hi - sc.lo) * ph;
+  const sc = scalaNice(lo, hi, 4);
   let sc1 = null, Y1 = null;
   if (doppio) { const r = range(1); sc1 = scalaNice(Math.min(0, r[0]), r[1], 4); Y1 = v => T + ph - (v - sc1.lo) / (sc1.hi - sc1.lo) * ph; }
+  {   // colonna dei numeri larga quanto serve. Telefono: stima (2 cifre ≈ 21 px, «4000» ≈ 34 px). PC: misura vera, così la prima cifra
+    // cade sulla prima lettera del titolo
+    const larg = sk => colonnaNumeri(sk.tick.map(v => num(v, sk.passo < 1 ? 1 : 0)), tel);
+    L = larg(sc); R = doppio ? larg(sc1) : tel ? 7 : 8;
+    pw = W - L - R;
+  }
+  const X = t => L + (t - d.da) / (d.a - d.da) * pw, Y = v => T + ph - (v - sc.lo) / (sc.hi - sc.lo) * ph;
   const tt = tickTempo(d.da, d.a, W < 480 ? 4 : 7), buco = g.id === 'pot' ? 3600 : Math.max(d.passo * 4, 1000);
   const mezzo = Math.max(d.passo, 120) / 2, colAsse1 = doppio ? COLS[(g.linee.find(l => l.asse === 1) || {}).col] : '';
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-l="${L}" data-pw="${pw}" data-id="${g.id}" data-t0="${T}" data-ph="${ph}" data-lo="${sc.lo}" data-hi="${sc.hi}"${doppio ? ` data-lo1="${sc1.lo}" data-hi1="${sc1.hi}"` : ''} data-buco="${buco}" data-mezzo="${g.gradini ? mezzo : 0}">`;
+  // periodi senza dati: dove le linee di questo grafico si interrompono E la pompa risulta senza dati (così i grafici che hanno dati solo
+  // quando il compressore lavora, come il gas, non segnano come «nessun dato» le pause normali). Righe oblique sottili, bordi = buco della linea.
+  const ts = [...new Set(g.linee.flatMap(l => l.punti.map(p => p[0])))].sort((a, b) => a - b), mz = g.gradini ? mezzo : 0, buchi = [];
+  if (!ts.length || ts[0] - d.da > buco) buchi.push([d.da, ts.length ? ts[0] - mz : d.a]);
+  for (let k = 1; k < ts.length; k++) if (ts[k] - ts[k - 1] > buco) buchi.push([ts[k - 1] + mz, ts[k] - mz]);
+  if (ts.length && d.a - ts[ts.length - 1] > buco) buchi.push([ts[ts.length - 1] + mz, d.a]);
+  const senzaDati = ((d.modi || {}).segmenti || []).filter(m => m[2] === 'nodati'), vuoti = [];
+  buchi.forEach(([a, b]) => senzaDati.forEach(([s0, s1]) => {
+    const lo = Math.max(a, s0 - buco), hi = Math.min(b, s1 + buco);
+    if (hi > lo && Math.min(b, s1) > Math.max(a, s0)) vuoti.push([lo, hi]);
+  }));
+  (S.vuoti = S.vuoti || {})[g.id] = vuoti;
+  s += `<defs><pattern id="tr-${g.id}" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#8793a8" stroke-opacity=".22" stroke-width="1"/></pattern></defs>`;
+  s += vuoti.map(([s0, s1]) => `<rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="rgba(135,147,168,.05)"/><rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('')).join('');
   s += g.id === 'casa' ? fasceRichiesta(d.richiesta || [], d.da, d.a, X, T, ph) : fasce(d.modi.segmenti, d.da, d.a, X, T, ph);
   if (g.id === 'casa') s += fasceRichiesta(d.richiesta || [], d.da, d.a, X, T + ph - 7, 7, .9);   // striscia piena in basso: quando lo Smarther chiede caldo
-  s += sc.tick.map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, sc.passo < 1 ? 1 : 0)}</text>`).join('');
-  if (doppio) s += sc1.tick.map(v => `<text x="${W - R + 6}" y="${(Y1(v) + 4).toFixed(1)}" text-anchor="start" fill="${colAsse1}">${num(v, sc1.passo < 1 ? 1 : 0)}</text>`).join('');
+  s += sc.tick.map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, sc.passo < 1 ? 1 : 0)}</text>`).join('');
+  if (doppio) s += sc1.tick.map(v => `<text x="${W - R + 4}" y="${(Y1(v) + 4).toFixed(1)}" text-anchor="start" fill="${colAsse1}">${num(v, sc1.passo < 1 ? 1 : 0)}</text>`).join('');
   s += tt.tick.map(t => `<line x1="${X(t).toFixed(1)}" x2="${X(t).toFixed(1)}" y1="${T}" y2="${T + ph}" class="gv"/><text x="${X(t).toFixed(1)}" y="${H - 6}" text-anchor="middle">${etTempo(t, tt.step)}</text>`).join('');
   soglie.forEach((v, i) => { if (v >= sc.lo && v <= sc.hi) s += `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" stroke="${i ? 'var(--bad)' : 'var(--warn)'}" stroke-width="1.2" stroke-dasharray="2 4" opacity=".8"/>`; });
   g.linee.forEach(l => {
@@ -2145,7 +2479,7 @@ function graficoLineare(g, d, W, H) {
   });
   s += g.linee.map((l, i) => `<circle class="cur-d" data-i="${i}" data-a="${l.asse || 0}" r="4.5" cx="0" cy="0" fill="${COLS[l.col]}" stroke="var(--card)" stroke-width="2" visibility="hidden"/>`).join('');
   s += `<line class="cur" x1="0" x2="0" y1="${T}" y2="${T + ph}" visibility="hidden"/>
-    <text class="cur-t" x="0" y="${T + 10}" visibility="hidden"></text>
+    <g class="cur-t" visibility="hidden"><rect class="cur-bg" rx="6" height="19"/><text class="cur-tx"></text></g>
     <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/></svg>`;
   return s;
 }
@@ -2169,7 +2503,7 @@ function legenda(g, t) {
   const el = document.querySelector(`[data-l="${g.id}"].legg`); if (!el) return;
   const d = S.dati, tol = Math.max(d.passo * 3, 900);
   el.innerHTML = g.linee.map(l => {
-    const v = t == null ? l.punti[l.punti.length - 1][1] : valoreA(l.punti, t, tol);
+    const v = !l.punti.length ? null : t == null ? l.punti[l.punti.length - 1][1] : valoreA(l.punti, t, tol);
     const u = l.u != null ? l.u : g.unita;
     return `<span><i style="background:${COLS[l.col]};${l.tratti ? 'opacity:.6' : ''}"></i>${l.nome} <b>${v == null ? '—' : num(v, u === 'W' || u === 'Hz' || u === '%' ? 0 : 1)}${u ? ' ' + u : ''}</b></span>`;
   }).join('') + (g.id === 'casa' ? richiestaLegenda(d.richiesta || [], t) : '');
@@ -2211,15 +2545,76 @@ function cursore(t) {
         c.setAttribute('cx', x.toFixed(1)); c.setAttribute('cy', (T0 + ph - (v - lo) / (hi - lo) * ph).toFixed(1)); c.setAttribute('visibility', 'visible');
       });
     }
-    tx.textContent = dm(t); tx.setAttribute('x', Math.max(L + 40, Math.min(L + pw - 40, x))); tx.setAttribute('text-anchor', 'middle'); tx.setAttribute('visibility', 'visible');
+    const vuoto = ((S.vuoti || {})[svg.dataset.id] || []).find(v => t >= v[0] && t < v[1]);     // sulle righe oblique: «nessun dato» + durata del buco
+    const T0 = +svg.dataset.t0, txt = tx.querySelector('.cur-tx'), bg = tx.querySelector('.cur-bg'), NS = 'http://www.w3.org/2000/svg';
+    txt.textContent = '';
+    [[dm(t), ''], ...(vuoto ? [[' · nessun dato' + (vuoto[1] - vuoto[0] >= 120 ? ' · ' + durata(Math.round((vuoto[1] - vuoto[0]) / 60)) : ''), 'nd']] : [])].forEach(([tt, cl]) => {
+      const ts = document.createElementNS(NS, 'tspan'); if (cl) ts.setAttribute('class', cl); ts.textContent = tt; txt.appendChild(ts);
+    });
+    tx.setAttribute('visibility', 'visible');
+    const w = txt.getComputedTextLength() + 16, bx = Math.max(L, Math.min(L + pw - w, x - w / 2));
+    bg.setAttribute('x', bx.toFixed(1)); bg.setAttribute('y', T0 + 3); bg.setAttribute('width', w.toFixed(1));
+    txt.setAttribute('x', (bx + 8).toFixed(1)); txt.setAttribute('y', T0 + 16);
+    c.setAttribute('y1', T0 + 22);
   });
   (S.grafici || []).forEach(g => legenda(g, t));
 }
+// Cursore dei grafici di Efficienza: come in Analisi (linea, puntini sulle linee, etichetta in alto, valori nella legenda)
+const EF = {};
+const curEf = (T, ph, cols = []) => cols.map(c => `<circle class="cur-d" r="4.5" fill="${c}" stroke="var(--card)" stroke-width="2" visibility="hidden"/>`).join('') +
+  `<line class="cur" x1="0" x2="0" y1="${T}" y2="${T + ph}" visibility="hidden"/><g class="cur-t" visibility="hidden"><rect class="cur-bg" rx="6" height="19"/><text class="cur-tx"></text></g>`;
+const vEf = (v, u, n = 1) => ` <b>${v == null ? '—' : num(v, n) + (u ? ' ' + u : '')}</b>`;
+const vuotoEf = (u, n = 1) => !tipici(EF.d) ? '' : ` <b style="visibility:hidden">${n > 1 ? '0,00' : '00,0'}${u ? ' ' + u : ''}</b>`;   // segnaposto (solo con Confronta, dove la legenda e' lunga): a riposo occupa lo stesso spazio di quella coi valori, cosi' non va a capo solo al cursore
+function legEf(k, i) {
+  const d = EF.d, on = i != null, sp = (st, nome, v, ph) => `<span><i ${st}></i>${nome}${on ? v : ph}</span>`;
+  if (k === 'en') {
+    const g = on ? d.giorni[i] : {}, tp = tipici(d), t = on && tp ? tp[g.giorno] : null, u = x => tp ? '' : x;   // l'unita' solo sull'ultimo valore: la legenda sta su una riga anche su iPhone
+    return sp('style="background:var(--casa)"', 'Risc.', vEf(g.el_casa, ''), vuotoEf('')) + sp('style="background:var(--acs)"', 'Acqua', vEf(g.el_acs, ''), vuotoEf('')) +
+      sp('style="background:#3a4558"', 'Standby', vEf(g.el_riposo, u('kWh')), vuotoEf(u('kWh'))) +
+      (tp ? sp('class="tp"', 'Tipico', vEf(t && t.el, 'kWh'), vuotoEf('kWh')) + '<span><i class="an"></i>Sopra il normale</span>' : '');
+  }
+  if (k === 'cop') {
+    const g = on ? d.giorni[i] : {}, t = on && tipici(d) ? tipici(d)[g.giorno] : null;
+    return sp('style="background:var(--casa)"', 'Risc.', vEf(g.cop_casa, '', 2), vuotoEf('', 2)) + sp('style="background:var(--acs)"', 'Acqua', vEf(g.cop_acs, '', 2), vuotoEf('', 2)) +
+      (tipici(d) ? sp('class="tp2"', 'Tipico', vEf(t && (t.cop_casa != null ? t.cop_casa : t.cop_acs), '', 2), vuotoEf('', 2)) : '');
+  }
+  const b = on ? EF.bin.bins[i] : null, f = m => b == null ? null : ((d.bins[m].find(x => x.da === b) || {}).cop);
+  return sp('style="background:var(--casa)"', 'Risc.', vEf(f('casa'), '', 2), vuotoEf('', 2)) + sp('style="background:var(--acs)"', 'Acqua', vEf(f('acs'), '', 2), vuotoEf('', 2));
+}
+function cursoreEf(svg, e) {
+  const k = svg.dataset.ef, c = EF[k]; if (!c || !c.xs.length) return;
+  const r = svg.getBoundingClientRect(), x0 = (e.clientX - r.left) * (+svg.getAttribute('width') / r.width);
+  let i = 0; c.xs.forEach((x, j) => { if (Math.abs(x - x0) < Math.abs(c.xs[i] - x0)) i = j; });
+  const x = c.xs[i], ln = svg.querySelector('.cur'), tx = svg.querySelector('.cur-t'), txt = tx.querySelector('.cur-tx'), bg = tx.querySelector('.cur-bg');
+  ln.setAttribute('x1', x); ln.setAttribute('x2', x); ln.setAttribute('y1', c.T + 22); ln.setAttribute('visibility', 'visible');
+  const ys = c.dots ? c.dots(i) : [];
+  svg.querySelectorAll('.cur-d').forEach((p, j) => {
+    if (ys[j] == null) { p.setAttribute('visibility', 'hidden'); return; }
+    p.setAttribute('cx', x.toFixed(1)); p.setAttribute('cy', ys[j].toFixed(1)); p.setAttribute('visibility', 'visible');
+  });
+  svg.querySelectorAll('.vt[data-i]').forEach(t => t.setAttribute('visibility', +t.dataset.i === i ? 'hidden' : 'visible'));   // il numero sopra la barra sparirebbe sotto l'etichetta
+  const et = c.seg ? c.seg(i, (e.clientY - r.top) * (+svg.getAttribute('height') / r.height)) : c.lab[i];
+  if (et == null) tx.setAttribute('visibility', 'hidden');
+  else { txt.textContent = et; tx.setAttribute('visibility', 'visible'); }
+  ln.setAttribute('y1', et == null ? c.T : c.T + 22);
+  if (et == null) { const lg0 = document.getElementById('lg-' + k); if (lg0) lg0.innerHTML = legEf(k, i); return; }
+  const w = txt.getComputedTextLength() + 16, bx = Math.max(c.L, Math.min(c.L + c.pw - w, x - w / 2));
+  bg.setAttribute('x', bx.toFixed(1)); bg.setAttribute('y', c.T + 3); bg.setAttribute('width', w.toFixed(1));
+  txt.setAttribute('x', (bx + 8).toFixed(1)); txt.setAttribute('y', c.T + 16);
+  const lg = document.getElementById('lg-' + k); if (lg) lg.innerHTML = legEf(k, i);
+}
+function togliCursoreEf() {
+  document.querySelectorAll('#eff .cur, #eff .cur-t, #eff .cur-d').forEach(e => e.setAttribute('visibility', 'hidden'));
+  document.querySelectorAll('#eff .vt[data-i]').forEach(t => t.setAttribute('visibility', 'visible'));
+  if (EF.d) ['en', 'cop', 'bin'].forEach(k => { const lg = document.getElementById('lg-' + k); if (lg) lg.innerHTML = legEf(k, null); });
+}
 function togliCursore() {
+  togliCursoreEf();
   document.querySelectorAll('#grafici .cur, #grafici .cur-t, #grafici .cur-d').forEach(e => e.setAttribute('visibility', 'hidden'));
   (S.grafici || []).forEach(g => legenda(g, null));
 }
 function muoviCursore(e) {
+  const ef = e.target.closest && e.target.closest('#eff svg[data-ef]'); if (ef) { cursoreEf(ef, e); return true; }
   const svg = e.target.closest && e.target.closest('#grafici svg'); const d = S.dati;
   if (!svg || !d || S.dpag !== 'analisi') return false;
   const r = svg.getBoundingClientRect(), L = +svg.dataset.l, pw = +svg.dataset.pw;
@@ -2227,6 +2622,69 @@ function muoviCursore(e) {
   cursore(d.da + f * (d.a - d.da)); return true;
 }
 
+
+// ---------- zoom con due dita sui grafici di Analisi (telefono); doppio tocco = vista intera ----------
+const dita = new Map();
+let pizzico = null, tocco = null, mossoPizzico = false, trascina = null;
+const unita = x => Math.max(0, Math.min(1, x));
+function fraz(el, x) {
+  const svg = document.querySelector('#grafici svg');
+  if (el.id === 'tlw' || !svg) { const r = el.getBoundingClientRect(); return (x - r.left) / r.width; }
+  const r = svg.getBoundingClientRect(), L = +svg.dataset.l, pw = +svg.dataset.pw;
+  return (x - r.left - L) / pw;
+}
+function zoomaGiu(e) {
+  if (e.pointerType !== 'touch' || S.pagina !== 'analisi' || !S.dati) return;
+  const el = e.target.closest && e.target.closest('#grafici, #tlw'); if (!el) return;
+  if (!dita.size) { mossoPizzico = false; trascina = null; tocco = tocco && Date.now() - tocco.t < 320 ? tocco : null; }
+  dita.set(e.pointerId, {x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, el});
+  if (dita.size === 2 && !pizzico) {
+    const [a, b] = [...dita.values()], v = S.dati;
+    pizzico = {el, dist0: Math.max(30, Math.abs(a.x - b.x)), span0: v.a - v.da, tc: v.da + unita(fraz(el, (a.x + b.x) / 2)) * (v.a - v.da)};
+    try { dita.forEach((_, id) => el.setPointerCapture(id)); } catch (_) {}
+    togliCursore();
+  }
+}
+function zoomaMuovi(e) {
+  const p = dita.get(e.pointerId); if (!p) return false;
+  p.x = e.clientX; p.y = e.clientY;
+  if (!pizzico && dita.size === 1 && S.zoom && !mossoPizzico) {   // con lo zoom attivo, un dito che scorre in orizzontale sposta la finestra di tempo
+    if (!trascina) {
+      if (Math.abs(p.x - p.x0) < 8 || Math.abs(p.x - p.x0) < Math.abs(p.y - p.y0)) return false;
+      trascina = {da: S.zoom.da, span: S.zoom.a - S.zoom.da, x0: p.x0};
+      try { p.el.setPointerCapture(e.pointerId); } catch (_) {}
+      togliCursore(); tocco = null;
+    }
+    const o = S.dati.pieno || S.dati;
+    const da = Math.min(o.a - trascina.span, Math.max(o.da, trascina.da + (fraz(p.el, trascina.x0) - fraz(p.el, p.x)) * trascina.span));
+    S.zoom = {da: Math.round(da), a: Math.round(da + trascina.span)};
+    if (!zoomaMuovi.rid) zoomaMuovi.rid = requestAnimationFrame(() => { zoomaMuovi.rid = 0; disegna(); });
+    return true;
+  }
+  if (!pizzico || dita.size < 2) return false;
+  const [a, b] = [...dita.values()], o = S.dati.pieno || S.dati, pieno = o.a - o.da;
+  const minimo = Math.max(900, (o.passo || 60) * 8), dist = Math.max(30, Math.abs(a.x - b.x));
+  const span = Math.min(pieno, Math.max(minimo, pizzico.span0 * pizzico.dist0 / dist));
+  const da = Math.min(o.a - span, Math.max(o.da, pizzico.tc - unita(fraz(pizzico.el, (a.x + b.x) / 2)) * span));
+  S.zoom = span >= pieno * 0.98 ? null : {da: Math.round(da), a: Math.round(da + span)};
+  mossoPizzico = true;
+  if (!zoomaMuovi.rid) zoomaMuovi.rid = requestAnimationFrame(() => { zoomaMuovi.rid = 0; disegna(); });
+  return true;
+}
+function zoomaSu(e) {
+  const p = dita.get(e.pointerId); if (!p) return;
+  dita.delete(e.pointerId);
+  if (dita.size < 2) pizzico = null;
+  if (dita.size) return;
+  trascina = null;
+  const fermo = Math.hypot(e.clientX - p.x0, e.clientY - p.y0) < 12;
+  if (mossoPizzico || !fermo || e.type === 'pointercancel') { tocco = null; return; }
+  const ora_ = Date.now();
+  if (tocco && ora_ - tocco.t < 320 && Math.hypot(e.clientX - tocco.x, e.clientY - tocco.y) < 40) {
+    tocco = null;
+    if (S.zoom) { S.zoom = null; disegna(); togliCursore(); }
+  } else tocco = {t: ora_, x: e.clientX, y: e.clientY};
+}
 
 // ---------- Impostazioni > Registro ----------
 const TAB_IMP = [['', 'Stato'], ['collegamenti', 'Collegamenti'], ['avvisi', 'Avvisi'], ['accesso', 'Accesso'], ['dati', 'Dati'], ['registro', 'Registro']];
@@ -2265,7 +2723,7 @@ function disegnaRegistro() {
     </div>
     <label class="reg-filtro"><input type="checkbox" id="reg-solo" ${S.solo ? 'checked' : ''}> Solo avvisi ed errori</label>
     <div class="reg-log" tabindex="0">${righe.length ? righe.map(r => `<div class="rl ${esc(r.livello)}">${esc(r.testo)}</div>`).join('') : '<div class="vuoto">Nessuna riga da mostrare.</div>'}</div>
-    <p class="nota-fondo" style="margin:8px 0 0">Ultime ${d.righe.length} righe di <code>pdc_pannello.log</code>. I token e le password vengono nascosti, ma controlla comunque prima di incollare il testo in giro.</p></article>`;
+    <p class="nota f" style="margin:8px 0 0">Ultime ${d.righe.length} righe di <code>pdc_pannello.log</code>. I token e le password vengono nascosti, ma controlla comunque prima di incollare il testo in giro.</p></article>`;
   const n = box.querySelector('.reg-log'); if (n && inFondo) n.scrollTop = n.scrollHeight;
 }
 document.addEventListener('click', async e => {
@@ -2280,115 +2738,201 @@ document.addEventListener('click', async e => {
 document.addEventListener('change', e => { if (e.target && e.target.id === 'reg-solo') { S.solo = e.target.checked; disegnaRegistro(); } });
 setInterval(() => { if (S.pagina === 'impostazioni' && S.sub === 'registro' && !document.hidden) caricaRegistro(); }, 15000);
 
+// ---------- Meteo (riga nella scheda Esterna) ----------
+// Icone a tratto, 32x32, nello stesso stile del resto dell'app. Ogni colore e' una variabile CSS (vedi .mt-*).
+const MT = {
+  nuvola: '<path class="mt-n" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
+  nuvolaP: '<path class="mt-n" transform="translate(6.5 7.5) scale(.72)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
+  nuvolaAlta: '<path class="mt-n" transform="translate(0 -3)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
+  sole: (cx, cy, r, ray) => `<circle class="mt-s" cx="${cx}" cy="${cy}" r="${r}"/>` + [0, 45, 90, 135, 180, 225, 270, 315].map(a => {
+    const t = a * Math.PI / 180, c = Math.cos(t), n = Math.sin(t);
+    return `<path class="mt-s" d="M${(cx + c * (r + 2.6)).toFixed(1)} ${(cy + n * (r + 2.6)).toFixed(1)}L${(cx + c * (r + 2.6 + ray)).toFixed(1)} ${(cy + n * (r + 2.6 + ray)).toFixed(1)}"/>`;
+  }).join(''),
+  luna: (tr) => `<path class="mt-l" ${tr || ''} d="M23.5 19.5A9 9 0 0 1 12.5 8.5 9 9 0 1 0 23.5 19.5z"/>`,
+  gocce: '<path class="mt-p" d="M12 26.2l-1.4 3M17.4 26.2L16 29.2M22.8 26.2l-1.4 3"/>',
+  fulmine: '<path class="mt-f" d="M17.6 21.2l-3.4 5h4.4l-2.4 4.6"/>',
+};
+const ICONE_METEO = {
+  sole: MT.sole(16, 16, 5.6, 3.2),
+  luna: MT.luna('transform="translate(-.5 .5)"'),
+  'sole-nuvola': MT.sole(10.5, 10.5, 3.6, 2.2) + MT.nuvolaP,
+  'luna-nuvola': MT.luna('transform="translate(-2.6 -2.5) scale(.74)"') + MT.nuvolaP,
+  nuvola: MT.nuvola,
+  pioggia: MT.nuvolaAlta + MT.gocce,
+  'sole-pioggia': MT.sole(10, 9.5, 3.2, 2) + '<path class="mt-n" transform="translate(5 1) scale(.8)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/><path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>',
+  'luna-pioggia': MT.luna('transform="translate(-2 -3) scale(.68)"') + '<path class="mt-n" transform="translate(5 1) scale(.8)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/><path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>',
+  temporale: MT.nuvolaAlta + MT.fulmine,
+  neve: MT.nuvolaAlta + '<path class="mt-v" d="M12 26.5v.01M16.5 28.5v.01M21 26.5v.01"/>',
+  nebbia: '<path class="mt-n" d="M7 11h14M5 16h20M9 21h16M7 26h10"/>',
+};
+const iconaMeteo = (nome, px) => `<svg class="mt-i" viewBox="0 0 32 32" width="${px}" height="${px}" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONE_METEO[nome] || ICONE_METEO.nuvola}</svg>`;
+
+// Versione corta della frase per la scheda (nel pannello c'e' quella completa)
+function meteoBreve(m) {
+  if (m.livello !== 'certa' && m.livello !== 'possibile') return '';
+  const r = (m.testo || '').replace(/^(possibile )?pioggia\s*/, '').replace('per il resto della giornata', 'tutto il giorno');
+  if (m.livello === 'possibile') return 'possibile ' + r;
+  return /^(fino|tutto)/.test(r) ? r : 'pioggia ' + r;
+}
+function meteoRiga(m) {
+  const el = document.getElementById('e-mt');
+  if (!el) return;
+  if (!m) { el.hidden = true; chiudiMeteo(); return; }
+  const gradi = v => v == null ? '—' : Math.round(v) + '°';
+  el.hidden = false;
+  const breve = meteoBreve(m).replace(/(\d)–(\d)/g, '$1⁠–⁠$2');
+  html('e-mt', iconaMeteo(m.icona, 26) + `<b class="mt-g">${gradi(m.tmin)}–${gradi(m.tmax)}</b>` +
+    (breve ? `<span class="mt-pi ${m.livello}">${esc(breve)}</span>` : ''));
+  if (S.meteoAperto) disegnaPannelloMeteo(m);
+}
+function pannelloMeteoHtml(m) {
+  const gradi = v => v == null ? '—' : Math.round(v) + '°';
+  const righe = (m.ore || []).map(o => {
+    const mm = o.mm > 0 ? (o.mm < 0.1 ? '<0,1' : o.mm.toFixed(1).replace('.', ',')) + ' mm' : '';
+    const pioggia = o.p === 'certa' ? (mm || 'pioggia') : o.p === 'possibile' ? 'possibile' + (mm ? ' · ' + mm : '') : 'asciutto';
+    return `<div class="mt-r ${o.p || 'nessuna'}">${iconaMeteo(o.i || 'nuvola', 20)}<span class="mt-h">${String(o.h).padStart(2, '0')}:00</span><b>${gradi(o.t)}</b><span class="mt-mm">${pioggia}</span></div>`;
+  }).join('');
+  const NOMI = {italia_meteo_arpae_icon_2i: 'ICON-2I', ecmwf_ifs025: 'ECMWF'};
+  const mod = (m.modelli_nomi || []).map(n => NOMI[n] || n).join(' + ');
+  const agg = m.agg ? new Date(m.agg * 1000).toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'}) : '';
+  return `<div class="eti">${esc(m.giorno)} · ogni 3 ore</div>${righe || '<div class="mt-r"><span class="mt-h">Nessun dettaglio orario</span></div>'}` +
+    `<div class="mt-fo"><span>${esc(mod)}${agg ? ' · agg. ' + agg : ''}</span><span>Dati: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0)</span></div>`;
+}
+// Pannello sospeso (fuori dalla scheda, cosi' non la allunga): si chiude toccando fuori, con Esc o scorrendo la pagina.
+function disegnaPannelloMeteo(m) {
+  let p = document.getElementById('mt-pan');
+  if (!p) { p = document.createElement('div'); p.id = 'mt-pan'; p.className = 'mt-pan'; document.body.appendChild(p); }
+  p.innerHTML = pannelloMeteoHtml(m);
+  const ref = document.getElementById('e-mt'); if (!ref) return;
+  const r = ref.closest('article').getBoundingClientRect(), w = Math.min(290, window.innerWidth - 20);
+  p.style.width = w + 'px';
+  p.style.left = Math.max(10, Math.min(window.innerWidth - w - 10, r.left + r.width / 2 - w / 2)) + 'px';
+  const h = p.offsetHeight, sotto = r.bottom + 8;
+  p.style.top = (sotto + h > window.innerHeight - 90 && r.top - h - 8 > 10 ? r.top - h - 8 : Math.max(10, sotto)) + 'px';
+}
+function chiudiMeteo() { S.meteoAperto = false; const p = document.getElementById('mt-pan'); if (p) p.remove(); }
+document.addEventListener('click', ev => {
+  if (ev.target.closest && ev.target.closest('[data-meteo]')) {
+    if (S.meteoAperto) return chiudiMeteo();
+    if (S.dati && S.dati.meteo) { S.meteoAperto = true; disegnaPannelloMeteo(S.dati.meteo); }
+  } else if (S.meteoAperto && !(ev.target.closest && ev.target.closest('#mt-pan'))) chiudiMeteo();
+});
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') chiudiMeteo(); });
+window.addEventListener('scroll', () => { if (S.meteoAperto) chiudiMeteo(); }, {passive: true});
+
 // ---------- Changelog ----------
-// Una voce per ogni consegna, la piu' recente in alto. Testi in italiano semplice (i dettagli tecnici stanno in PIANO.md).
+// Una voce per ogni versione, la piu' recente in alto; le sotto-versioni stanno nella versione madre.
+// Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola: i dettagli tecnici stanno in PIANO.md.
+const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
+const CL_BREVE = [
+  ['ora', 'Ripartenza prevista', 'Nella card Smarther: a che ora il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
+  ['tipici', 'Giorni tipici', 'In Efficienza → Confronta: il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
+  ['avviso', 'Avviso dal tunnel', 'Telegram ti scrive se da internet il pannello non risponde, e lo chiude da solo quando torna tutto a posto.'],
+  ['sbr', 'Sbrinamenti', 'In Efficienza l’elenco degli sbrinamenti con consumo e temperatura, e due avvisi Telegram silenziosi: inizio e fine.'],
+];
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄'};
 const CHANGELOG = [
-  {v: '0.17', quando: '3 novembre 2026', titolo: 'Aggiornare senza fermare la raccolta dei dati', righe: [
-    'Impostazioni → Stato → «Aggiornamento»: quando sostituisci il file del pannello senza riavviarlo, qui compare cosa è cambiato. Se sono cambiate solo le parti di interfaccia (pagine, grafici, API, Impostazioni, Dispositivi, comandi allo Smarther) premi «Applica aggiornamento»: il codice nuovo entra a caldo e la lettura dei dati dalla pompa di calore e dallo Smarther non si ferma mai. Le pagine aperte si ricaricano da sole.',
-    'Se invece è cambiato il nucleo (come si leggono e si decodificano i dati, Telegram, tunnel, backup) il pannello lo dice e serve il riavvio completo, come prima. Il numero di versione da solo non richiede riavvio.',
-    'Se il file nuovo ha un errore, non cambia niente: continua a girare il codice di prima, con il motivo scritto in chiaro.',
-    'La prima volta (per far entrare questa funzione) serve comunque un riavvio completo.',
+  {v: '0.19', quando: '3 novembre 2026', titolo: 'Ripartenza prevista e giorni tipici', righe: [
+    ['n', 'Ripartenza prevista', 'Nella card Smarther: l’ora in cui il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
+    ['n', 'Giorni tipici', 'Efficienza → Confronta: sui grafici dei giorni compare il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
+    ['n', 'Avviso se il pannello non si apre da fuori', 'Telegram ti scrive se da internet il pannello non risponde per qualche minuto; quando torna tutto a posto lo chiude da solo.'],
+    ['n', 'Programma dello Smarther', 'In Dispositivi: il programma orario letto dal termostato, a fasce o fisso.'],
+    ['n', 'Zoom sui grafici', 'Analisi, da telefono: pizzica con due dita per ingrandire il tempo (tutti i grafici insieme), trascina con un dito per spostarti, doppio tocco per tornare alla vista intera. In più i grafici sono più larghi, con i numeri degli assi in una colonna stretta.'],
+    ['n', 'Elenco degli sbrinamenti', 'In Efficienza → Cicli di funzionamento: il riquadro «Sbrinamenti» dice anche quanta energia hanno usato; toccalo per l’elenco a scomparsa con ora, durata, consumo approssimato e temperatura esterna.'],
+    ['n', 'Cursore nei grafici di Efficienza', 'Passando il mouse o toccando un grafico di Efficienza compare, come in Analisi, la linea con i puntini e l’etichetta in alto; i valori di quel giorno (o di quella fascia di temperatura) si leggono nella legenda.'],
+    ['n', 'Avvisi Telegram di sbrinamento', 'Un messaggio senza suoneria quando la PdC entra in sbrinamento e uno quando finisce (durata e consumo). Si accendono e si spengono a parte in Impostazioni → Avvisi, e i testi si possono cambiare.'],
+    ['m', 'Avvisi di Efficienza in alto', 'Dati incompleti e l’avviso di Confronta ora stanno subito sotto «Aggiornato», così li vedi appena premi il tasto.'],
+    ['m', 'Note e legende più ordinate', 'In Analisi le note sono un elenco con icona e la legenda di «Modo di funzionamento» sta su una riga; l’icona «i» è la stessa dappertutto.'],
+    ['m', 'Riquadri di Impostazioni', 'Aperti, hanno meno spazio vuoto e tutti uguali, sopra e sotto.'],
+    ['m', 'Avvisi nelle card', '«Smarther non collegato» in rosso, «Ultimo dato delle…» in giallo, nello stesso box della ripartenza (anche per la PdC ferma nella card Esterna).'],
+    ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra sempre 3 righe da 3 ore a partire da adesso, con la scritta «Oggi»: mai «Domani», nemmeno a sera tarda.'],
+    ['m', 'Card Smarther stabile', 'Su PC la card ha sempre la stessa altezza, con o senza la riga della ripartenza: niente più saltelli.'],
+  ]},
+  {v: '0.18', quando: '3 novembre 2026', titolo: 'Meteo, costo del mese e dati più freschi', righe: [
+    ['n', 'Meteo', 'Nella scheda Esterna: icona e forchetta di oggi, due modelli a confronto; toccala per il dettaglio ogni 3 ore.'],
+    ['n', 'Costo del mese', 'In Efficienza: speso finora, stima a fine mese e confronto col mese scorso.'],
+    ['n', 'Refresh dei dati', 'Impostazioni → Collegamenti: la pompa viene interrogata ogni minuto mentre lavora, per dati meno in ritardo.'],
+    ['n', 'Azzera il database', 'Impostazioni → Dati: riparte da zero, tenendo impostazioni e password, dopo una copia di sicurezza.'],
+    ['m', 'Curva climatica', 'Riquadri Freddo, Mite e Adesso allineati, note brevi con il loro simbolo.'],
+    ['m', 'Efficienza ordinata', 'Cicli a gruppi colorati, note brevi con il loro simbolo, formule a scomparsa e pulsanti per l’Excel.'],
+    ['m', 'Ritocchi ai testi', 'Più coerenti in tutto il pannello e nei messaggi Telegram.'],
+    ['m', 'Impostazioni rifatte', 'Campi corti in linea, aiuto sotto ogni campo, riquadri chiusi su due colonne che si ricordano come li hai lasciati.'],
+    ['m', 'Più leggero e leggibile', 'Pagine e dati compressi (da 124 a circa 40 KB); nei grafici i periodi senza dati hanno le righe oblique.'],
+    ['s', 'Stato più pronto', '«A riposo» e «Riscaldamento» si aggiornano in 1–2 minuti. Tolto l’avviso «Resistenza elettrica»: l’impianto non ce l’ha.'],
+  ]},
+  {v: '0.17', quando: '3 novembre 2026', titolo: 'Aggiornare senza fermare i dati', righe: [
+    ['n', 'Applica aggiornamento', 'Impostazioni → Stato: le parti di interfaccia entrano a caldo e la lettura dei dati non si ferma mai.'],
+    ['m', 'Più chiaro', 'Se è cambiato il nucleo (dati, Telegram, tunnel, backup) il pannello lo dice, e il riavvio serve come prima.'],
+    ['s', 'File con errori', 'Se il file nuovo ha un errore non cambia niente: continua il codice di prima, col motivo scritto in chiaro.'],
   ]},
   {v: '0.16', quando: '3 novembre 2026', titolo: 'Cartelle in ordine', righe: [
-    'Il pannello non butta più tutto nella stessa cartella: il database sta in «dati», le copie di sicurezza in «dati/backup», i tuoi loghi in «dati/loghi», i file di registro in «log», il tunnel Cloudflare nella sua cartella. In radice restano pdc_pannello.py, pdc_strumenti.py e config.json (quello che modifichi a mano).',
-    'Al primo avvio dopo l\'aggiornamento sposta da solo i file vecchi nei posti nuovi e aggiorna config.json (solo se avevi i percorsi di prima: se ne avevi scelti di tuoi non li tocca). Non copia e non cancella: sposta, e se qualcosa non torna rimette tutto com\'era e si ferma dicendolo.',
-    'Se il pannello è ancora acceso (o c\'è un altro database con lo stesso nome) non sposta niente e te lo dice. I loghi messi per abitudine nella vecchia cartella «loghi» si vedono ancora.',
-    'README e PIANO vanno in una cartella «docs» (nel pacco te li mando separati: spostali tu).',
+    ['m', 'Ogni cosa al suo posto', 'Database in «dati», backup in «dati/backup», loghi in «dati/loghi», registro in «log»; in radice solo i file che usi.'],
+    ['m', 'Si sistema da solo', 'Al primo avvio sposta i file vecchi (non copia né cancella) e, se qualcosa non torna, rimette tutto com’era.'],
+    ['m', 'Documenti', 'README e PIANO vanno nella cartella «docs».'],
   ]},
   {v: '0.15', quando: '3 novembre 2026', titolo: 'Un solo grafico per compressore, portata e pompa', righe: [
-    'Analisi: i tre grafici separati diventano uno, «Compressore, portata e pompa». Il compressore è un\'area a gradini (Hz), la pompa una linea a gradini (%) sulla stessa scala a sinistra, la portata una linea a gradini (L/min) con la sua scala a destra, dello stesso colore.',
-    'I valori sono a gradini perché arrivano ogni pochi minuti e restano validi fino al successivo: prima la linea inclinata inventava valori intermedi. Passando il mouse compaiono i puntini su ogni linea e la legenda mostra i valori di quell\'ora.',
-    'Potenza elettrica e gas refrigerante restano grafici a parte.',
-    'Analisi, «Temperatura ambiente · Smarther»: in basso c\'è una striscia rossa piena quando il termostato chiede caldo (prima c\'era solo una tinta leggera dietro il grafico) e la legenda dice «Richiesta caldo sì/no» all\'ora scelta.',
-    'Dashboard: la nota sul ritardo dei dati è su una riga ordinata, senza «min» rimasto solo a capo.',
-    'Dashboard: «Gas di scarico» compare solo se la pompa di calore manda davvero quel valore (la tua mostrava sempre un trattino).',
-    'Dashboard: la scheda «Compressore e circuito» mostra i valori solo mentre il compressore lavora. Quando è fermo (quasi sempre) vedi lo stato «Fermo» e tre riquadri sull\'ultimo ciclo: per cosa (riscaldamento o acqua calda), durata ed energia.',
-  ]},
-  {v: '0.14.2', quando: '3 novembre 2026', titolo: 'Grafici più leggibili', righe: [
-    'Analisi: il grafico della potenza elettrica non è più spezzettato. Ogni rapporto della pompa vale per la sua finestra di tempo (è una media), quindi ora la linea è continua a gradini.',
-    'Analisi: passando il mouse su un grafico compare un puntino colorato su ogni linea, esattamente sul valore di quell\'ora.',
-    '«Modo di funzionamento»: nel riepilogo in alto «casa» diventa «riscaldamento».',
-  ]},
-  {v: '0.14.1', quando: '3 novembre 2026', titolo: 'Il riepilogo racconta anche la notte', righe: [
-    'Se il silenzio notturno è acceso, il riepilogo del mattino aggiunge una sezione «Di notte» solo quando è successo qualcosa: temperatura in casa variata di almeno 2 °C (minimo e massimo), umidità salita sopra la soglia gialla (con il picco e l\'ora) e avvisi scattati e già rientrati durante il silenzio.',
-    'La soglia delle oscillazioni di temperatura si cambia in Impostazioni → Avvisi → «Silenzio notturno e riepilogo». Se la notte è tranquilla la sezione non compare.',
+    ['n', 'Grafico unico', 'Analisi: compressore, pompa e portata insieme, a gradini come arrivano i dati, con i valori al passaggio del mouse.'],
+    ['n', 'Richiesta di caldo', 'Una striscia rossa sotto il grafico dello Smarther, con «sì/no» all’ora scelta.'],
+    ['m', 'Compressore da fermo', 'Dashboard: stato «Fermo» e tre riquadri sull’ultimo ciclo (per cosa, durata, energia).'],
+    ['m', 'Nota sul ritardo', 'Su una riga ordinata, senza «min» rimasto a capo.'],
+    ['s', 'Gas di scarico', 'Compare solo se la pompa lo manda davvero.'],
   ]},
   {v: '0.14', quando: '3 novembre 2026', titolo: 'Umidità in casa: soglie e avvisi', righe: [
-    'Due nuovi avvisi Telegram: «Umidità alta» (sopra 60 %) e «Umidità molto alta» (sopra 70 %). L\'umidità arriva dallo Smarther.',
-    'Le soglie si cambiano in un solo posto, Impostazioni → Avvisi → «Umidità in casa», e valgono per Telegram, Dashboard e grafico. Lì si regolano anche i minuti da aspettare prima di avvisare (30) e di quanti punti deve scendere per dire che è rientrata (2). Ogni avviso si può spegnere in «Quando avvisarti».',
-    'Dashboard: il valore dell\'umidità diventa giallo sopra la prima soglia e rosso sopra la seconda. Il resto non cambia.',
-    'Analisi: nel grafico «Umidità · Smarther» due linee tratteggiate (gialla e rossa) mostrano le soglie quando i valori si avvicinano.',
-  ]},
-  {v: '0.13.1', quando: '3 novembre 2026', titolo: 'Rifiniture per iPhone e grafici', righe: [
-    'Dispositivi su telefono: logo a sinistra e stato (ONLINE e «ultimo dato») a destra sulla stessa riga, sotto titolo e sottotitolo. I loghi hanno una casella di misura fissa, così non si sovrappongono più al testo.',
-    'Analisi: il grafico della temperatura dello Smarther si chiama «Temperatura ambiente · Smarther» e quello dell\'umidità «Umidità · Smarther», per far capire da dove arrivano i dati.',
-    'Impostazioni → Stato mostra «acceso da 2 minuti» (non più «da 2 min fa»), e anche nella scheda Dispositivi.',
+    ['n', 'Avvisi sull’umidità', 'Telegram avvisa sopra il 60 % e il 70 %; soglie e attese si cambiano in Impostazioni → Avvisi.'],
+    ['n', 'Riepilogo con la notte', 'Il riepilogo del mattino racconta anche la notte, ma solo se è successo qualcosa.'],
+    ['m', 'Colori e soglie', 'L’umidità diventa gialla e rossa in Dashboard, e due linee tratteggiate la accompagnano nel grafico.'],
+    ['m', 'Grafici', 'La potenza è una linea continua a gradini, e al passaggio del mouse ogni linea ha il suo puntino.'],
   ]},
   {v: '0.13', quando: '3 novembre 2026', titolo: 'Impostazioni in tab', righe: [
-    'Impostazioni è divisa in sei tab: Stato, Collegamenti, Avvisi, Accesso, Dati e Registro. Ogni riquadro si apre e si chiude con un tocco e il pannello ricorda come l\'hai lasciato.',
-    'Nuovi riquadri nel tab Dati: litri del bollitore e backup (acceso/spento e quante copie tenere), prima solo in config.json.',
-    'Se un valore non è valido, il pannello apre il riquadro giusto, passa al tab e lo segna in rosso.',
-    'In Cloudflare c\'è il pulsante «Invia il link su Telegram».',
-    'Messaggio di avvio più pulito (solo rete di casa e indirizzo Cloudflare) e «acceso da 2 minuti» al posto di «acceso da 2 min fa».',
-  ]},
-  {v: '0.12.1', quando: '3 novembre 2026', titolo: 'Più sicuro e più robusto', righe: [
-    'Il «tempo reale» su Safari si ricollega da solo quando la scheda era in pausa o la rete è cambiata.',
-    'Se il disco è pieno o il database non si può scrivere, la raccolta dati, i controlli automatici e il tunnel Cloudflare non si fermano più per sempre: riprovano da soli e lo scrivono nel registro.',
-    'Se il database è danneggiato, il pannello lo dice chiaramente e indica il comando «ripristina», che ora funziona anche in quel caso.',
-    'config.json (password e token) è leggibile solo dal proprietario del file, e viene scritto con più cura per resistere a un blackout.',
-    'Il login rifiuta richieste che arrivano da altri siti, le richieste malformate non bloccano più il pannello e le pagine aperte in tempo reale sono al massimo 20.',
-    'Efficienza: sistemato lo spazio sopra la scheda «Salute del bollitore».',
+    ['n', 'Sei tab', 'Stato, Collegamenti, Avvisi, Accesso, Dati e Registro; i riquadri si ricordano come li hai lasciati.'],
+    ['n', 'Nuovi riquadri', 'In Dati: litri del bollitore e backup. In Cloudflare: «Invia il link su Telegram».'],
+    ['m', 'Errori chiari', 'Un valore non valido apre il riquadro giusto e si segna in rosso.'],
+    ['m', 'Telefono', 'Dispositivi più ordinato; grafici Smarther rinominati «Temperatura ambiente» e «Umidità»; «acceso da 2 minuti».'],
   ]},
   {v: '0.12', quando: '3 novembre 2026', titolo: 'Confronto, bollitore, registro e ripristino', righe: [
-    'Efficienza: nuovo pulsante «Confronta» che mette i numeri del periodo accanto a quelli del periodo precedente della stessa lunghezza (COP, energia, calore, cicli). All\'apertura della pagina è spento.',
-    'Efficienza: nuova scheda «Salute del bollitore» con quanto calore perde di notte e quanto ci mette a scaldarsi. Serve qualche notte di dati; i litri si cambiano in config.json (sezione bollitore).',
-    'Impostazioni: nuova scheda «Registro» con le ultime righe del registro del pannello, le dimensioni di database e log e lo stato dei backup.',
-    'Nuovo comando «python pdc_pannello.py ripristina»: mostra le copie di backup, ti fa scegliere, mette da parte il database attuale e rimette quello scelto. Si usa a pannello fermo.',
+    ['n', 'Confronta', 'Efficienza: il periodo accanto al precedente di pari durata (COP, energia, calore, cicli).'],
+    ['n', 'Salute del bollitore', 'Quanto calore perde di notte e quanto ci mette a scaldarsi.'],
+    ['n', 'Registro e ripristino', 'Impostazioni → Registro, e il comando «ripristina» per rimettere un backup.'],
+    ['s', 'Più robusto', 'Disco pieno o database non scrivibile non fermano più la raccolta: riprova da sola e lo scrive nel registro.'],
+    ['s', 'Più sicuro', 'config.json leggibile solo dal proprietario, login che rifiuta richieste da altri siti, tempo reale di Safari che si ricollega.'],
   ]},
-  {v: '0.11.2', quando: '2 novembre 2026', titolo: 'Correzioni dopo le prove sull\'impianto vero', righe: [
-    'Acqua calda e riscaldamento non restano più in «Standby» o «A riposo» mentre la pompa sta partendo: se il compressore è in ritardo, il pannello guarda anche l\'acqua dell\'impianto, che sale subito.',
-    'Nella scheda «Compressore e circuito» compare «dato di N min fa», e il pannello misura il ritardo con cui arrivano i dati (tipico e massimo delle ultime 24 ore).',
-    'Smarther: ora il pannello capisce se è spento sia dal pannello sia dall\'app, e lo riaccende anche se l\'hai spento dall\'app. Ogni comando viene verificato su Netatmo prima di dirti che è andato.',
-    'Badge giallo «ATTENDI…» sugli interruttori mentre il comando è in corso; lo sblocco di 30 secondi riparte a ogni azione.',
-    'Comandi dati dal pannello: a pagine da 5.',
-    'Costo dell\'energia in euro (metti il prezzo in Impostazioni), anche per un ciclo di acqua calda.',
-    'Esportazione in CSV per Excel (pagina Efficienza).',
-    'Backup notturno automatico di database e configurazione, e comando «backup».',
-    'Nuova pagina Changelog.']},
-  {v: '0.11.1', quando: '2 novembre 2026', titolo: 'Primo aggiustamento dello Smarther', righe: ['Prima correzione dell\'accensione dello Smarther, completata poi nella 0.11.2.']},
-  {v: '0.11', titolo: 'Accendere e spegnere dal pannello', righe: [
-    'Interruttori per Riscaldamento casa, Acqua calda sanitaria e Termostato Smarther, nella scheda «Stato del sistema».',
-    'Bloccati finché non premi «Sblocca comandi» (30 secondi), conferma allo spegnimento, registro dei comandi in Dispositivi.',
-    'Funzionano anche da fuori casa. Servono token con il permesso di comando (vedi README).']},
+  {v: '0.11', quando: '2 novembre 2026', titolo: 'Accendere e spegnere dal pannello', righe: [
+    ['n', 'Interruttori', 'Riscaldamento, Acqua calda e Smarther: bloccati finché non premi «Sblocca comandi», con conferma allo spegnimento.'],
+    ['n', 'Costi e dati', 'Costo in euro (prezzo in Impostazioni), esportazione CSV per Excel, backup notturno, pagina Changelog.'],
+    ['m', 'Ritardo misurato', 'Il pannello misura e mostra il ritardo dei dati, e non dice più «Standby» mentre la pompa parte.'],
+    ['s', 'Smarther', 'Capisce se è spento dal pannello o dall’app, e verifica ogni comando su Netatmo.'],
+  ]},
   {v: '0.10', titolo: 'Impostazioni installatore', righe: [
-    'Nuova scheda «Installatore» dentro Dispositivi: le impostazioni FSV che la pompa comunica, in sola lettura, per gruppi e con il nome in italiano.',
-    'Per ognuna c\'è l\'intervallo previsto dal manuale e un avviso se il valore ne esce; «Copia elenco» per mandarle all\'installatore.']},
-  {v: '0.9.3', titolo: 'Loghi e cache', righe: [
-    'Loghi più ordinati nella pagina Dispositivi (BTicino nella riga «Produttore»).',
-    'Quando il pannello viene aggiornato, le pagine rimaste aperte si ricaricano da sole.']},
-  {v: '0.9.2', titolo: 'Rifinitura', righe: ['Logo Smarther più piccolo e allineato nella scheda Casa.']},
-  {v: '0.9.1', titolo: 'Stato «In funzione / A riposo»', righe: ['Corretto il caso in cui il pannello diceva «A riposo» a pompa in marcia, per il ritardo dei dati del compressore.']},
+    ['n', 'Scheda Installatore', 'In Dispositivi: le impostazioni FSV in sola lettura, con l’intervallo del manuale, l’avviso se escono e «Copia elenco».'],
+  ]},
   {v: '0.9', titolo: 'Pagina Dispositivi', righe: [
-    'Una scheda per la pompa e una per lo Smarther: modello, versioni, identificativi con «Copia», IP e MAC, stato Online/Offline.',
-    'Storico delle versioni: il pannello segna quando cambia un firmware o un software.',
-    'Loghi dalla cartella «loghi» (li metti tu).']},
-  {v: '0.8 – 0.8.4', titolo: 'Colori e dettagli', antico: true, righe: [
-    'Badge di stato a colori pieni (verde acceso, arancio richiesta di calore, giallo sbrinamento, blu fermo, rosso spento).',
-    'Etichette di stato sempre sotto il titolo delle schede; verde più chiaro e leggibile.',
-    'Primo intervento sul ritardo del compressore: l\'acqua calda non va più in «Standby» durante un ciclo.']},
-  {v: 'Fino alla 0.7', titolo: 'Come è nato (ricostruito dal piano di lavoro)', antico: true, righe: [
-    'Pezzo 1 – Il nucleo: lettura della pompa da SmartThings e dello Smarther da Netatmo, database SQLite, decodifica dei dati del ciclo (compressore, mandata, ritorno, portata…).',
-    'Pezzo 2 – Il sito: server web, login con sessioni, Dashboard con la curva climatica, aggiornamento in tempo reale, modalità demo.',
-    'Pezzo 3 – Analisi ed Efficienza: grafici sincronizzati, COP stimato, energia al giorno, cicli di funzionamento.',
-    'Pezzo 4 – Telegram: avvisi e controllo anomalie (pompa ferma con richiesta di calore, casa fredda, cicli brevi, portata bassa…), riepilogo del mattino.',
-    'Pezzo 5 – Impostazioni: modifica di config.json dal pannello, cambio password, stato dei collegamenti.',
-    'Pezzo 6 – Accesso da fuori casa: procedura guidata per il tunnel Cloudflare.',
-    'Pezzo 7 – README, compattazione automatica dello storico vecchio, rifinitura.']},
+    ['n', 'Pompa e Smarther', 'Modello, versioni, identificativi con «Copia», IP e MAC, stato, storico delle firmware e loghi tuoi.'],
+    ['m', 'Si aggiorna da sola', 'Dopo un aggiornamento le pagine rimaste aperte si ricaricano da sole.'],
+    ['s', 'Stato corretto', '«A riposo» non compare più a pompa in marcia per il ritardo dei dati.'],
+  ]},
+  {v: '0.8', titolo: 'Colori e dettagli', antico: true, righe: [
+    ['m', 'Badge di stato', 'A colori pieni, sempre sotto il titolo delle schede.'],
+    ['s', 'Acqua calda', 'Non va più in «Standby» durante un ciclo.'],
+  ]},
+  {v: '≤ 0.7', titolo: 'Come è nato', antico: true, righe: [
+    ['n', 'Il nucleo', 'Lettura della pompa (SmartThings) e dello Smarther (Netatmo), database, decodifica del ciclo.'],
+    ['n', 'Il sito', 'Server web con login, Dashboard con curva climatica, tempo reale, modalità demo.'],
+    ['n', 'Analisi ed Efficienza', 'Grafici sincronizzati, COP stimato, energia al giorno, cicli.'],
+    ['n', 'Telegram', 'Avvisi sulle anomalie e riepilogo del mattino.'],
+    ['n', 'Impostazioni e accesso', 'Config dal pannello, password, tunnel Cloudflare, README, compattazione dello storico.'],
+  ]},
 ];
+
 function disegnaChangelog() {
-  const voce = c => `<article class="card cl"><div class="ch"><h2>${esc(c.v)}${c.titolo ? ` <span class="cl-t">· ${esc(c.titolo)}</span>` : ''}</h2>${c.quando ? `<span class="et">${esc(c.quando)}</span>` : ''}</div><ul>${c.righe.map(r => `<li>${esc(r)}</li>`).join('')}</ul></article>`;
-  const nuove = CHANGELOG.filter(c => !c.antico), vecchie = CHANGELOG.filter(c => c.antico);
-  return `<div class="changelog">${nuove.map(voce).join('')}<details class="cl-vecchie"><summary>Le prime versioni (fino alla 0.8)</summary>${vecchie.map(voce).join('')}</details></div>`;
+  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
+  const voce = (c, attuale) => `<section class="cl-v${attuale ? ' att' : ''}"><div class="cl-h"><span class="cl-n">${esc(c.v)}</span>` +
+    `${attuale ? '<span class="pill en">Attuale</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.quando ? `<span class="cl-d">${esc(c.quando)}</span>` : ''}</div>` +
+    `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+  const recenti = CHANGELOG.filter((c, k) => k < 3), prima = CHANGELOG.filter((c, k) => k >= 3 && !c.antico), antiche = CHANGELOG.filter(c => c.antico);
+  const breve = `<div class="cl-breve"><div class="eti">In breve</div>${CL_BREVE.map(b => `<div class="cl-bi">${CL_IC[b[0]] ? `<span class="cl-ic">${CL_IC[b[0]]}</span>` : iconaMeteo(b[0], 22)}<span><b>${esc(b[1])}</b> ${esc(b[2])}</span></div>`).join('')}</div>`;
+  return `<div class="changelog">${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
+    `<details class="cl-vecchie"><summary>Versioni precedenti</summary>${prima.map(c => voce(c)).join('')}` +
+    `<div class="eti">Le prime versioni</div>${antiche.map(c => voce(c)).join('')}</details></div></div>`;
 }
 
 // ---------- Efficienza ----------
@@ -2410,14 +2954,17 @@ function rigaConf(d, ora_, prima, fmt, meglio, minimo) {
   const buono = p == null || Math.abs(p) <= 0.5 || !meglio ? '' : ((p > 0) === (meglio === 'su') ? 'buono' : 'cattivo');
   return `<div class="conf-r"><span>Prima <b>${fmt(prima)}</b></span><span class="conf-d ${buono}">${p == null ? '—' : segno + ' ' + num(Math.abs(p), 0) + '%'}</span></div>`;
 }
+const notaTip = d => tipici(d) ? '' : ' Il consumo «tipico» nei grafici comparirà quando ci saranno almeno 3 giorni con lo stesso freddo.';
+// avviso di Confronta: sta in cima alla pagina, sotto «Aggiornato», cosi' si vede appena premi il tasto
+function avvisoConf(d) {
+  if (!S.confronto || !d.prec || d.prec.completo) return '';
+  return `<div class="avviso warn"><span><i class="in"></i></span><div>Il pannello non ha ancora dati per tutto il periodo di confronto (${esc(dataLunga(d.prec.da))} – ${esc(dataLunga(d.prec.a))}): il confronto comparirà quando ci saranno.${notaTip(d)}</div></div>`;
+}
 function notaConf(d) {
-  if (!S.confronto) return '';
-  if (!d.prec) return '';
-  const da = dataLunga(d.prec.da), a = dataLunga(d.prec.a);
-  if (!d.prec.completo)
-    return `<div class="avviso warn"><span>ℹ️</span><div>Il pannello non ha ancora dati per tutto il periodo di confronto (${esc(da)} – ${esc(a)}): il confronto comparirà quando ci saranno.</div></div>`;
+  if (!S.confronto || !d.prec || !d.prec.completo) return '';
+  const da = dataLunga(d.prec.da), a = dataLunga(d.prec.a), tip = notaTip(d);
   const dm = d.prec.nodati_min;
-  return `<p class="nota-fondo conf-nota">Confronto con il periodo di pari durata subito prima: dal ${esc(da)} al ${esc(a)}.${dm > 120 ? ` In quel periodo mancano circa ${durata(dm)} di dati: il confronto è meno preciso.` : ''}</p>`;
+  return `<p class="nota f conf-nota">Confronto con il periodo di pari durata subito prima: dal ${esc(da)} al ${esc(a)}.${dm > 120 ? ` In quel periodo mancano circa ${durata(dm)} di dati: il confronto è meno preciso.` : ''}${tip}</p>`;
 }
 function cardBollitore(d) {
   const b = d.bollitore, pb = S.confronto && d.prec && d.prec.completo ? d.prec.bollitore : null;
@@ -2429,120 +2976,197 @@ function cardBollitore(d) {
     + (sa ? t('Tempo per salire di 10 °C', durata(sa.min_per_10), `${num(sa.gradi_ora, 1)} °C/h · ${sa.cicli} cicli`,
       conf(ps ? ps.min_per_10 : null, v => durata(v))) : t('Tempo per salire di 10 °C', '—', 'servono almeno 2 cicli completi'))
     + (sa ? t('Ciclo tipico', '+' + num(sa.gradi, 1) + ' °C', `in ${durata(sa.minuti)}`, conf(ps ? ps.gradi : null, v => '+' + num(v, 1) + ' °C')) : '');
-  return `<article class="card"><h2>Salute del bollitore</h2><div class="tiles">${tiles}</div>
-    <p class="nota-fondo" style="margin:10px 0 0">Stime dalla sonda dell'acqua calda. La <b>perdita</b> è di quanto scende la temperatura nel tratto notturno più lungo (23–06) senza che la pompa scaldi l'acqua; i watt sono calcolati su ${b ? b.litri : 300} litri (modificabili in <code>config.json</code>, sezione <code>bollitore</code>). Se cresce nel tempo può indicare un problema di isolamento o di ricircolo. Il <b>tempo per salire di 10 °C</b> dice quanto è rapido il riscaldo: se si allunga nel tempo, la pompa rende di meno (o l'acqua da scaldare è di più). Sono indicazioni, non diagnosi.</p></article>`;
+  return `<article class="card"><h2>Salute del bollitore</h2><div class="tiles tc c-acs">${tiles}</div>
+    <ul class="nota-cv"><li><i class="in"></i><span>Stime dalla sonda dell'acqua calda (${b ? b.litri : 300} litri). Sono indicazioni, non diagnosi. <button type="button" class="come-b" data-come="boll" aria-expanded="false">Come leggerli</button></span></li></ul>
+    <p class="come-t" id="come-boll" hidden>La <b>perdita</b> dice quanto si raffredda l'acqua del bollitore di notte, quando non la usa nessuno e la pompa non la scalda (si guarda il tratto più lungo tra le 23 e le 6). Se col tempo aumenta, può esserci un problema di isolamento o di ricircolo. Il <b>tempo per salire di 10 °C</b> dice quanto ci mette la pompa a scaldare l'acqua di 10 gradi: se si allunga, la pompa rende meno oppure c'è più acqua da scaldare.</p></article>`;
 }
+// Costo del mese in corso (non dipende dal periodo scelto): stima a fine mese e confronto col mese scorso
+function meseCosto(m) {
+  if (!m) return '';
+  const MES = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
+  return `<article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Costo di ${MES[m.mese - 1]}</span></div>
+      <div class="val"><div class="n"><span>${euro(m.euro)}</span></div></div>
+      <div class="sub">${m.stima_euro != null ? `<span>Stima a fine mese <b>${euro(m.stima_euro)}</b></span>` : ''}${m.scorso_euro != null ? `<span>${MES[m.mese_scorso - 1]} <b>${euro(m.scorso_euro)}</b></span>` : ''}</div>
+      <div class="nota">Stima: media dei giorni passati, indicativa.</div></article>`;
+}
+const ICONA_SCARICA = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg>';
 function disegnaEfficienza(d) {
+  EF.d = d;
   const t = d.tot, nodati = d.giorni.reduce((a, g) => a + g.nodati_min, 0);
   const cop = v => v == null ? '—' : num(v, 2);
   const pt = d.prec ? d.prec.tot : {};
   const cov = d.copertura, bassa = [cov.casa, cov.acs].some(v => v != null && v < 80);
+  const avvDati = bassa || nodati > 120 ? `<div class="avviso warn"><span>⚠️</span><div>Dati incompleti${bassa ? `: per il calcolo del COP ho potenza e portata solo per il ${Math.min(cov.casa ?? 100, cov.acs ?? 100)}% del tempo di funzionamento` : ''}${nodati > 120 ? ` (mancano circa ${durata(nodati)} di dati nel periodo)` : ''}. I valori sono più bassi o meno precisi del reale.</div></div>` : '';
   const html_ = `
-  <div class="cards">
+  ${avvisoConf(d)}${avvDati}
+  <div class="cards c5">
     <article class="card acc" style="--acc:var(--est)"><div class="ch"><span class="et">COP medio</span></div>
       <div class="val"><div class="n"><span>${cop(t.cop)}</span></div></div>
-      <div class="sub"><span>Casa <b>${cop(t.cop_casa)}</b></span><span>Acqua calda <b>${cop(t.cop_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
+      <div class="sub"><span>Risc. <b>${cop(t.cop_casa)}</b></span><span>Acqua <b>${cop(t.cop_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
     <article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Energia elettrica</span></div>
       <div class="val"><div class="n"><span>${fm(t.el_casa + t.el_acs + t.el_riposo)}</span><i>kWh</i></div></div>
-      <div class="sub"><span>Casa <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span>Costo stimato <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
+      <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span>Costo stimato <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
+    ${meseCosto(d.mese)}
     <article class="card acc" style="--acc:var(--casa)"><div class="ch"><span class="et">Calore prodotto (stima)</span></div>
       <div class="val"><div class="n"><span>${fm(t.calore_casa + t.calore_acs)}</span><i>kWh</i></div></div>
-      <div class="sub"><span>Casa <b>${fm(t.calore_casa)}</b></span><span>Acqua <b>${fm(t.calore_acs)}</b></span></div>${rigaConf(d, t.calore_casa + t.calore_acs, pt.calore_casa + pt.calore_acs, v => fm(v) + ' kWh', '', 1)}</article>
+      <div class="sub"><span>Risc. <b>${fm(t.calore_casa)}</b></span><span>Acqua <b>${fm(t.calore_acs)}</b></span></div>${rigaConf(d, t.calore_casa + t.calore_acs, pt.calore_casa + pt.calore_acs, v => fm(v) + ' kWh', '', 1)}</article>
     <article class="card acc" style="--acc:var(--acs)"><div class="ch"><span class="et">Ore di funzionamento</span></div>
       <div class="val"><div class="n"><span>${fm(t.ore_casa + t.ore_acs)}</span><i>h</i></div></div>
-      <div class="sub"><span>Casa <b>${fm(t.ore_casa)}</b></span><span>Acqua <b>${fm(t.ore_acs)}</b></span></div>${rigaConf(d, t.ore_casa + t.ore_acs, pt.ore_casa + pt.ore_acs, v => fm(v) + ' h', '', 0.5)}</article>
+      <div class="sub"><span>Risc. <b>${fm(t.ore_casa)}</b></span><span>Acqua <b>${fm(t.ore_acs)}</b></span></div>${rigaConf(d, t.ore_casa + t.ore_acs, pt.ore_casa + pt.ore_acs, v => fm(v) + ' h', '', 0.5)}</article>
   </div>
   ${notaConf(d)}
-  ${bassa || nodati > 120 ? `<div class="avviso warn"><span>⚠️</span><div>Dati incompleti${bassa ? `: per il calcolo del COP ho potenza e portata solo per il ${Math.min(cov.casa ?? 100, cov.acs ?? 100)}% del tempo di funzionamento` : ''}${nodati > 120 ? ` (mancano circa ${durata(nodati)} di dati nel periodo)` : ''}. I valori sono più bassi o meno precisi del reale.</div></div>` : ''}
+  <ul class="nota-cv alto"><li><i class="in"></i><span>Il calore è una stima, non una misura. <button type="button" class="come-b" data-come="calc" aria-expanded="false">Come si calcola</button></span></li></ul>
+  <p class="come-t alto" id="come-calc" hidden>Il calore si stima così: portata dell'acqua × differenza di temperatura tra mandata e ritorno × 0,0698 (il risultato è in kW, con la portata in L/min e la temperatura in °C). Il COP è il calore prodotto diviso l'energia elettrica assorbita, e si calcola solo quando la pompa lavora (riscaldamento e acqua calda): lo standby non conta. Il totale dell'energia elettrica, invece, comprende anche lo standby.${d.energia_contatore != null ? ` Contatore della PdC nel periodo: ${fm(d.energia_contatore, 1)} kWh.` : ''}</p>
   <div class="grid2 uguali">
-    <article class="card"><div class="ch"><h2>Energia elettrica al giorno</h2><div class="legg"><span><i style="background:var(--casa)"></i>Casa</span><span><i style="background:var(--acs)"></i>Acqua</span><span><i style="background:#3a4558"></i>Standby</span></div></div><div id="g-en"></div></article>
-    <article class="card"><div class="ch"><h2>COP al giorno</h2><div class="legg"><span><i style="background:var(--casa)"></i>Casa</span><span><i style="background:var(--acs)"></i>Acqua</span></div></div><div id="g-cop"></div></article>
+    <article class="card"><div class="ch"><h2>Energia elettrica al giorno</h2><div class="legg" id="lg-en">${legEf('en', null)}</div></div><div id="g-en"></div></article>
+    <article class="card"><div class="ch"><h2>COP al giorno</h2><div class="legg" id="lg-cop">${legEf('cop', null)}</div></div><div id="g-cop"></div></article>
   </div>
   <div class="grid2 uguali">
-    <article class="card"><div class="ch"><h2>COP in base alla temperatura esterna</h2></div><div id="g-bin"></div>
-      <p class="nota-fondo" style="margin:6px 0 0">Ogni punto è una fascia di 2 °C e compare solo se la pdc ha lavorato lì almeno mezz'ora.</p></article>
-    <article class="card"><h2>Cicli di funzionamento</h2><div class="tiles" id="cicli">${cicliHtml(d)}</div>
-      <p class="nota-fondo" style="margin:10px 0 0">Un ciclo è un tratto continuo di lavoro. Molti cicli sotto i 10 minuti sono un segnale da tenere d'occhio: l'impianto parte e si ferma troppo spesso.</p></article>
+    <article class="card"><div class="ch"><h2>COP in base alla temperatura esterna</h2><div class="legg" id="lg-bin">${legEf('bin', null)}</div></div><div id="g-bin"></div>
+      <ul class="nota-cv"><li><i class="in"></i>Un punto = fascia di 2 °C, se la PdC ha lavorato almeno mezz'ora.</li></ul></article>
+    <article class="card"><h2>Cicli di funzionamento</h2><div id="cicli">${cicliHtml(d)}</div>
+      <ul class="nota-cv"><li><i class="in"></i>Un ciclo è un tratto continuo di lavoro.</li><li><i class="av"></i>Tanti cicli brevi: la PdC parte e si ferma troppo spesso.</li></ul></article>
   </div>
   ${cardBollitore(d)}
-  <p class="nota-fondo">Il calore è una stima: portata × salto di temperatura tra mandata e ritorno × 0,0698 kW per (L/min·°C). Il COP è calore / energia elettrica nei soli momenti di lavoro (casa + acqua calda); lo standby è escluso dal COP. Il totale elettrico include tutto.${d.energia_contatore != null ? ` Contatore della pdc nel periodo: ${fm(d.energia_contatore, 1)} kWh.` : ''}</p>
-  <p class="nota-fondo esporta">Esporta per Excel: <a href="/api/esporta.csv?tipo=giorni&giorni=${d.n_giorni}" download>riepilogo per giorno (${d.n_giorni} giorni)</a> · <a href="/api/esporta.csv?tipo=misure&giorni=7" download>dati grezzi degli ultimi 7 giorni</a></p>`;
+  <article class="card"><h2>Esporta per Excel</h2><div class="exp">
+    <a href="/api/esporta.csv?tipo=giorni&giorni=${d.n_giorni}" download>${ICONA_SCARICA}<span><b>Riepilogo per giorno</b><small>${d.n_giorni} giorni, una riga al giorno</small></span></a>
+    <a href="/api/esporta.csv?tipo=misure&giorni=7" download>${ICONA_SCARICA}<span><b>Dati grezzi</b><small>ultimi 7 giorni, ogni misura</small></span></a>
+  </div></article>`;
   const box = $('#eff'); const f = JSON.stringify([d.ora, d.n_giorni, box.clientWidth]);
   if (box.dataset.f === f) return;
-  box.dataset.f = f; box.innerHTML = html_;
-  const w = box.querySelector('#g-en').clientWidth || 320;
-  $('#g-en').innerHTML = barreGiorni(d.giorni, w);
-  $('#g-cop').innerHTML = lineeGiorni(d.giorni, w);
-  $('#g-bin').innerHTML = curvaCop(d.bins, w);
+  box.dataset.f = f; const y0 = window.scrollY; box.innerHTML = html_;
+  (S.comeAperti || []).forEach(id => apriCome(box, id, true));
+  const w0 = box.querySelector('#g-en').clientWidth || 320, tel = w0 < 480, w = tel ? w0 + 15 : w0;   // telefono: i grafici escono dal padding, come in Analisi
+  if (tel) ['g-en', 'g-cop', 'g-bin'].forEach(id => { $('#' + id).style.margin = '0 -6px 0 -9px'; });
+  $('#g-en').innerHTML = barreGiorni(d.giorni, w, tipici(d), tel);
+  $('#g-cop').innerHTML = lineeGiorni(d.giorni, w, tipici(d), tel);
+  $('#g-bin').innerHTML = curvaCop(d.bins, w, tel);
+  if (window.scrollY !== y0) window.scrollTo(0, y0);
 }
+// «Come leggerli» / «Come si calcola»: testo a scomparsa che si ricorda se era aperto
+function apriCome(radice, id, apri) {
+  const t = radice.querySelector('#come-' + id), b = radice.querySelector('[data-come="' + id + '"]');
+  if (!t || !b) return;
+  t.hidden = !apri; b.classList.toggle('on', apri); b.setAttribute('aria-expanded', apri ? 'true' : 'false');
+  if (!S.comeAperti) S.comeAperti = new Set();
+  apri ? S.comeAperti.add(id) : S.comeAperti.delete(id);
+}
+document.addEventListener('click', ev => {
+  const b = ev.target.closest && ev.target.closest('[data-come]'); if (!b) return;
+  apriCome(document, b.dataset.come, b.getAttribute('aria-expanded') !== 'true');
+});
 
 function cicliHtml(d) {
   const c = d.cicli, t = (k, v) => `<div class="tile"><small>${k}</small><b>${v}</b></div>`;
-  return t('Cicli casa', c.casa.n) + t('Durata media casa', c.casa.media_min == null ? '—' : durata(Math.round(c.casa.media_min))) +
-    t('Cicli brevi (<10 min)', c.casa.brevi) + t('Cicli acqua calda', c.acs.n) +
-    t('Durata media acqua', c.acs.media_min == null ? '—' : durata(Math.round(c.acs.media_min))) + t('Sbrinamenti', d.sbrinamenti) +
-    (d.prezzo_kwh > 0 && c.acs.n > 0 ? t('Costo medio di un ciclo acqua calda', euro(d.tot.el_acs * d.prezzo_kwh / c.acs.n)) : '');
+  const dm = x => x == null ? '—' : durata(Math.round(x));
+  const gr = (cl, tit, righe) => `<div class="cg ${cl}"><h3 class="eti"><i></i>${tit}</h3><div class="tiles">${righe}</div></div>`;
+  return gr('c-casa', 'Riscaldamento', t('Cicli', c.casa.n) + t('Durata media', dm(c.casa.media_min))) +
+    gr('c-acs', 'Acqua calda', t('Cicli', c.acs.n) + t('Durata media', dm(c.acs.media_min)) +
+      (d.prezzo_kwh > 0 && c.acs.n > 0 ? t('Costo medio di un ciclo', euro(d.tot.el_acs * d.prezzo_kwh / c.acs.n)) : '')) +
+    gr('c-en', 'Da tenere d’occhio', t('Cicli brevi (<10 min)', c.casa.brevi) + sbrinamentiTile(d.sbr)) + sbrinamentiElenco(d.sbr);
+}
+// Riquadro «Sbrinamenti» (numero · kWh): se ce ne sono, al tocco apre l'elenco a scomparsa (stesso meccanismo di «Come si calcola»)
+function sbrinamentiTile(s) {
+  if (!s || !s.n) return `<div class="tile"><small>Sbrinamenti</small><b>${s ? 0 : '—'}</b></div>`;
+  return `<div class="tile" data-come="sbr" role="button" tabindex="0" aria-expanded="false"><small>Sbrinamenti</small><b>${s.n}</b>${s.kwh != null ? `<i>· <b>${num(s.kwh, 1)}</b> kWh</i>` : ''}</div>`;
+}
+function sbrinamentiElenco(s) {
+  if (!s || !s.n) return '';
+  const gr = v => num(Math.round(v) + 0, 0) + ' °C', quando = t => { const d = new Date(t * 1000); return d.toLocaleDateString('it-IT', {day: 'numeric', month: 'short'}) + ' · ' + d.toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'}); };
+  const riga = x => `<div class="sr"><span>${quando(x.ts)}</span><span>${x.incorso ? 'in corso' : x.min + ' min'}</span><span>${x.kwh != null ? '~' + num(x.kwh, 2) : '—'}</span><span>${x.esterna != null ? gr(x.esterna) : '—'}</span></div>`;
+  const v = [s.media_min != null ? num(s.media_min, 0) + ' min' : '', s.kwh != null && s.n ? '~' + num(s.kwh / s.n, 2) + ' kWh' : '', s.esterna != null ? gr(s.esterna) : ''].filter(Boolean).map(t => `<span class="pill">${t}</span>`);
+  const testa = `<div class="tiles"><div class="tile"><span class="mut">Media</span> ${v.join(' ')}</div></div>`;
+  return `<div class="come-t sbr" id="come-sbr" hidden>${testa}<div>${s.elenco.map(riga).join('')}</div></div>`;
 }
 
-function barreGiorni(giorni, W) {
-  const H = 210, L = 34, R = 6, T = 14, B = 24, pw = W - L - R, ph = H - T - B, n = giorni.length;
-  const tot = g => g.el_casa + g.el_acs + g.el_riposo, mx = Math.max(1, ...giorni.map(tot));
+// Giorni "tipici" (solo con Confronta): per ogni giorno, consumo e COP normali per il suo freddo. Vuoto se non ce ne sono abbastanza.
+const tipici = d => S.confronto && d.tipici && Object.keys(d.tipici).length ? d.tipici : null;
+function barreGiorni(giorni, W, tip, tel) {
+  const H = 210, R = tel ? 7 : 6, T = 14, B = 24, ph = H - T - B, n = giorni.length;
+  let L = 34, pw = W - L - R;
+  const tot = g => g.el_casa + g.el_acs + g.el_riposo, mx = Math.max(1, ...giorni.map(tot), ...(tip ? Object.values(tip).map(t => t.el) : []));
   const sc = scalaNice(0, mx, 4); sc.lo = 0;
+  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
   const Y = v => T + ph - v / sc.hi * ph, bw = Math.min(46, pw / n * 0.7), cx = i => L + pw / n * (i + 0.5);
-  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`;
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="en">`;
+  EF.en = {xs: giorni.map((_, i) => cx(i)), lab: giorni.map(giornoBreve), L, pw, T,
+    // etichetta = valore del segmento (rosso, blu, standby) sotto il dito; sopra la barra niente (il totale e' gia' scritto sulla barra)
+    seg: (i, yy) => { const g = giorni[i]; let y0 = Y(0);
+      for (const [k, nome] of [['el_riposo', 'Standby'], ['el_acs', 'Acqua'], ['el_casa', 'Risc.']]) { const h = g[k] / sc.hi * ph; if (yy >= y0 - h || k === 'el_riposo' && yy >= y0) return `${nome} ${num(g[k], 1)} kWh`; y0 -= h; }
+      return null; }};
+  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
   giorni.forEach((g, i) => {
     let y = Y(0);
     [['el_riposo', '#3a4558'], ['el_acs', COLS.acs], ['el_casa', COLS.casa]].forEach(([k, c]) => {
       const h = g[k] / sc.hi * ph; if (h <= 0) return; y -= h;
       s += `<rect x="${(cx(i) - bw / 2).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.5, h).toFixed(1)}" fill="${c}" rx="2"><title>${giornoBreve(g)}: ${k.replace('el_', '')} ${num(g[k], 1)} kWh</title></rect>`;
     });
-    if (n <= 10) s += `<text x="${cx(i).toFixed(1)}" y="${(y - 4).toFixed(1)}" text-anchor="middle" class="vt">${num(tot(g), 1)}</text>`;
+    const t = tip && tip[g.giorno];
+    if (t && Y(t.el) < y && y - Y(t.el) < 15) y = Y(t.el);
+    if (t) {
+      const yt = Y(t.el).toFixed(1), tt = `${giornoBreve(g)}: ${num(tot(g), 1)} kWh · tipico per ${num(t.esterna, 0)}°C esterni: ${num(t.el, 1)} kWh (da ${t.n} giorni simili)`;
+      s += `<line x1="${(cx(i) - bw / 2 - 3).toFixed(1)}" x2="${(cx(i) + bw / 2 + 3).toFixed(1)}" y1="${yt}" y2="${yt}" class="tip-l"><title>${tt}</title></line>`;
+      if (t.sopra) s += `<circle cx="${cx(i).toFixed(1)}" cy="${(y - (n <= 10 ? 17 : 8)).toFixed(1)}" r="3.2" class="tip-a"><title>${tt} — sopra il normale</title></circle>`;
+    }
+    if (n <= 10) s += `<text x="${cx(i).toFixed(1)}" y="${(y - 4).toFixed(1)}" text-anchor="middle" class="vt" data-i="${i}">${num(tot(g), 1)}</text>`;
     if (n <= 10 || i % Math.ceil(n / 7) === 0) s += `<text x="${cx(i).toFixed(1)}" y="${H - 7}" text-anchor="middle">${giornoBreve(g)}</text>`;
   });
-  return s + '</svg>';
+  return s + curEf(T, ph) + '</svg>';
 }
 
-function lineeGiorni(giorni, W) {
-  const H = 210, L = 34, R = 22, T = 14, B = 24, pw = W - L - R, ph = H - T - B, n = giorni.length;
-  const vals = giorni.flatMap(g => [g.cop_casa, g.cop_acs]).filter(v => v != null);
+function lineeGiorni(giorni, W, tip, tel) {
+  const H = 210, R = tel ? 7 : 6, T = 14, B = 24, ph = H - T - B, n = giorni.length;
+  let L = 34, pw = W - L - R;
+  const vals = giorni.flatMap(g => [g.cop_casa, g.cop_acs, ...(tip && tip[g.giorno] ? [tip[g.giorno].cop_casa, tip[g.giorno].cop_acs] : [])]).filter(v => v != null);
   const sc = scalaNice(0, Math.max(5, ...(vals.length ? vals : [0])), 5); sc.lo = 0;
+  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
   const Y = v => T + ph - v / sc.hi * ph, X = i => n === 1 ? L + pw / 2 : L + pw * i / (n - 1);
-  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`;
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
-  giorni.forEach((g, i) => { if (n <= 10 || i % Math.ceil(n / 7) === 0) s += `<text x="${X(i).toFixed(1)}" y="${H - 7}" text-anchor="middle">${giornoBreve(g)}</text>`; });
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="cop">`;
+  EF.cop = {xs: giorni.map((_, i) => X(i)), lab: giorni.map(giornoBreve), L, pw, T, dots: i => ['cop_casa', 'cop_acs'].map(k => giorni[i][k] == null ? null : Y(giorni[i][k]))};
+  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  giorni.forEach((g, i) => { if (n <= 10 || i % Math.ceil(n / 7) === 0) s += `<text x="${X(i).toFixed(1)}" y="${H - 7}" text-anchor="${i === n - 1 && n > 1 ? 'end' : 'middle'}">${giornoBreve(g)}</text>`; });
   [['cop_casa', COLS.casa], ['cop_acs', COLS.acs]].forEach(([k, c]) => {
     let p = '', prec = false;
     giorni.forEach((g, i) => { if (g[k] == null) { prec = false; return; } p += (prec ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(g[k]).toFixed(1) + ' '; prec = true; });
+    if (tip) {   // COP tipico per il freddo di ciascun giorno: linea tratteggiata sottile
+      let q = '', pq = false;
+      giorni.forEach((g, i) => { const v = tip[g.giorno] && tip[g.giorno][k]; if (v == null) { pq = false; return; } q += (pq ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v).toFixed(1) + ' '; pq = true; });
+      if (q) s += `<path d="${q}" fill="none" stroke="${c}" stroke-width="1.4" stroke-dasharray="4 4" opacity=".6"/>`;
+    }
     s += `<path d="${p}" fill="none" stroke="${c}" stroke-width="2.2" stroke-linejoin="round"/>`;
-    giorni.forEach((g, i) => { if (g[k] != null) s += `<circle cx="${X(i).toFixed(1)}" cy="${Y(g[k]).toFixed(1)}" r="${n > 14 ? 2.5 : 3.5}" fill="${c}"><title>${giornoBreve(g)}: COP ${num(g[k], 2)}</title></circle>`; });
+    giorni.forEach((g, i) => { if (g[k] != null) { const tv = tip && tip[g.giorno] && tip[g.giorno][k];
+      s += `<circle cx="${X(i).toFixed(1)}" cy="${Y(g[k]).toFixed(1)}" r="${n > 14 ? 2.5 : 3.5}" fill="${c}"><title>${giornoBreve(g)}: COP ${num(g[k], 2)}${tv != null ? ` · tipico per ${num(tip[g.giorno].esterna, 0)}°C esterni: ${num(tv, 2)}` : ''}</title></circle>`; } });
   });
-  return s + '</svg>';
+  return s + curEf(T, ph, [COLS.casa, COLS.acs]) + '</svg>';
 }
 
-function curvaCop(bins, W) {
-  const H = 210, L = 34, R = 10, T = 14, B = 34, pw = W - L - R, ph = H - T - B;
+function curvaCop(bins, W, tel) {
+  const H = 210, R = tel ? 7 : 6, T = 14, B = 34, ph = H - T - B;
+  let L = 34, pw = W - L - R;
   const tutti = [...bins.casa, ...bins.acs];
   if (!tutti.length) return '<div class="vuoto">Servono più ore di funzionamento per questo grafico.</div>';
   const x0 = Math.min(...tutti.map(b => b.da)), x1 = Math.max(...tutti.map(b => b.a)), mx = Math.max(5, ...tutti.map(b => b.cop));
   const sc = scalaNice(0, mx, 5); sc.lo = 0;
+  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
   const X = t => L + (t - x0) / Math.max(1, x1 - x0) * pw, Y = v => T + ph - v / sc.hi * ph;
-  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`;
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
-  for (let t = Math.ceil(x0 / 2) * 2; t <= x1; t += (x1 - x0 > 20 ? 5 : 2)) s += `<text x="${X(t).toFixed(1)}" y="${H - 16}" text-anchor="middle">${t}°</text>`;
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="bin">`;
+  const das = [...new Set(tutti.map(b => b.da))].sort((a, b) => a - b);
+  EF.bin = {bins: das, xs: das.map(t => X(t + 1)), lab: das.map(t => `${t}…${t + 2} °C`), L, pw, T,
+    dots: i => ['casa', 'acs'].map(m => { const b = bins[m].find(x => x.da === das[i]); return b ? Y(b.cop) : null; })};
+  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  for (let t = Math.ceil(x0 / 2) * 2; t <= x1; t += (x1 - x0 > 20 ? 5 : 2)) s += `<text x="${X(t).toFixed(1)}" y="${H - 16}" text-anchor="${X(t) > W - 14 ? 'end' : 'middle'}">${t}°</text>`;
   s += `<text x="${(L + pw / 2).toFixed(1)}" y="${H - 2}" text-anchor="middle" class="ass">Temperatura esterna</text>`;
   [['casa', COLS.casa], ['acs', COLS.acs]].forEach(([k, c]) => {
     const b = bins[k]; if (!b.length) return;
     const P = b.map(x => [X((x.da + x.a) / 2), Y(x.cop)]);
     s += `<path d="${P.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ')}" fill="none" stroke="${c}" stroke-width="2.2" stroke-linejoin="round"/>`;
     b.forEach((x, i) => { s += `<circle cx="${P[i][0].toFixed(1)}" cy="${P[i][1].toFixed(1)}" r="4" fill="${c}"><title>${x.da}…${x.a} °C esterni: COP ${num(x.cop, 2)} (${num(x.ore, 1)} h)</title></circle>`;
-      if (k === 'casa' && b.length <= 12) s += `<text x="${P[i][0].toFixed(1)}" y="${(P[i][1] - 8).toFixed(1)}" text-anchor="middle" class="vt">${num(x.cop, 1)}</text>`; });
+      if (b.length <= 12) s += `<text x="${P[i][0].toFixed(1)}" y="${(P[i][1] + (k === 'casa' ? -8 : 15)).toFixed(1)}" text-anchor="middle" class="vt">${num(x.cop, 1)}</text>`; });   // rosso: valore sopra il punto, blu: sotto
   });
-  return s + '</svg>';
+  return s + curEf(T, ph, [COLS.casa, COLS.acs]) + '</svg>';
 }
 
 // ---------- Impostazioni ----------
-const quando = t => t ? dm(t) : '—';
 function fa(t) { if (!t) return 'mai'; const s = ora() - t; return s < 90 ? 'adesso' : s < 5400 ? Math.round(s / 60) + ' min fa' : s < 172800 ? Math.round(s / 3600) + ' ore fa' : Math.round(s / 86400) + ' giorni fa'; }
 // "da quanto" (senza "fa"): acceso da 2 minuti, da 3 ore, da 4 giorni
 function daQuanto(t) {
@@ -2607,7 +3231,7 @@ function schedaDisp(s, d) {
       <div class="dev-id">${marca}<div><h2>${esc(s.titolo)}</h2><small class="mut">${conLogo(d, s.sotto)}</small></div></div>
       <div class="dev-st"><span class="pill ${esc(s.stato.cls)}">${esc(s.stato.testo.toUpperCase())}</span><small class="mut">ultimo dato ${s.ultimo_dato ? fa(s.ultimo_dato) : 'mai'}</small></div>
     </div>
-    ${s.gruppi.map(g => `<section class="dev-gr"><h3>${esc(g.titolo)}</h3>${g.righe.map(r => rigaDisp(r, d)).join('')}</section>`).join('')}
+    ${s.gruppi.map(g => `<section class="dev-gr"><h3 class="eti">${esc(g.titolo)}</h3>${g.righe.map(r => rigaDisp(r, d)).join('')}</section>`).join('')}
   </article>`;
 }
 const TAB_DISP = [['', 'Dispositivi'], ['installatore', 'Installatore']];
@@ -2685,33 +3309,63 @@ function campoHtml(c) {
   let ctl;
   if (c.tipo === 'bool') ctl = `<label class="sw"><input type="checkbox" id="${id}" data-k="${c.chiave}" ${c.valore ? 'checked' : ''}><span></span></label>`;
   else if (c.tipo === 'scelta') ctl = `<select id="${id}" data-k="${c.chiave}">${c.opzioni.map(([v, t]) => `<option value="${esc(v)}" ${v === c.valore ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
-  else if (c.tipo === 'segreto') ctl = `<input type="password" id="${id}" data-k="${c.chiave}" autocomplete="new-password" placeholder="${c.impostato ? '•••••• (impostato: scrivi per cambiare)' : 'non impostato'}">`;
+  else if (c.tipo === 'segreto') ctl = `<input type="password" id="${id}" data-k="${c.chiave}" autocomplete="new-password" placeholder="${c.impostato ? '•••••• impostato' : 'non impostato'}">`;
   else if (c.tipo === 'lungo') ctl = `<textarea id="${id}" data-k="${c.chiave}" rows="${Math.min(7, Math.max(2, String(c.valore).split('\n').length + 1))}" spellcheck="false">${esc(c.valore)}</textarea>`;
   else if (c.tipo === 'int' || c.tipo === 'float') ctl = `<input type="text" inputmode="decimal" id="${id}" data-k="${c.chiave}" value="${esc(String(c.valore).replace('.', ','))}">`;
-  else ctl = `<input type="${c.tipo === 'ora' ? 'time' : 'text'}" id="${id}" data-k="${c.chiave}" value="${esc(c.valore)}" autocapitalize="none" autocorrect="off" spellcheck="false">`;
-  return `<div class="campo ${c.tipo === 'bool' ? 'riga-sw' : ''}"><label for="${id}">${esc(c.et)}</label>${ctl}${h}<small class="err" data-e="${c.chiave}"></small></div>`;
+  else ctl = `<input type="${c.tipo === 'ora' ? 'time' : 'text'}" id="${id}" data-k="${c.chiave}" value="${esc(c.valore)}" class="${/_id$/.test(c.chiave) ? 'mono' : ''}" autocapitalize="none" autocorrect="off" spellcheck="false">`;
+  const corto = ['bool', 'scelta', 'int', 'float', 'ora'].includes(c.tipo);
+  return `<div class="campo ${corto ? 'in' : 'lg'}"><label for="${id}">${esc(c.et)}</label>${ctl}${h}<small class="err" data-e="${c.chiave}"></small></div>`;
 }
 
 // Riquadri collassabili: lo stato aperto/chiuso si ricorda per ogni riquadro (per il primo di ogni tab, aperto di partenza)
-function impAperti() { try { return JSON.parse(localStorage.getItem('pdc_imp_aperti') || '{}') || {}; } catch (e) { return {}; } }
-function impRicorda(id, aperto) { try { const m = impAperti(); m[id] = aperto; localStorage.setItem('pdc_imp_aperti', JSON.stringify(m)); } catch (e) { /* niente */ } }
+function impAperti() { try { return JSON.parse(localStorage.getItem('pdc_imp_aperti2') || '{}') || {}; } catch (e) { return {}; } }
+function impRicorda(id, aperto) { try { const m = impAperti(); m[id] = aperto; localStorage.setItem('pdc_imp_aperti2', JSON.stringify(m)); } catch (e) { /* niente */ } }
 function riquadro(id, titolo, corpo, primo, extra = '') {
-  const m = impAperti(), ap = id in m ? m[id] : !!primo;
+  const m = impAperti(), ap = id in m ? m[id] : false;   // chiusi di partenza; poi si ricorda cosa apri
   return `<details class="card imp riq" data-id="${id}" ${ap ? 'open' : ''}><summary><h2>${esc(titolo)}</h2>${extra}</summary><div class="riq-c">${corpo}</div></details>`;
 }
-document.addEventListener('toggle', e => { const t = e.target; if (t.classList && t.classList.contains('riq') && t.dataset.id) impRicorda(t.dataset.id, t.open); }, true);
+document.addEventListener('toggle', e => { const t = e.target; if (t.classList && t.classList.contains('riq') && t.dataset.id) { const m = impAperti(); if (t.open !== (t.dataset.id in m ? m[t.dataset.id] : false)) impRicorda(t.dataset.id, t.open); } }, true);
 // mostra un campo (per esempio con un errore): apre i riquadri che lo contengono e passa al tab giusto
 function mostraCampo(el) {
   let n = el; while ((n = n.closest && n.closest('details'))) { n.open = true; n = n.parentElement; }
   const g = el.closest('.imp-tab'); if (g && g.hidden) location.hash = '#/impostazioni' + (g.dataset.t === 'stato' ? '' : '/' + g.dataset.t);
 }
+// Mette i riquadri di ogni scheda in due colonne indipendenti, a turno da sinistra e nell'ordine di partenza: aprire o chiudere un riquadro
+// normale non sposta mai gli altri. I riquadri "larghi" (testi, avvisi, Cloudflare) stanno in colonna da chiusi; da aperti passano a tutta riga.
+// Su telefono è una colonna sola, nell'ordine di prima.
+function riquadroLargo(f) { return !!(f.querySelector('textarea') || f.dataset.id === 'allarmi' || f.id === 'cf-d'); }
+function disponiColonne() {
+  document.querySelectorAll('#imp .imp-tab:not([data-t=stato])').forEach(tab => {
+    tab.querySelectorAll(':scope > details.riq, :scope .imp-col > details.riq').forEach((f, n) => { if (f.dataset.ix === undefined) f.dataset.ix = n; });
+    const tutti = [...tab.querySelectorAll('details.riq')].sort((a, b) => a.dataset.ix - b.dataset.ix);
+    const altri = [...tab.children].filter(c => !c.matches('details.riq') && !c.classList.contains('imp-cols'));
+    tab.querySelectorAll(':scope > .imp-cols').forEach(c => c.remove());
+    let gruppo = [], ord = 0;
+    const fine = () => {
+      if (!gruppo.length) return;
+      const box = document.createElement('div'); box.className = 'imp-cols';
+      const cols = [document.createElement('div'), document.createElement('div')];
+      cols.forEach(c => { c.className = 'imp-col'; box.appendChild(c); });
+      gruppo.forEach((g, i) => { g.style.order = ord++; cols[i % 2].appendChild(g); });
+      tab.appendChild(box); gruppo = [];
+    };
+    tutti.forEach(f => {
+      f.classList.remove('largo');
+      if (riquadroLargo(f) && f.open) { fine(); f.classList.add('largo'); f.style.order = ''; tab.appendChild(f); }
+      else gruppo.push(f);
+    });
+    fine();
+    altri.forEach(a => tab.appendChild(a));
+  });
+}
+document.addEventListener('toggle', e => { const t = e.target; if (t.classList && t.classList.contains('riq') && riquadroLargo(t) && t.closest('#imp')) disponiColonne(); }, true);
 function disegnaImpostazioni(d) {
   const box = $('#imp'); if (!box) return;
   const stato_ = $('#imp-stato'); if (stato_) stato_.innerHTML = statoImpostazioni(d.stato);
   if (box.dataset.pronto && S.sporco) return;            // non cancellare quello che stai scrivendo
   if (box.dataset.pronto === '1' && !S.ricarica) return;
   S.ricarica = false; box.dataset.pronto = '1';
-  const sez = t => d.sezioni.filter(s => s.tab === t).map((s, i) => riquadro('s-' + s.id, s.titolo, `
+  const sez = t => d.sezioni.filter(s => s.tab === t).sort((a, b) => (a.id === 'testi') - (b.id === 'testi')).map((s, i) => riquadro('s-' + s.id, s.titolo, `
       ${s.nota ? `<p class="nota-sez">${esc(s.nota)}</p>` : ''}
       <div class="campi">${s.campi.map(campoHtml).join('')}</div>
       ${s.prova ? '<div class="azioni"><button type="button" class="sec" id="b-prova">Invia messaggio di prova</button><small class="mut">Usa i valori già salvati: salva prima.</small></div>' : ''}`, i === 0)).join('');
@@ -2719,9 +3373,9 @@ function disegnaImpostazioni(d) {
     <details class="allarme"><summary><span class="t">${esc(a.titolo)}</span><span class="d">${esc(a.descrizione)}</span></summary>
       <div class="campi">${a.campi.map(campoHtml).join('')}</div></details>`).join('');
   const pw = `<div class="campi">
-      <div class="campo"><label for="p-ut">Utente</label><input id="p-ut" type="text" autocomplete="username" value="${esc(d.utente || '')}" autocapitalize="none"></div>
-      <div class="campo"><label for="p-at">Password attuale</label><input id="p-at" type="password" autocomplete="current-password"></div>
-      <div class="campo"><label for="p-nu">Nuova password (almeno 10 caratteri)</label><input id="p-nu" type="password" autocomplete="new-password"></div></div>
+      <div class="campo lg"><label for="p-ut">Utente</label><input id="p-ut" type="text" autocomplete="username" value="${esc(d.utente || '')}" autocapitalize="none"></div>
+      <div class="campo lg"><label for="p-at">Password attuale</label><input id="p-at" type="password" autocomplete="current-password"></div>
+      <div class="campo lg"><label for="p-nu">Nuova password (almeno 10 caratteri)</label><input id="p-nu" type="password" autocomplete="new-password"></div></div>
       <div class="azioni"><button type="button" class="sec" id="b-pw">Cambia password</button><small class="msg" id="pw-msg"></small></div>`;
   const m = impAperti(), cfAp = 'cf' in m ? m.cf : false;
   box.innerHTML = `
@@ -2735,9 +3389,16 @@ function disegnaImpostazioni(d) {
     <div class="imp-tab" data-t="accesso" hidden>
       ${riquadro('password', 'Password del pannello', pw, true)}
       <details class="card imp riq" data-id="cf" id="cf-d" ${cfAp ? 'open' : ''}><summary><h2>Accesso da internet (Cloudflare)</h2></summary><div class="riq-c" id="cf"><div class="vuoto" style="padding:14px 0">Controllo l'accesso da internet…</div></div></details></div>
-    <div class="imp-tab" data-t="dati" hidden>${sez('dati')}</div>
+    <div class="imp-tab" data-t="dati" hidden>${sez('dati')}
+      ${riquadro('reset', 'Azzera il database', `<p class="nota-sez">Cancella <b>tutti i dati raccolti</b> (storico, grafici, anomalie) e riparte da zero. Restano le impostazioni, la password e i collegamenti.<br>Prima di cancellare il pannello fa una <b>copia di sicurezza</b> nella cartella dei backup (<code>prima-del-reset-…db</code>); se la copia non riesce, non cancella niente. Si rimette con <code>python pdc_pannello.py ripristina</code>.</p>
+        <div class="azioni"><button type="button" class="sec pericolo" id="rst-apri">Azzera il database…</button></div>
+        <div id="rst-form" hidden><div class="campi">
+          <div class="campo lg"><label for="rst-parola">Per confermare scrivi RESETTA</label><input id="rst-parola" type="text" autocomplete="off" autocapitalize="characters"></div>
+          <div class="campo lg"><label for="rst-pw">La tua password</label><input id="rst-pw" type="password" autocomplete="current-password"></div></div>
+          <div class="azioni"><button type="button" class="pericolo" id="rst-vai">Sì, cancella tutto</button><button type="button" class="sec" id="rst-annulla">Annulla</button><small class="msg" id="rst-msg"></small></div></div>`, false)}</div>
     <div class="barra-salva" id="barra" hidden><span id="barra-t">Modifiche non salvate</span><button type="button" class="sec" id="b-annulla">Annulla</button><button type="button" id="b-salva">Salva</button></div>`;
   S.mod = {}; S.sporco = false;
+  disponiColonne();
   vistaImp();
   aggCarica();
   cfCarica(true);
@@ -2787,6 +3448,19 @@ async function azioniImpostazioni(e) {
     } catch (err) { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
     delete box.dataset.occupato; aggCarica(); return;
   }
+  if (id === 'rst-apri' || id === 'rst-annulla') {
+    const f = $('#rst-form'); if (f) { f.hidden = id === 'rst-annulla'; if (id === 'rst-annulla') { $('#rst-parola').value = ''; $('#rst-pw').value = ''; $('#rst-msg').textContent = ''; } }
+    return;
+  }
+  if (id === 'rst-vai') {
+    const msg = $('#rst-msg'); e.target.disabled = true; msg.textContent = '';
+    try {
+      const r = await inviaPost('/api/database/reset', {conferma: $('#rst-parola').value, password: $('#rst-pw').value});
+      if (r.ok) { toast(r.messaggio || 'Fatto'); setTimeout(() => location.reload(), 1500); return; }
+      msg.textContent = r.messaggio || 'Non è stato possibile.'; toast(msg.textContent, true);
+    } catch (err) { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
+    e.target.disabled = false; return;
+  }
   if (id === 'b-agg') { S.ricarica = false; carica(); toast('Stato aggiornato'); }
   else if (id === 'b-annulla') { S.sporco = false; S.ricarica = true; disegnaImpostazioni(S.dati); }
   else if (id === 'b-salva') {
@@ -2831,13 +3505,13 @@ function cfWizard(st) {
   ${st.demo ? '<p class="msg bad">In modalità demo la procedura non è disponibile.</p>' : ''}
   <details class="guida"><summary>1 · Come creo il token di Cloudflare (2 minuti)</summary><ol>
     <li>Apri <b>dash.cloudflare.com/profile/api-tokens</b> e premi <b>Create Token</b>, poi <b>Create Custom Token</b> (“Get started”).</li>
-    <li>Dagli un nome, per esempio <i>pannello pdc</i>.</li>
+    <li>Dagli un nome, per esempio <i>pannello PdC</i>.</li>
     <li>In <b>Permissions</b> aggiungi tre righe:<br>• <b>Account</b> · <b>Cloudflare Tunnel</b> · <b>Edit</b><br>• <b>Zone</b> · <b>DNS</b> · <b>Edit</b><br>• <b>Zone</b> · <b>Zone</b> · <b>Read</b></li>
     <li>In <b>Account Resources</b> scegli il tuo account; in <b>Zone Resources</b> scegli <b>Include → Specific zone</b> e il tuo dominio.</li>
     <li>Premi <b>Continue to summary</b>, poi <b>Create Token</b> e <b>copia il token</b> (si vede una volta sola).</li></ol>
     <p class="nota-sez">Il token serve solo adesso: il pannello <b>non lo conserva</b>. Dopo puoi anche cancellarlo dal sito di Cloudflare.</p></details>
   <div class="campi" style="grid-template-columns:1fr">
-    <div class="campo"><label for="cf-tok">2 · Incolla qui il token</label><input id="cf-tok" type="password" autocomplete="off" placeholder="il token di Cloudflare"></div></div>
+    <div class="campo lg"><label for="cf-tok">2 · Incolla qui il token</label><input id="cf-tok" type="password" autocomplete="off" placeholder="il token di Cloudflare"></div></div>
   <div class="azioni"><button type="button" id="cf-verifica" ${st.demo ? 'disabled' : ''}>Verifica e cerca i miei domini</button><small class="msg" id="cf-msg"></small></div>
   <div id="cf-passo2"></div>`;
 }
@@ -2845,9 +3519,9 @@ function cfPasso2(zone) {
   const opz = zone.map((z, i) => `<option value="${i}">${esc(z.nome)}</option>`).join('');
   return `<h3 class="sez-t" style="margin-top:20px">3 · Scegli l'indirizzo</h3>
   <div class="campi">
-    <div class="campo"><label for="cf-zona">Dominio</label><select id="cf-zona">${opz}</select></div>
-    <div class="campo"><label for="cf-sub">Sottodominio</label><input id="cf-sub" type="text" value="pdc" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
-    <div class="campo"><label for="cf-nome">Nome del tunnel (solo per riconoscerlo su Cloudflare)</label><input id="cf-nome" type="text" value="pannello-pdc" spellcheck="false"></div></div>
+    <div class="campo lg"><label for="cf-zona">Dominio</label><select id="cf-zona">${opz}</select></div>
+    <div class="campo lg"><label for="cf-sub">Sottodominio</label><input id="cf-sub" type="text" value="pdc" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
+    <div class="campo lg"><label for="cf-nome">Nome del tunnel (solo per riconoscerlo su Cloudflare)</label><input id="cf-nome" type="text" value="pannello-pdc" spellcheck="false"></div></div>
   <p class="nota-sez" id="cf-anteprima"></p>
   <div class="azioni"><button type="button" id="cf-crea">Crea tunnel e collega</button><small class="msg" id="cf-msg2"></small></div>
   <ul class="passi" id="cf-passi"></ul>`;
@@ -2872,12 +3546,12 @@ function cfGestione(st) {
   <div class="campo riga-sw" style="margin-top:14px"><label for="cf-auto">Avvia il tunnel insieme al pannello</label><label class="sw"><input type="checkbox" id="cf-auto" ${st.avvio_automatico ? 'checked' : ''}><span></span></label></div>
   <details class="guida" style="margin-top:12px" id="cf-rim"><summary>Rimuovi l'accesso da internet…</summary>
     <p class="nota-sez">Ferma il tunnel e lo toglie dal pannello. Per cancellare anche tunnel e DNS su Cloudflare incolla un token con gli stessi permessi (altrimenti dovrai cancellarli tu dal loro sito).</p>
-    <div class="campo"><label for="cf-rtok">Token Cloudflare (facoltativo)</label><input id="cf-rtok" type="password" autocomplete="off"></div>
+    <div class="campo lg"><label for="cf-rtok">Token Cloudflare (facoltativo)</label><input id="cf-rtok" type="password" autocomplete="off"></div>
     <div class="azioni"><button type="button" class="sec" id="cf-rimuovi" style="color:var(--bad)">Rimuovi</button><small class="msg" id="cf-rmsg"></small></div></details>
   <p class="nota-sez">Il tunnel è protetto dal tuo login. Se cambi la porta del pannello, rifai la procedura.</p>`;
 }
 async function cfAzione(e) {
-  const id = e.target.id, msg = t => { const m = $('#cf-msg') || $('#cf-rmsg'); if (m) { m.textContent = t; m.className = 'msg bad'; } };
+  const id = e.target.id;
   if (id === 'cf-agg') { toast('Stato aggiornato'); return cfCarica(true); }
   if (id === 'cf-verifica') {
     e.target.disabled = true; $('#cf-msg').textContent = 'Controllo…'; $('#cf-msg').className = 'msg';
@@ -3009,6 +3683,7 @@ function avvia() {
     }
   });
   document.addEventListener('pointermove', e => {
+    if (zoomaMuovi(e) || dita.size > 1) return;
     if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e);
     else { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
   });
@@ -3017,7 +3692,8 @@ function avvia() {
   document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { if (e.target.id.startsWith('cf-')) cfAzione(e); else azioniImpostazioni(e); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
-  document.addEventListener('pointerdown', e => { if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
+  document.addEventListener('pointerdown', e => { zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
+  document.addEventListener('pointerup', zoomaSu); document.addEventListener('pointercancel', zoomaSu);
   if (S.range === 'custom' && S.pagina !== 'efficienza') { $('#custom').hidden = false; if (S.custom) { $('#c-da').value = loc(S.custom.da); $('#c-a').value = loc(S.custom.a); } }
   carica(); collega();
   setInterval(() => { if (finestra().live) carica(); }, 60000);
@@ -3509,6 +4185,506 @@ def modo_istantaneo(db, ora, tol, valvola):
     return modo
 
 
+# --------------------------------------------------------------------------
+# Meteo del giorno (Open-Meteo, due modelli): una riga nella card «Esterna»
+# --------------------------------------------------------------------------
+
+METEO_PREDEFINITO = {"latitudine": 45.23, "longitudine": 7.60}         # Cirié; si cambia solo in config.json (sezione "meteo")
+METEO_URL = "https://api.open-meteo.com/v1/forecast"
+METEO_MODELLI = ("italia_meteo_arpae_icon_2i", "ecmwf_ifs025")         # ICON-2I (2 km, modello italiano) + ECMWF come seconda opinione
+METEO_VARIABILI = ("temperature_2m", "precipitation", "cloud_cover", "weather_code", "is_day")
+METEO_SOGLIA_MM = 0.2          # da questa pioggia oraria (mm) in su si considera che piova
+METEO_OGNI = 1800              # secondi fra una lettura e l'altra
+METEO_VECCHIO = 3 * 3600       # dati più vecchi di così non si mostrano più
+_METEO_NEVE = {71, 73, 75, 77, 85, 86}
+_METEO_TEMPORALE = {95, 96, 99}
+
+
+def meteo_config(app):
+    """(latitudine, longitudine) da config.json -> 'meteo'; None se svuotate (il meteo sparisce)."""
+    c = dict(METEO_PREDEFINITO)
+    try:
+        c.update(app.cfg.leggi().get("meteo") or {})
+        return float(c["latitudine"]), float(c["longitudine"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def meteo_scarica(lat, lon, modo=0):
+    """Legge Open-Meteo. modo: 0 = due modelli, 1 = solo ICON-2I, 2 = modello automatico. -> (dati, modo_riuscito)
+    Se Open-Meteo rifiuta la richiesta (per esempio il nome di un modello) si passa al modo successivo."""
+    ultimo = None
+    for m in range(modo, 3):
+        modelli = METEO_MODELLI if m == 0 else METEO_MODELLI[:1] if m == 1 else ()
+        par = {"latitude": f"{lat:.4f}", "longitude": f"{lon:.4f}", "hourly": ",".join(METEO_VARIABILI),
+               "timezone": "Europe/Rome", "timeformat": "unixtime", "forecast_days": 2}
+        if modelli:
+            par["models"] = ",".join(modelli)
+        # se la rete non c'è http_json solleva ErroreAPI: inutile provare gli altri modi, si esce
+        code, js = http_json("GET", METEO_URL + "?" + urlencode(par), {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
+        if code != 200 or not isinstance(js, dict) or "hourly" not in js:
+            ultimo = f"HTTP {code} {str(js)[:120]}"
+            continue
+        try:
+            dati = meteo_leggi(js, modelli)
+        except (KeyError, TypeError, ValueError) as e:
+            ultimo = f"risposta inattesa ({e})"
+            continue
+        if dati["m"]:
+            return dati, m
+        ultimo = "nessun modello con dati"
+    raise ErroreAPI("richiesta", 0, f"Open-Meteo: {ultimo}")
+
+
+def meteo_leggi(js, modelli):
+    """Risposta di Open-Meteo -> {'t': [epoch], 'off': secondi, 'm': {modello: {variabile: [valori]}}}. Con più modelli i nomi hanno il suffisso _<modello>."""
+    h, tempi = js["hourly"], js["hourly"]["time"]
+    out = {}
+    for nome in (modelli or ("auto",)):
+        d = {}
+        for v in METEO_VARIABILI:
+            chiave = next((k for k in ((f"{v}_{nome}", v) if modelli else (v,)) if k in h), None)
+            d[v] = list(h[chiave]) if chiave else [None] * len(tempi)
+        if any(x is not None for x in d["precipitation"]) and any(x is not None for x in d["temperature_2m"]):
+            out[nome] = d
+    return {"t": [int(t) for t in tempi], "off": int(js.get("utc_offset_seconds", 3600)), "m": out}
+
+
+def _ore_intervalli(livelli):
+    """[(inizio, fine_esclusa, livello_massimo)] dei gruppi di ore consecutive con livello > 0."""
+    gr, cur = [], None
+    for i, lv in enumerate(livelli):
+        if lv > 0:
+            if cur is None:
+                cur = [i, i + 1, lv]
+            else:
+                cur[1], cur[2] = i + 1, max(cur[2], lv)
+        elif cur is not None:
+            gr.append(tuple(cur)); cur = None
+    if cur is not None:
+        gr.append(tuple(cur))
+    return gr
+
+
+def _icona_blocco(prim, idx, p):
+    """Icona di un blocco di ore (p: 0 asciutto, 1 pioggia possibile, 2 pioggia certa)."""
+    cod = [prim["weather_code"][i] for i in idx if prim["weather_code"][i] is not None]
+    notte = prim["is_day"][idx[len(idx) // 2]] == 0
+    temp = [prim["temperature_2m"][i] for i in idx if prim["temperature_2m"][i] is not None]
+    if p and any(c in _METEO_TEMPORALE for c in cod):
+        return "temporale"
+    if p and (any(c in _METEO_NEVE for c in cod) or (temp and min(temp) <= 0.5)):
+        return "neve"
+    if p == 2:
+        return "pioggia"
+    if p == 1:
+        return "luna-pioggia" if notte else "sole-pioggia"
+    if cod and sum(1 for c in cod if c in (45, 48)) * 2 > len(cod):
+        return "nebbia"
+    nuv = [prim["cloud_cover"][i] for i in idx if prim["cloud_cover"][i] is not None]
+    media = sum(nuv) / len(nuv) if nuv else 50
+    if media < 20:
+        return "luna" if notte else "sole"
+    if media < 60:
+        return "luna-nuvola" if notte else "sole-nuvola"
+    return "nuvola"
+
+
+def meteo_riassumi(raw, ora):
+    """Dati grezzi -> {giorno, tmin, tmax, icona, testo, livello, ore[...]}. Funzione pura (si prova con dati finti).
+    Pioggia 'certa' = tutti i modelli la prevedono nell'ora; 'possibile' = solo alcuni. Con un modello solo, se la prevede è 'certa'."""
+    tempi, off, modelli = raw["t"], raw["off"], raw["m"]
+    if not tempi or not modelli:
+        return None
+    nomi = list(modelli)
+    prim = modelli[nomi[0]]
+    loc = [t + off for t in tempi]
+    adesso = ora + off
+    oggi = adesso // 86400
+    giorno_idx = oggi + 1 if (adesso % 86400) // 3600 >= 20 else oggi          # dalle 20 la forchetta e la pioggia guardano al giorno dopo (ma la scritta resta «Oggi»)
+    del_giorno = [i for i, l in enumerate(loc) if l // 86400 == giorno_idx]
+    if not del_giorno:
+        return None
+    finestra = [i for i in del_giorno if giorno_idx != oggi or loc[i] // 3600 >= adesso // 3600]
+    temps = [prim["temperature_2m"][i] for i in del_giorno if prim["temperature_2m"][i] is not None]
+    if not temps:
+        return None
+
+    def mm(nome, i):
+        v = modelli[nome]["precipitation"][i]
+        return v if v is not None else 0.0
+
+    n = len(nomi)
+    def livello(i):
+        k = sum(1 for nome in nomi if mm(nome, i) >= METEO_SOGLIA_MM)
+        return 0 if k == 0 else 2 if k == n else 1
+
+    liv = [livello(i) for i in finestra]
+    gruppi = _ore_intervalli(liv)
+    ora_h = lambda i: (loc[i] % 86400) // 3600
+    notte = giorno_idx == oggi and prim["is_day"][finestra[0]] == 0 if finestra else False
+    testo, lvl, codici = "asciutto", "nessuna", []
+    if gruppi:
+        a, b, mx = gruppi[0]
+        lvl = "certa" if mx == 2 else "possibile"
+        ia, ib = ora_h(finestra[a]), ora_h(finestra[b - 1]) + 1
+        in_corso = giorno_idx == oggi and a == 0
+        fino_sera = ib >= 24
+        if in_corso:
+            quando = "per il resto della giornata" if fino_sera else f"fino alle {ib}"
+        else:
+            quando = f"dalle {ia}" if fino_sera else f"alle {ia}" if ib - ia <= 1 else f"{ia}–{ib}"
+        testo = ("pioggia " if lvl == "certa" else "possibile pioggia ") + quando
+        codici = [prim["weather_code"][finestra[j]] for j in range(a, b) if prim["weather_code"][finestra[j]] is not None]
+        freddo = any((prim["temperature_2m"][finestra[j]] or 9) <= 0.5 for j in range(a, b))
+    # icona
+    if gruppi:
+        if any(c in _METEO_TEMPORALE for c in codici):
+            icona = "temporale"
+        elif any(c in _METEO_NEVE for c in codici) or freddo:
+            icona = "neve"
+        elif lvl == "certa":
+            icona = "pioggia"
+        else:
+            icona = "luna-pioggia" if notte else "sole-pioggia"
+    else:
+        diurne = [i for i in (finestra or del_giorno) if 8 <= ora_h(i) <= 19] or (finestra or del_giorno)
+        nuv = [prim["cloud_cover"][i] for i in diurne if prim["cloud_cover"][i] is not None]
+        cod = [prim["weather_code"][i] for i in diurne if prim["weather_code"][i] is not None]
+        media = sum(nuv) / len(nuv) if nuv else 50
+        if cod and sum(1 for c in cod if c in (45, 48)) * 2 > len(cod):
+            icona = "nebbia"
+        elif media < 20:
+            icona = "luna" if notte else "sole"
+        elif media < 60:
+            icona = "luna-nuvola" if notte else "sole-nuvola"
+        else:
+            icona = "nuvola"
+    # dettaglio a blocchi di 3 ore (per il riquadro al tocco): ora d'inizio, temperatura, pioggia del blocco e icona
+    nomi_liv = ("nessuna", "possibile", "certa")
+    dettaglio = []
+    # il dettaglio sono sempre 3 righe da 3 ore a partire da adesso (a sera tarda le ultime due cadono dopo mezzanotte), sotto la scritta «Oggi»
+    fin_det = [i for i in range(len(loc)) if loc[i] // 3600 >= adesso // 3600][:9]
+    liv_det = [livello(i) for i in fin_det]
+    for j in range(0, len(fin_det), 3):
+        blocco = list(range(j, min(j + 3, len(fin_det))))
+        idx = [fin_det[k] for k in blocco]
+        p = max(liv_det[k] for k in blocco)
+        mm_blocco = sum(max(mm(nome, i) for nome in nomi) for i in idx)
+        dettaglio.append({"h": ora_h(idx[0]), "t": prim["temperature_2m"][idx[0]], "mm": round(mm_blocco, 1),
+                          "p": nomi_liv[p], "i": _icona_blocco(prim, idx, p)})
+        if len(dettaglio) >= 3:
+            break
+    return {"giorno": "Oggi", "tmin": min(temps), "tmax": max(temps),
+            "icona": icona, "testo": testo, "livello": lvl, "ore": dettaglio, "modelli": n}
+
+
+def _meteo_lavoro(app, lat, lon):
+    st = app.meteo_st
+    try:
+        dati, modo = meteo_scarica(lat, lon, st["modo"])
+        st.update(raw=dati, ts=int(time.time()), modo=modo, falliti=0, prossimo=int(time.time()) + METEO_OGNI)
+        if modo:
+            log.info("Meteo: Open-Meteo non ha dato due modelli, uso la modalità %d", modo)
+    except Exception as e:
+        st["falliti"] += 1
+        st["prossimo"] = int(time.time()) + min(300 * st["falliti"], METEO_OGNI)
+        (log.warning if st["falliti"] == 1 else log.debug)("Meteo: lettura non riuscita (%s)", e)
+    finally:
+        st["occupato"] = False
+
+
+def meteo_demo(ora):
+    """Previsione finta per la modalità demo: dalle 17 pioggia (i due modelli concordano), poi asciutto."""
+    off = 3600
+    inizio = (ora + off) // 86400 * 86400 - off
+    tempi = [inizio + h * 3600 for h in range(48)]
+    def serie(f):
+        return [f(h % 24) for h in range(48)]
+    base = {"temperature_2m": serie(lambda h: round(9 + 8 * max(0.0, 1 - abs(h - 15) / 9), 1)),
+            "cloud_cover": serie(lambda h: 30 if h < 14 else 85), "weather_code": serie(lambda h: 3 if h < 17 else 63),
+            "is_day": serie(lambda h: 1 if 7 <= h <= 18 else 0)}
+    a = dict(base, precipitation=serie(lambda h: 0.0 if h < 17 or h > 20 else 1.2))
+    b = dict(base, precipitation=serie(lambda h: 0.0 if h < 18 or h > 21 else 0.8))
+    return {"t": tempi, "off": off, "m": {METEO_MODELLI[0]: a, METEO_MODELLI[1]: b}}
+
+
+def meteo_info(app):
+    """Riassunto del meteo per la Dashboard, o None. La lettura di Open-Meteo parte in un thread (mai nella richiesta della pagina)."""
+    cfg = meteo_config(app)
+    if not cfg:
+        return None
+    ora = int(time.time())
+    if app.demo:
+        r = meteo_riassumi(meteo_demo(ora), ora)
+        return dict(r, agg=ora, modelli_nomi=list(METEO_MODELLI)) if r else None
+    st = app.__dict__.setdefault("meteo_st", {"raw": None, "ts": 0, "prossimo": 0, "occupato": False, "modo": 0, "falliti": 0})
+    if ora >= st["prossimo"] and not st["occupato"]:
+        st["occupato"], st["prossimo"] = True, ora + 60
+        threading.Thread(target=_meteo_lavoro, args=(app, *cfg), daemon=True, name="meteo").start()
+    if not st["raw"] or ora - st["ts"] > METEO_VECCHIO:
+        return None
+    r = meteo_riassumi(st["raw"], ora)
+    return dict(r, agg=st["ts"], modelli_nomi=list(st["raw"]["m"])) if r else None
+
+
+# --------------------------------------------------------------------------
+# Stima: quando riparte il riscaldamento (dalla discesa della temperatura in casa)
+# --------------------------------------------------------------------------
+# Idea: a riscaldamento fermo la casa si raffredda come un corpo caldo in una stanza fredda, T(t) = E + (T0 - E) * exp(-k t),
+# con E la temperatura esterna. Dallo storico ricavo k (quanto "tiene" la casa), di quanto sale ancora la temperatura dopo che lo
+# Smarther smette di chiedere (inerzia del pavimento) e a quanti gradi sotto il target riparte. Poi dalla temperatura di adesso
+# calcolo quando arrivera' a quella soglia. Si ricalcola dallo storico (ultimi 45 giorni, pesando di piu' i piu' recenti).
+RIP_PASSO = 300           # secondi per cella
+RIP_GIORNI = 45           # finestra dello storico
+RIP_MEZZAVITA = 14.0      # giorni: dopo tanto un campione pesa la meta'
+RIP_MIN_CAMPIONI = 5      # senza almeno cosi' tante discese vere la stima non compare
+RIP_TRATTO = 18           # celle (90 minuti) dell'ultimo tratto su cui si misura k
+RIP_MAX_ORE = 12          # oltre questo orizzonte la stima non e' credibile
+
+
+def _med_pesata(vals, pesi):
+    """Mediana pesata: robusta, non si fa spostare da una discesa strana."""
+    coppie = sorted(zip(vals, pesi))
+    meta = sum(p for _, p in coppie) / 2.0
+    acc = 0.0
+    for v, p in coppie:
+        acc += p
+        if acc >= meta:
+            return v
+    return coppie[-1][0]
+
+
+def ripartenza_campioni(T, R, E, S, ok, fine, diag=None):
+    """Cerca nelle celle (dict cella -> valore) le discese a riscaldamento fermo e ne ricava i campioni.
+    T temperatura casa, R richiesta calore (0/1), E esterna, S target, ok(cella) -> True se lo Smarther era in programma.
+    Un campione = una pausa della richiesta, tra due accensioni, di almeno un'ora, con dati completi.
+    diag (opzionale, per 'pdc_strumenti.py rip-diag'): lista in cui annotare ogni pausa trovata e perche' e' valida o scartata."""
+    campioni = []
+    celle = sorted(R)
+    if not celle:
+        return campioni
+    i = 0
+    n = len(celle)
+    while i < n:
+        b = celle[i]
+        # acceso da almeno 3 celle consecutive, poi spento: e' la fine di un ciclo di riscaldamento
+        if R[b] >= 0.5:
+            j = i
+            while j + 1 < n and celle[j + 1] == celle[j] + 1 and R[celle[j + 1]] >= 0.5:
+                j += 1
+            if j - i + 1 >= 3 and j + 1 < n and celle[j + 1] == celle[j] + 1 and R[celle[j + 1]] < 0.5:
+                s = celle[j + 1]                     # prima cella spenta
+                k = j + 1
+                while k + 1 < n and celle[k + 1] == celle[k] + 1 and R[celle[k + 1]] < 0.5:
+                    k += 1
+                # k = ultima cella spenta; la pausa e' valida solo se poi lo Smarther RIPARTE (cella successiva accesa)
+                riparte = k + 1 < n and celle[k + 1] == celle[k] + 1 and R[celle[k + 1]] >= 0.5
+                if riparte and celle[k] - s + 1 >= 12:
+                    e = celle[k + 1]
+                    mot = []
+                    c = _campione(T, E, S, ok, s, e, mot)
+                    if c:
+                        c["cella"] = e
+                        campioni.append(c)
+                    if diag is not None:
+                        diag.append({"da": s * RIP_PASSO, "a": e * RIP_PASSO, "valida": bool(c), "motivo": None if c else (mot[0] if mot else "scartata"),
+                                     "k": c["k"] if c else None, "sovra": c["sovra"] if c else None, "scarto": c["scarto"] if c else None})
+                elif diag is not None:
+                    if not riparte:
+                        mot = "la pausa non e' finita (lo Smarther non e' ancora ripartito) o ci sono buchi nei dati"
+                    else:
+                        mot = "pausa troppo corta (%d min, ne servono almeno 60)" % ((celle[k] - s + 1) * RIP_PASSO // 60)
+                    diag.append({"da": s * RIP_PASSO, "a": (celle[k] + 1) * RIP_PASSO, "valida": False, "motivo": mot,
+                                 "k": None, "sovra": None, "scarto": None})
+                i = k + 1
+                continue
+            i = j + 1
+            continue
+        i += 1
+    return campioni
+
+
+def _campione(T, E, S, ok, s, e, motivo=None):
+    """Una pausa [s, e): s prima cella spenta, e cella in cui lo Smarther riparte.
+    motivo (opzionale): lista in cui annotare perche' la pausa viene scartata (per la diagnostica)."""
+    def no(m):
+        if motivo is not None:
+            motivo.append(m)
+        return None
+    tutte = range(s, e + 1)
+    pres = sum(1 for x in tutte if x in T)
+    if pres < 0.85 * len(tutte):
+        return no("dati di temperatura incompleti (%d%% delle celle, ne servono almeno 85%%)" % (100 * pres // len(tutte)))
+    if not all(ok(x) for x in (s, e)):
+        return no("lo Smarther non era in modo programma/casa all'inizio o alla fine della pausa")
+    t0 = T.get(s - 1, T.get(s))
+    if t0 is None:
+        return no("manca la temperatura prima dello stop")
+    # picco: il massimo nella prima ora e mezza (il pavimento continua a cedere calore dopo lo stop)
+    fin = min(e - 1, s + 17)
+    cand = [(T[x], x) for x in range(s, fin + 1) if x in T]
+    if not cand:
+        return no("nessun dato di temperatura nella prima ora e mezza dopo lo stop")
+    tpk, pk = max(cand)
+    dur_h = (e - pk) * RIP_PASSO / 3600.0
+    te = T.get(e)
+    if te is None:
+        return no("manca la temperatura nel momento della ripartenza")
+    if dur_h < 0.75:
+        return no("discesa troppo breve (%.1f h dal picco, ne servono 0,75)" % dur_h)
+    # k si misura sull'ultimo tratto della discesa (al massimo 90 minuti prima della ripartenza): e' quello che conta per
+    # prevedere quando riparte, e li' la curva e' piu' vicina a un'esponenziale che subito dopo il picco
+    q = max(pk, e - RIP_TRATTO)
+    tq = T.get(q)
+    if tq is None:
+        return no("manca la temperatura all'inizio dell'ultimo tratto di discesa")
+    dq_h = (e - q) * RIP_PASSO / 3600.0
+    es = [E[x] for x in range(q, e + 1) if x in E]
+    if dq_h < 0.5:
+        return no("ultimo tratto di discesa troppo corto (%d min, ne servono 30)" % (dq_h * 60))
+    if len(es) < 0.7 * (e - q + 1):
+        return no("dati della temperatura esterna incompleti nell'ultimo tratto")
+    em = sum(es) / len(es)
+    if tq - em < 3 or te - em < 3:
+        return no("troppo poca differenza tra casa e esterno (casa %.1f / %.1f, esterna %.1f: servono almeno 3 gradi)" % (tq, te, em))
+    if tq <= te + 0.05:
+        return no("la temperatura non scende nell'ultimo tratto (da %.1f a %.1f)" % (tq, te))
+    k = math.log((tq - em) / (te - em)) / dq_h
+    if not (0.003 <= k <= 1.0):
+        return no("coefficiente di raffreddamento fuori dai limiti (k=%.3f, ammessi 0,003-1,0)" % k)
+    bers = S.get(e)
+    return {"k": k, "sovra": max(0.0, tpk - t0), "coda_min": (pk - s) * RIP_PASSO / 60.0,
+            "scarto": (bers - te) if bers is not None else None, "te": te}
+
+
+def ripartenza_fit(campioni, ora, diag=None):
+    """Dai campioni ai parametri: k (1/ora), sovraelongazione, durata della coda, soglia di ripartenza."""
+    if len(campioni) < RIP_MIN_CAMPIONI:
+        if diag is not None:
+            diag.setdefault("motivi", []).append("storico insufficiente: %d pause valide su %d necessarie" % (len(campioni), RIP_MIN_CAMPIONI))
+        return None
+    pesi = [0.5 ** (max(0.0, ora - c["cella"] * RIP_PASSO) / 86400.0 / RIP_MEZZAVITA) for c in campioni]
+    if diag is not None:
+        diag["peso"] = sum(pesi)
+    if sum(pesi) < 3.0:
+        if diag is not None:
+            diag.setdefault("motivi", []).append("pause valide troppo vecchie (peso %.1f, ne servono almeno 3,0): servono dati piu' recenti" % sum(pesi))
+        return None
+    scarti = [(c["scarto"], p) for c, p in zip(campioni, pesi) if c["scarto"] is not None]
+    assoluti = [(c["te"], p) for c, p in zip(campioni, pesi)]
+    return {"k": _med_pesata([c["k"] for c in campioni], pesi),
+            "sovra": _med_pesata([c["sovra"] for c in campioni], pesi),
+            "coda_min": _med_pesata([c["coda_min"] for c in campioni], pesi),
+            "scarto": _med_pesata([v for v, _ in scarti], [p for _, p in scarti]) if scarti else None,
+            "soglia": _med_pesata([v for v, _ in assoluti], [p for _, p in assoluti]),
+            "n": len(campioni)}
+
+
+def ripartenza_eta(fit, ora, t_casa, esterna, target, spenta_da, t_alla_fine, diag=None):
+    """Quando la temperatura in casa arrivera' alla soglia di ripartenza: ora in secondi, oppure None.
+    spenta_da = secondi da quando lo Smarther ha smesso di chiedere; t_alla_fine = temperatura in quel momento."""
+    if not fit or t_casa is None or esterna is None:
+        return None
+    soglia = (target - fit["scarto"]) if (fit["scarto"] is not None and target is not None) else fit["soglia"]
+    t_rif, t_ora = t_casa, ora
+    if spenta_da is not None and t_alla_fine is not None and spenta_da < fit["coda_min"] * 60:
+        # il pavimento sta ancora cedendo calore: la temperatura salira' ancora fino al picco tipico
+        t_rif = max(t_casa, t_alla_fine + fit["sovra"])
+        t_ora = ora + (fit["coda_min"] * 60 - spenta_da)
+    if diag is not None:
+        diag.update({"soglia": soglia, "t_rif": t_rif})
+    if soglia - esterna < 1 or t_rif - esterna < 1:
+        if diag is not None:
+            diag["motivo"] = "casa o soglia troppo vicine alla temperatura esterna (%.1f / %.1f / esterna %.1f)" % (t_rif, soglia, esterna)
+        return None
+    if t_rif <= soglia:
+        if diag is not None:
+            diag["motivo"] = "la casa e' gia' sotto la soglia di ripartenza (%.1f contro %.1f): lo Smarther dovrebbe ripartire subito" % (t_rif, soglia)
+        return None
+    ore = math.log((t_rif - esterna) / (soglia - esterna)) / fit["k"]
+    eta = t_ora + ore * 3600
+    if eta - ora > RIP_MAX_ORE * 3600:
+        if diag is not None:
+            diag["motivo"] = "la ripartenza e' troppo lontana (%.1f ore, oltre il limite di %d)" % ((eta - ora) / 3600.0, RIP_MAX_ORE)
+        return None
+    return max(eta, ora)
+
+
+def _celle_sql(db, serie, da, a, funz):
+    """{cella: valore} con una sola query: media (o massimo) per cella di 5 minuti."""
+    with closing(db._c()) as c:
+        righe = c.execute(f"SELECT ts/{RIP_PASSO} AS b, {funz}(valore) FROM misure WHERE serie=? AND ts BETWEEN ? AND ? "
+                          "GROUP BY b", (serie, int(da), int(a))).fetchall()
+    return {b: v for b, v in righe if v is not None}
+
+
+def stima_ripartenza(app, ora, t_casa, ts_casa, richiesta, esterna, target, diag=None):
+    """Orario (in secondi, arrotondato al quarto d'ora) in cui il riscaldamento dovrebbe ripartire, oppure None.
+    Si calcola solo a richiesta spenta, con dato fresco e con abbastanza discese vere nello storico.
+    diag (opzionale, un dict): se c'e', si riempie con le pause trovate, i parametri e il primo motivo per cui la stima manca;
+    in quel caso non si usa la cache. Serve a 'pdc_strumenti.py rip-diag'."""
+    def no(m):
+        if diag is not None:
+            diag.setdefault("motivi", []).append(m)
+            diag.setdefault("motivo", m)
+        return None
+    blocco = None
+    if richiesta:
+        blocco = "lo Smarther sta chiedendo calore adesso: la stima si fa solo a richiesta spenta"
+    elif t_casa is None:
+        blocco = "manca la temperatura della casa"
+    elif esterna is None:
+        blocco = "manca la temperatura esterna"
+    elif ts_casa is None or ora - ts_casa > 900:
+        blocco = "il dato della casa e' vecchio (%s): serve piu' recente di 15 minuti" % ("mai ricevuto" if ts_casa is None else "%d min" % ((ora - ts_casa) // 60))
+    if blocco:
+        no(blocco)
+        if diag is None:
+            return None
+    db = app.db
+    cache = None if diag is not None else app.__dict__.get("rip_cache")
+    if not cache or ora - cache["ts"] > 600:
+        da = ora - RIP_GIORNI * 86400
+        T = _celle_sql(db, "casa.temperatura", da, ora, "AVG")
+        R = _celle_sql(db, "casa.richiesta_calore", da, ora, "MAX")
+        E = _celle_sql(db, "ciclo.esterna", da, ora, "AVG")
+        S = _celle_sql(db, "casa.setpoint", da, ora, "AVG")
+        cambi = q_cambi(db, "casa.modo", da, ora)
+
+        def ok(b):
+            m = stato_a(cambi, b * RIP_PASSO)
+            return m in (None, "schedule", "home")
+        pause = [] if diag is not None else None
+        campioni = ripartenza_campioni(T, R, E, S, ok, ora // RIP_PASSO, pause)
+        fit = ripartenza_fit(campioni, ora, diag)
+        if diag is not None:
+            diag.update({"pause": pause, "fit": fit, "celle": {"temperatura": len(T), "richiesta": len(R), "esterna": len(E), "target": len(S)}})
+        else:
+            cache = app.__dict__["rip_cache"] = {"ts": ora, "fit": fit}
+    fit = diag["fit"] if diag is not None and "fit" in diag else cache["fit"]
+    if not fit:
+        return None
+    if blocco:
+        return None
+    # da quando lo Smarther ha smesso di chiedere, e a che temperatura eravamo
+    with closing(db._c()) as c:
+        r = c.execute("SELECT MAX(ts) FROM misure WHERE serie='casa.richiesta_calore' AND valore>=0.5 AND ts>?",
+                      (int(ora - 6 * 3600),)).fetchone()
+    spenta_da = t_fine = None
+    if r and r[0] is not None:
+        spenta_da = max(0, ora - r[0])
+        t_fine = q_valore_a(db, "casa.temperatura", r[0])
+    ed = {} if diag is not None else None
+    eta = ripartenza_eta(fit, ora, t_casa, esterna, target, spenta_da, t_fine, ed)
+    if diag is not None:
+        diag["eta_dettagli"] = {**ed, "spenta_da": spenta_da, "t_fine": t_fine}
+    if eta is None:
+        return no((ed or {}).get("motivo") or "stima non calcolabile")
+    q15 = 900
+    return int(round(eta / q15) * q15)
+
+
 @api("/api/dashboard")
 def api_dashboard(app, q):
     ora = int(time.time())
@@ -3550,6 +4726,8 @@ def api_dashboard(app, q):
         "ora": ora, "da": da, "a": a, "demo": app.demo, "intervallo": app.intervallo_pdc(),
         "ultimo_ok": max([s["ultimo_ok"] or 0 for s in servizi] + [ts_("acs.temperatura") or 0]),
         "modo": modo, "servizi": servizi, "accesso_st": info_accesso_st(app),
+        "refresh": info_refresh(app),
+        "meteo": meteo_info(app),
         "riscaldamento": {
             "stato": stato_risc, "temp": acqua, "target": num("risc.setpoint"), "ritorno": ritorno,
             "delta": round(acqua - ritorno, 1) if acqua is not None and ritorno is not None else None,
@@ -3563,6 +4741,8 @@ def api_dashboard(app, q):
         "energia": {"kwh": energia_kwh(db, da, a), "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
                     "spark": q_medie(db, "pot.watt", da, a)},
         "casa": {"temp": num("casa.temperatura"), "umidita": num("casa.umidita"), "soglie_umidita": soglie_umidita(app), "target": num("casa.setpoint"),
+                 "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
+                                             num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
                  "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
                  "ts": ts_("casa.temperatura"), "spark": q_medie(db, "casa.temperatura", da, a),
                  "spark_um": q_medie(db, "casa.umidita", da, a)},
@@ -3613,6 +4793,18 @@ def ultimo_ciclo(db, ora):
     return {"inizio": i, "fine": f, "modo": m, "kwh": kwh if kwh and kwh > 0 else None}
 
 
+def info_refresh(app):
+    """Stato del 'refresh' dei dati del compressore (smartthings.refresh): {attivo, stato, ogni, inviati, ultimo, messaggio}."""
+    try:
+        cfg = (app.cfg.leggi()["smartthings"].get("refresh")) or {}
+        sv = next((x for x in app.servizi if x.sigla == "st"), None)
+        i = getattr(sv, "refresh_info", None) or {}
+        return {"attivo": bool(cfg.get("attivo")), "stato": i.get("stato", "spento"), "ogni": max(30, int(cfg.get("ogni_secondi") or 60)),
+                "inviati": i.get("inviati", 0), "ultimo": i.get("ultimo"), "messaggio": i.get("messaggio")}
+    except Exception:
+        return {"attivo": False, "stato": "spento"}
+
+
 def ritardo_ciclo(db, ora):
     """Ritardo con cui arrivano i campioni del compressore, ultime 24 h: {n, tipico_min, max_min} (None se pochi dati)."""
     v = sorted(x for _, x in q_serie(db, "diag.ritardo_ciclo", ora - 86400, ora))
@@ -3627,6 +4819,38 @@ def prezzo_kwh(app):
         return max(0.0, float(app.cfg.leggi().get("tariffa", {}).get("prezzo_kwh") or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def costo_mese(app, ora):
+    """Costo del mese in corso, stima a fine mese e confronto col mese scorso (None se manca il prezzo o i dati).
+    La stima e' lineare (consumo medio per giorno trascorso x giorni del mese): vale solo come ordine di grandezza."""
+    prezzo = prezzo_kwh(app)
+    if prezzo <= 0:
+        return None
+    db = app.db
+    adesso = datetime.fromtimestamp(ora)
+    inizio = datetime(adesso.year, adesso.month, 1)
+    prec = datetime(adesso.year - (adesso.month == 1), 12 if adesso.month == 1 else adesso.month - 1, 1)
+    fine = datetime(adesso.year + (adesso.month == 12), 1 if adesso.month == 12 else adesso.month + 1, 1)
+    with closing(db._c()) as c:
+        r = c.execute("SELECT MIN(ts) FROM misure WHERE serie='en.totale_wh'").fetchone()
+    primo = r[0] if r and r[0] is not None else None
+    if primo is None:
+        return None
+    t_in, t_prec = inizio.timestamp(), prec.timestamp()
+    kwh = energia_kwh(db, max(t_in, primo), ora)
+    if kwh is None:
+        return None
+    trascorso = (ora - max(t_in, primo)) / 86400
+    durata = (fine - inizio).total_seconds() / 86400
+    stima = None
+    if primo <= t_in and trascorso >= 1.0:
+        stima = kwh / trascorso * durata
+    scorso = energia_kwh(db, t_prec, t_in) if primo <= t_prec + 3600 else None
+    return {"kwh": kwh, "euro": round(kwh * prezzo, 2),
+            "stima_euro": None if stima is None else round(stima * prezzo, 2),
+            "scorso_euro": None if scorso is None else round(scorso * prezzo, 2),
+            "mese": inizio.month, "mese_scorso": prec.month}
 
 
 def cornice(app, ora):
@@ -3694,6 +4918,17 @@ def q_potenza_a_gradini(db, da, a):
     return pts
 
 
+def dirada_richiesta(punti, passo_max=600):
+    """Tiene solo i campioni che servono al grafico: quelli dove la richiesta cambia (e quello subito prima), e uno ogni 10 minuti
+    dentro un periodo uguale (la pagina ne ha bisogno per non spezzare le fasce). Su 30 giorni passa da ~800 KB a poche decine."""
+    out, ult = [], None
+    for i, (t, v) in enumerate(punti):
+        cambia = i == 0 or i == len(punti) - 1 or v != punti[i - 1][1] or v != punti[i + 1][1]
+        if cambia or t - ult >= passo_max:
+            out.append([t, v]); ult = t
+    return out
+
+
 @api("/api/analisi")
 def api_analisi(app, q):
     ora = int(time.time())
@@ -3718,7 +4953,7 @@ def api_analisi(app, q):
                 linee.append({"id": nome, "nome": et, "col": col, "tratti": tr, "punti": pts, "u": u, "asse": asse, "area": area})
         grafici.append({"id": gid, "titolo": titolo, "unita": unita, "gradini": gid == "circuito", "linee": linee})
     # richiesta di calore della casa: intervalli in cui lo Smarther chiede caldo (fascia sul grafico casa)
-    richiesta = [[t, v] for t, v in q_serie(app.db, "casa.richiesta_calore", da, a)]
+    richiesta = dirada_richiesta(q_serie(app.db, "casa.richiesta_calore", da, a))
     out.update({"da": da, "a": a, "passo": dim, "grafici": grafici, "richiesta": richiesta, "soglie_umidita": soglie_umidita(app),
                 "modi": calcola_modi(app.db, da, a, tol, ora)})
     return out
@@ -3766,7 +5001,8 @@ def cicli_compressore(db, da, a, ora, gap=900):
 
 def _mediana(v):
     v = sorted(v)
-    return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
 
 
 def calcola_bollitore(db, da, a, ora, litri=300):
@@ -3831,6 +5067,43 @@ def calcola_bollitore(db, da, a, ora, litri=300):
                          "minuti": round(_mediana([d for d, _ in sal]) / 60), "gradi": round(_mediana([g for _, g in sal]), 1),
                          "cicli": len(sal)}
     return out if (out["perdita"] or out["salita"]) else None
+
+
+SBR_MAX_ELENCO = 50
+
+
+def elenco_sbrinamenti(db, da, a, ora):
+    """Sbrinamenti nel periodo, dalle transizioni on/off di pdc.sbrinamento.
+    Inizio = passaggio a "on" dopo 'da'; fine = il "off" successivo (None se ancora in corso).
+    kWh = differenza del contatore tra inizio e fine (approssimata: il contatore e' a scatti); None se non leggibile.
+    Esterna = media dei campioni di ciclo.esterna attorno allo sbrinamento. Piu' recenti per primi."""
+    da, a = int(da), min(int(a), int(ora))
+    cambi = q_cambi(db, "pdc.sbrinamento", da, a)
+    lista, inizio = [], None
+    for ts, v in cambi[1 if cambi and cambi[0][0] == da else 0:]:      # il primo e' lo stato che c'era a 'da' (se c'era)
+        if v == "on" and inizio is None:
+            inizio = ts
+        elif v != "on" and inizio is not None:
+            lista.append((inizio, ts))
+            inizio = None
+    if inizio is not None:
+        lista.append((inizio, None))
+    out = []
+    for i, f in lista:
+        fine = f if f is not None else int(ora)
+        e0, e1 = q_valore_a(db, "en.totale_wh", i), q_valore_a(db, "en.totale_wh", fine)
+        kwh = round(max(0.0, e1 - e0) / 1000, 2) if e0 is not None and e1 is not None else None
+        est = [v for _, v in q_serie(db, "ciclo.esterna", i - 900, fine + 900)]
+        out.append({"ts": i, "fine": f, "min": round((fine - i) / 60), "kwh": kwh,
+                    "esterna": round(sum(est) / len(est), 1) if est else None, "incorso": f is None})
+    out.reverse()
+    chiusi = [s for s in out if not s["incorso"]]
+    kw = [s["kwh"] for s in out if s["kwh"] is not None]
+    est = [s["esterna"] for s in out if s["esterna"] is not None]
+    return {"n": len(out), "kwh": round(sum(kw), 2) if kw else None,
+            "media_min": round(sum(s["min"] for s in chiusi) / len(chiusi), 1) if chiusi else None,
+            "esterna": round(sum(est) / len(est), 1) if est else None,
+            "elenco": out[:SBR_MAX_ELENCO]}
 
 
 def calcola_efficienza(db, da, a, tol, ora, passo=300):
@@ -3916,14 +5189,14 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         durate = [(f - i) / 60 for i, f, mm in runs if mm == m]
         cicli[m] = {"n": len(durate), "media_min": round(sum(durate) / len(durate), 1) if durate else None,
                     "brevi": sum(1 for d in durate if d < 10), "max_min": round(max(durate), 1) if durate else None}
-    sbrinamenti = sum(1 for _, v in q_cambi(db, "pdc.sbrinamento", da, a)[1:] if v == "on") \
-        if q_cambi(db, "pdc.sbrinamento", da, a) else 0
+    sbr = elenco_sbrinamenti(db, da, a, ora)
+    sbrinamenti = sbr["n"]
     curva_cop = {}
     for m in ("casa", "acs"):
         curva_cop[m] = [{"da": b, "a": b + 2, "cop": round(d[0] / d[1], 2), "ore": round(d[2] * ore_h, 1)}
                         for b, d in sorted(bins[m].items()) if d[2] >= 6 and d[1] > 0]
     return {
-        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti,
+        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti, "sbr": sbr,
         "tot": {"el_casa": round(tot["el"]["casa"], 1), "el_acs": round(tot["el"]["acs"], 1),
                 "el_riposo": round(tot["el"]["riposo"], 1),
                 "calore_casa": round(tot["calore"]["casa"], 1), "calore_acs": round(tot["calore"]["acs"], 1),
@@ -3933,6 +5206,43 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         "copertura": {m: round(100.0 * coperte[m] / totali_celle[m]) if totali_celle[m] else None
                       for m in coperte},
     }
+
+
+# Giorni "tipici": con il pulsante Confronta, per ogni giorno completo si cerca nello storico (ultimi 90 giorni) un gruppo di giorni
+# con la stessa temperatura esterna media (entro 2 gradi) e se ne prende la mediana: e' il consumo / il COP "normale" per
+# quel freddo. Un giorno molto sopra il normale e' segnalato. Servono almeno 3 giorni simili, altrimenti niente (nessun valore inventato).
+TIP_STORICO_GIORNI = 90
+TIP_DELTA_GRADI = 2.0
+TIP_MIN_SIMILI = 3
+TIP_SOPRA = 1.25          # oltre il 25% sopra il tipico ...
+TIP_SOPRA_MIN_KWH = 1.5   # ... e almeno cosi' tanti kWh in piu': segnala un giorno anomalo
+
+
+def giorni_tipici(app, giorni_sel, ora, oggi0, tol):
+    """{giorno: {el, cop_casa, cop_acs, n, sopra}} per i giorni del periodo che hanno abbastanza giorni simili nello storico."""
+    cache = app.__dict__.get("tip_cache")
+    if not cache or cache["giorno"] != oggi0 or ora - cache["ts"] > 1800:
+        da = oggi0 - TIP_STORICO_GIORNI * 86400
+        rif = calcola_efficienza(app.db, da, ora, tol, ora)["giorni"]
+        cache = app.__dict__["tip_cache"] = {"giorno": oggi0, "ts": ora, "rif": rif}
+    tot = lambda g: g["el_casa"] + g["el_acs"] + g["el_riposo"]
+    pieni = lambda g: g["esterna"] is not None and g["nodati_min"] <= 120 and g["ts"] < oggi0 and tot(g) > 0.5
+    rif = [g for g in cache["rif"] if pieni(g)]
+    out = {}
+    for g in giorni_sel:
+        if not pieni(g):
+            continue
+        simili = [r for r in rif if r["giorno"] != g["giorno"] and abs(r["esterna"] - g["esterna"]) <= TIP_DELTA_GRADI]
+        if len(simili) < TIP_MIN_SIMILI:
+            continue
+        el = _mediana([tot(r) for r in simili])
+        cc = [r["cop_casa"] for r in simili if r["cop_casa"] is not None]
+        ca = [r["cop_acs"] for r in simili if r["cop_acs"] is not None]
+        out[g["giorno"]] = {"el": round(el, 2), "n": len(simili), "esterna": g["esterna"],
+                            "cop_casa": round(_mediana(cc), 2) if len(cc) >= TIP_MIN_SIMILI else None,
+                            "cop_acs": round(_mediana(ca), 2) if len(ca) >= TIP_MIN_SIMILI else None,
+                            "sopra": bool(tot(g) > el * TIP_SOPRA and tot(g) - el >= TIP_SOPRA_MIN_KWH)}
+    return out
 
 
 @api("/api/efficienza")
@@ -3951,10 +5261,11 @@ def api_efficienza(app, q):
     out = cornice(app, ora)
     out.update(calcola_efficienza(app.db, da, ora, tol, ora))
     out.update({"da": da, "a": ora, "n_giorni": giorni, "prezzo_kwh": prezzo_kwh(app),
-                "energia_contatore": energia_kwh(app.db, da, ora)})
+                "energia_contatore": energia_kwh(app.db, da, ora), "mese": costo_mese(app, ora)})
     litri = int((app.cfg.leggi().get("bollitore") or {}).get("litri") or 300)
     out["bollitore"] = calcola_bollitore(app.db, da, ora, ora, litri)
     if q.get("confronta", ["0"])[0] == "1":
+        out["tipici"] = giorni_tipici(app, out["giorni"], ora, oggi0, tol)
         # periodo di pari durata subito prima: da - (ora - da) ... da
         durata = ora - da
         prec = calcola_efficienza(app.db, da - durata, da, tol, ora)
@@ -4059,6 +5370,8 @@ MANIFEST = {"name": "Pompa di calore", "short_name": "PDC", "start_url": "/", "d
             "background_color": "#0b0f17", "theme_color": "#0b0f17", "lang": "it",
             "icons": [{"src": "/icona.png", "sizes": "180x180", "type": "image/png"}]}
 
+TIPI_COMPRIMIBILI = {"text/html", "text/css", "text/javascript", "text/csv", "text/plain", "application/json",
+                     "application/manifest+json", "image/svg+xml"}
 CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -4089,8 +5402,16 @@ class Gestore(BaseHTTPRequestHandler):
     # ---- risposte ----
     def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None):
         dati = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
+        compresso = False
+        # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto via tunnel, dove passano dalla tua linea in upload
+        if (len(dati) > 1024 and tipo.split(";")[0] in TIPI_COMPRIMIBILI and "gzip" in self.headers.get("Accept-Encoding", "")
+                and codice == 200):
+            dati, compresso = gzip.compress(dati, 5, mtime=0), True
         self.send_response(codice)
         self.send_header("Content-Type", tipo)
+        if compresso:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(dati)))
         extra = list(extra or [])
         sost = {k: v for k, v in extra if k in ("Cache-Control", "Content-Security-Policy")}
@@ -4408,7 +5729,8 @@ class Simulatore:
                           "info.pdc.versioni": '[["Software","DB91-02102A 2026-03-20","Version"],["Firmware","DB91-02100A 2020-07-10","Version"],["Firmware","DB91-02103B 2022-06-14",""],["Firmware","DB91-02450A 2022-07-06","EHS MONO LOWTEMP"]]',
                           "info.nt.firmware": "40", "info.nt.tipo": "BNS", "info.nt.id": "70:ee:50:00:00:01",
                           "info.nt.nome": "Smarther Thermostat", "info.nt.stanza": "Entrata", "info.nt.casa": "La mia abitazione",
-                          "info.nt.installato": "1759245643", "info.nt.modo_termico": "schedule"})
+                          "info.nt.installato": "1759245643", "info.nt.modo_termico": "schedule",
+                          "info.nt.programma": '{"nome": "Casa", "fasce": [[0, 20.0]]}'})
         return rec
 
 
@@ -4478,7 +5800,7 @@ TITOLI = {
     "st_pat": "Token personale SmartThings",
     "st_pdc_offline": "Pompa di calore offline",
     "st_ciclo_formato": "Formato dei dati ciclo",
-    "nessun_dato": "Dati dalla pdc",
+    "nessun_dato": "Dati dalla PdC",
     "pdc_ferma_con_richiesta": "Pompa ferma con richiesta di calore",
     "casa_fredda": "Temperatura in casa",
     "umidita_alta": "Umidità alta",
@@ -4489,6 +5811,8 @@ TITOLI = {
     "acs_bassa": "Acqua calda sanitaria",
     "cop_basso": "Efficienza (COP)",
     "sbrinamenti_frequenti": "Sbrinamenti frequenti",
+    "sbrinamento_inizio": "Sbrinamento iniziato",
+    "sbrinamento_fine": "Sbrinamento finito",
 }
 
 MESSAGGI_DEFAULT = {
@@ -4501,9 +5825,11 @@ MESSAGGI_DEFAULT = {
     "promemoria": "⏰ <b>{impianto}</b>\nCi siamo ancora: {testo}\n<i>da {durata}</i>",
     "riepilogo": "☀️ <b>{impianto} · ieri, {data}</b>\n"
                  "⚡ Energia: <b>{energia} kWh</b> · COP <b>{cop}</b>\n"
-                 "🔥 Casa {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli casa)\n"
+                 "🔥 Riscaldamento {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli)\n"
                  "🏠 In casa {casa_min}–{casa_max} °C · fuori {esterna} °C\n{anomalie}",
     "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
+    "sbrinamento_inizio": "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}.",
+    "sbrinamento_fine": "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}.",
     "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
     "per_codice": {},
 }
@@ -4523,6 +5849,8 @@ ALLARMI_DEFAULT = {
     "acs_bassa": {"attivo": True, "sotto_gradi": 35.0, "minuti": 30},
     "cop_basso": {"attivo": True, "sotto": 2.0, "ore_minime": 3},
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
+    "sbrinamento_inizio": {"attivo": True},     # non sono anomalie: avvisi informativi, sempre senza suoneria
+    "sbrinamento_fine": {"attivo": True},
 }
 
 TELEGRAM_DEFAULT = {
@@ -4647,10 +5975,11 @@ class Telegram:
             return f"{valori['impianto']}: {valori['testo']}"
 
     # ----- coda -----
-    def accoda(self, tipo, codice, livello, testo, ritardo=0, durata_s=0, extra=None, forza=False):
+    def accoda(self, tipo, codice, livello, testo, ritardo=0, durata_s=0, extra=None, forza=False, muto=False):
         with self.lock:
             self.coda.append({"due": time.time() + ritardo, "tipo": tipo, "codice": codice, "livello": livello,
-                              "testo": testo, "durata_s": durata_s, "extra": extra, "tentativi": 0, "forza": forza})
+                              "testo": testo, "durata_s": durata_s, "extra": extra, "tentativi": 0, "forza": forza,
+                              "muto": muto})
 
     def ascolta(self, tipo, codice, livello, testo):
         """Registrato in Eventi.ascoltatori: arriva da tutte le anomalie (script, collegamenti, sentinella)."""
@@ -4763,7 +6092,7 @@ class Telegram:
                 self._togli(e)
                 continue
             testo = self.formatta(e["tipo"], e["codice"], e["livello"], e["testo"], e["durata_s"], e["extra"])
-            ok, msg = self.invia_ora(testo, self.silenzioso(e["livello"]))
+            ok, msg = self.invia_ora(testo, e.get("muto") or self.silenzioso(e["livello"]))
             if ok:
                 self.ult_invio.append(time.time())
                 self._togli(e)
@@ -4850,12 +6179,14 @@ class Sentinella(threading.Thread):
         self.falso_da = {}    # codice -> da quando la condizione e' falsa
         self.ult_cop = 0
         self.cop_cond = False
+        self.sbr_primo = True   # primo controllo dopo l'avvio: uno sbrinamento gia' in corso non si riannuncia
 
     def run(self):
         self.fermo.wait(45)    # lascia partire i raccoglitori
         while not self.fermo.is_set():
             try:
                 self.valuta()
+                self.avvisa_sbrinamento()
                 self.app.eventi.chiudi("pannello_script")
                 if getattr(self.app, "telegram", None):
                     self.app.telegram.promemoria_aperti()
@@ -5010,6 +6341,42 @@ class Sentinella(threading.Thread):
                          f"Negli ultimi giorni il COP stimato è {num_it(cop, 2)} (soglia {num_it(r['sotto'])}): "
                          "la pompa rende meno del solito.")
 
+    # ----- sbrinamento: due avvisi informativi (inizio e fine), sempre senza suoneria -----
+    def avvisa_sbrinamento(self):
+        """Segue lo stato pdc.sbrinamento. L'inizio dello sbrinamento annunciato resta in 'tg_sbr_inizio': dopo un riavvio
+        non si riannuncia l'inizio, ma la fine si'. Non sono anomalie: niente eventi, niente promemoria."""
+        db, tg = self.app.db, self.app.telegram
+        ora = int(time.time())
+        r = {x[0]: x for x in db.ultimi()}.get("pdc.sbrinamento")
+        primo, self.sbr_primo = self.sbr_primo, False
+        if not r or r[3] not in ("on", "off") or ora - r[1] > 900:
+            return
+        try:
+            inizio = int(db.meta_get("tg_sbr_inizio", "0") or 0)
+        except ValueError:
+            inizio = 0
+        if inizio and ora - inizio > 3 * 3600:      # dimenticato da ore (pannello spento): non si racconta
+            inizio = 0
+            db.meta_set("tg_sbr_inizio", "0")
+        if r[3] == "on" and not inizio:
+            on_ts = [t for t, v in q_cambi(db, "pdc.sbrinamento", ora - 6 * 3600, ora) if v == "on"]
+            inizio = on_ts[-1] if on_ts else ora
+            db.meta_set("tg_sbr_inizio", str(inizio))
+            if not primo and tg.allarme_attivo("sbrinamento_inizio"):
+                est = {x[0]: x for x in db.ultimi()}.get("ciclo.esterna")
+                est_t = f"{num_it(est[2], 0)} °C" if est and est[2] is not None and ora - est[1] <= 1800 else "n.d."
+                tg.accoda("sbrinamento_inizio", "sbrinamento_inizio", "info", "", extra={"esterna": est_t,
+                          "ora": time.strftime("%H:%M", time.localtime(inizio))}, muto=True)
+        elif r[3] == "off" and inizio:
+            db.meta_set("tg_sbr_inizio", "0")
+            if tg.allarme_attivo("sbrinamento_fine"):
+                x = [e for e in elenco_sbrinamenti(db, inizio - 1, ora, ora)["elenco"] if not e["incorso"]]
+                minuti = x[0]["min"] if x else max(1, round((ora - inizio) / 60))
+                kwh = x[0]["kwh"] if x else None
+                tg.accoda("sbrinamento_fine", "sbrinamento_fine", "info", "", extra={
+                    "durata": f"{minuti} min",
+                    "consumo": f"consumo circa {num_it(kwh, 2)} kWh" if kwh is not None else "consumo non disponibile"}, muto=True)
+
     # ----- riepilogo del mattino -----
     # ----- cosa e' successo durante il silenzio notturno -----
     def _finestra_notte(self, ora):
@@ -5148,7 +6515,11 @@ DESCRIZIONI_ALLARME = {
     "acs_bassa": "L'acqua calda sanitaria è troppo fredda.",
     "cop_basso": "L'efficienza stimata (COP) è bassa.",
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
+    "sbrinamento_inizio": "Un messaggio, senza suoneria, quando la pompa entra in sbrinamento.",
+    "sbrinamento_fine": "Un messaggio, senza suoneria, quando lo sbrinamento finisce (durata e consumo).",
 }
+
+AVVISI_INFORMATIVI = ("sbrinamento_inizio", "sbrinamento_fine")     # non sono anomalie: solo interruttore, niente soglie né ritardo
 
 
 MODELLI_SMARTHER = [
@@ -5162,26 +6533,32 @@ MODELLI_SMARTHER = [
 
 def schema_impostazioni():
     sezioni = [
-        {"id": "telegram", "titolo": "Telegram", "nota": "Dove arrivano gli avvisi. Il token si può inserire qui oppure in un "
-         "tuo file .json (campo \"file\"): se il file è indicato ha la precedenza.", "prova": True, "campi": [
+        {"id": "telegram", "titolo": "Telegram", "nota": "Dove arrivano gli avvisi. Il token del bot si può inserire qui oppure in un "
+         "tuo file .json (riquadro sotto): se il file è indicato ha la precedenza.", "prova": True, "campi": [
             _c("telegram.abilitato", "bool", "Invia gli avvisi su Telegram"),
             _c("telegram.bot_token", "segreto", "Token del bot", "Quello che ti ha dato BotFather."),
             _c("telegram.chat_id", "testo", "Chat ID", "Il tuo numero di chat con il bot."),
-            _c("telegram.file_credenziali", "testo", "File con le credenziali (facoltativo)",
-               "Percorso di un tuo .json, per es. C:\\bot\\telegram.json"),
-            _c("telegram.chiave_token", "testo", "Nome della chiave del token nel file", "Per chiavi annidate: a.b"),
-            _c("telegram.chiave_chat", "testo", "Nome della chiave della chat nel file"),
             _c("telegram.nome_impianto", "testo", "Nome mostrato nei messaggi"),
-            _c("telegram.promemoria_ore", "float", "Promemoria se l'anomalia resta aperta (ore, 0 = mai)", min=0, max=168),
+        ]},
+        {"id": "telegram_file", "titolo": "Telegram: credenziali da un tuo file (facoltativo)", "nota": "Se il token e la chat sono già in un tuo "
+         "file .json (per esempio quello di un altro bot), scrivi qui dove sta e come si chiamano le chiavi.", "campi": [
+            _c("telegram.file_credenziali", "testo", "Percorso del file", "Per es. C:\\bot\\telegram.json"),
+            _c("telegram.chiave_token", "testo", "Chiave del token nel file", "Per chiavi annidate: a.b"),
+            _c("telegram.chiave_chat", "testo", "Chiave della chat nel file"),
+        ]},
+        {"id": "telegram_limiti", "titolo": "Telegram: promemoria e limiti", "campi": [
+            _c("telegram.promemoria_ore", "float", "Promemoria ogni (ore)", "Se l'anomalia resta aperta. 0 = mai.", min=0, max=168),
             _c("telegram.max_messaggi_ora", "int", "Massimo messaggi all'ora", min=1, max=200),
         ]},
-        {"id": "orari", "titolo": "Silenzio notturno e riepilogo", "campi": [
-            _c("telegram.silenzio_notturno.attivo", "bool", "Messaggi senza suoneria di notte"),
+        {"id": "orari", "titolo": "Silenzio notturno", "nota": "Di notte i messaggi arrivano senza suoneria.", "campi": [
+            _c("telegram.silenzio_notturno.attivo", "bool", "Silenzio notturno attivo"),
             _c("telegram.silenzio_notturno.da", "ora", "Dalle"),
             _c("telegram.silenzio_notturno.a", "ora", "Alle"),
             _c("telegram.silenzio_notturno.anche_errori", "bool", "Silenzia anche gli errori gravi"),
-            _c("telegram.silenzio_notturno.oscillazione_gradi", "float", "Segnala la notte se la temperatura in casa varia di più di (°C)",
-               "Nel riepilogo del mattino (se attivo) aggiungo cosa è successo durante il silenzio: oscillazioni di temperatura, umidità sopra la soglia gialla, avvisi scattati.", min=0.5, max=20),
+            _c("telegram.silenzio_notturno.oscillazione_gradi", "float", "Oscillazione notturna da segnalare (°C)",
+               "Nel riepilogo del mattino (se attivo) aggiungo cosa è successo durante il silenzio: temperatura in casa variata di almeno questi gradi, umidità sopra la soglia gialla, avvisi scattati.", min=0.5, max=20),
+        ]},
+        {"id": "riepilogo", "titolo": "Riepilogo del mattino", "campi": [
             _c("telegram.riepilogo_mattina.attivo", "bool", "Riepilogo di ieri ogni mattina"),
             _c("telegram.riepilogo_mattina.ora", "ora", "Ora del riepilogo"),
         ]},
@@ -5193,25 +6570,37 @@ def schema_impostazioni():
             _c("telegram.messaggi.ripristino", "lungo", "Tutto risolto"),
             _c("telegram.messaggi.promemoria", "lungo", "Promemoria"),
             _c("telegram.messaggi.riepilogo", "lungo", "Riepilogo del mattino"),
+            _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {esterna} {ora}."),
+            _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {durata} {consumo}."),
         ]},
-        {"id": "collegamenti", "titolo": "Collegamenti", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
+        {"id": "collegamenti", "titolo": "SmartThings (pompa di calore)", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
          "campi": [
-            _c("smartthings.device_id", "testo", "SmartThings: ID della pompa di calore"),
-            _c("smartthings.pat", "segreto", "SmartThings: token personale (PAT, dura 24 ore)",
-               "Usato solo se l'OAuth non è configurato."),
-            _c("netatmo.home_id", "testo", "Netatmo: ID della casa"),
-            _c("netatmo.room_id", "testo", "Netatmo: ID della stanza (Smarther)"),
-            _c("generale.intervallo_pdc_secondi", "int", "Ogni quanti secondi leggere la pompa", "Minimo 20.", min=20, max=3600),
-            _c("generale.intervallo_netatmo_secondi", "int", "Ogni quanti secondi leggere lo Smarther", min=30, max=3600),
+            _c("smartthings.device_id", "testo", "ID della pompa di calore"),
+            _c("smartthings.pat", "segreto", "Token personale (PAT, dura 24 ore)", "Usato solo se l'OAuth non è configurato."),
+            _c("generale.intervallo_pdc_secondi", "int", "Leggi la pompa ogni (secondi)", "Minimo 20.", min=20, max=3600),
+        ]},
+        {"id": "refresh", "titolo": "Dati più freschi (refresh)", "nota": "SmartThings consegna i dati del compressore con 4-5 minuti di ritardo. "
+         "Con questa opzione, solo mentre la pompa lavora, il pannello le manda il comando «refresh» (non cambia nessuna impostazione) e a volte "
+         "i dati arrivano molto prima. Serve il permesso di comando del token (x:devices:*). È una prova: migliora, non elimina il ritardo.",
+         "campi": [
+            _c("smartthings.refresh.attivo", "bool", "Chiedi alla pompa di aggiornare i dati mentre lavora"),
+            _c("smartthings.refresh.ogni_secondi", "int", "Manda il refresh ogni (secondi)", "Minimo 30, consigliato 60.", min=30, max=600),
+        ]},
+        {"id": "netatmo", "titolo": "Netatmo (Smarther)", "campi": [
+            _c("netatmo.home_id", "testo", "ID della casa"),
+            _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
+            _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
+        ]},
+        {"id": "accessoweb", "titolo": "Login del pannello", "campi": [
             _c("generale.sessione_giorni", "int", "Giorni prima di rifare il login", min=1, max=365),
         ]},
         {"id": "umidita", "titolo": "Umidità in casa", "nota": "Soglie dell'umidità (dallo Smarther): sopra la prima il valore diventa giallo "
          "in Dashboard e parte l'avviso Telegram «Umidità alta»; sopra la seconda diventa rosso e parte «Umidità molto alta». "
          "Valgono per tutto: Dashboard, grafico e Telegram. Gli avvisi si possono spegnere in «Quando avvisarti».", "campi": [
-            _c("umidita.giallo", "float", "Soglia gialla (% di umidità)", "Predefinita 60.", min=20, max=100),
-            _c("umidita.rosso", "float", "Soglia rossa (% di umidità)", "Predefinita 70. Deve essere maggiore della gialla.", min=20, max=100),
-            _c("umidita.minuti", "int", "Prima di avvisare su Telegram, per quanti minuti di fila", "Evita gli avvisi per un picco breve (una doccia).", min=1, max=1440),
-            _c("umidita.rientro_punti", "float", "L'avviso rientra quando scende sotto la soglia di (punti)", "Evita messaggi continui se l'umidità oscilla attorno alla soglia.", min=0, max=20),
+            _c("umidita.giallo", "float", "Soglia gialla (%)", "Predefinita 60.", min=20, max=100),
+            _c("umidita.rosso", "float", "Soglia rossa (%)", "Predefinita 70. Deve essere maggiore della gialla.", min=20, max=100),
+            _c("umidita.minuti", "int", "Avvisa dopo (minuti di fila)", "Evita gli avvisi per un picco breve (una doccia).", min=1, max=1440),
+            _c("umidita.rientro_punti", "float", "Rientro sotto la soglia di (punti)", "Evita messaggi continui se l'umidità oscilla attorno alla soglia.", min=0, max=20),
         ]},
         {"id": "tariffa", "titolo": "Costo dell'energia", "nota": "Se metti il prezzo, il pannello mostra quanto costa l'energia "
          "della pompa (stima: kWh della pompa per il prezzo, senza quota fissa).", "campi": [
@@ -5252,8 +6641,9 @@ def schema_impostazioni():
             if k in ETICHETTE_ALLARME:
                 et, tipo, mn, mx = ETICHETTE_ALLARME[k]
                 campi.append(_c(f"allarmi.{codice}.{k}", tipo, et, min=mn, max=mx))
-        et, tipo, mn, mx = ETICHETTE_ALLARME["ritardo_minuti"]
-        campi.append(_c(f"allarmi.{codice}.ritardo_minuti", tipo, et, "Se si risolve prima, non ti scrivo.", min=mn, max=mx))
+        if codice not in AVVISI_INFORMATIVI:
+            et, tipo, mn, mx = ETICHETTE_ALLARME["ritardo_minuti"]
+            campi.append(_c(f"allarmi.{codice}.ritardo_minuti", tipo, et, "Se si risolve prima, non ti scrivo.", min=mn, max=mx))
         allarmi.append({"id": codice, "titolo": TITOLI.get(codice, codice), "descrizione": DESCRIZIONI_ALLARME.get(codice, ""),
                         "campi": campi})
     for s in sezioni:  # in quale tab della pagina sta ogni riquadro
@@ -5261,7 +6651,7 @@ def schema_impostazioni():
     return sezioni, allarmi
 
 
-TAB_SEZIONI = {"telegram": "avvisi", "orari": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti",
+TAB_SEZIONI = {"telegram": "avvisi", "telegram_file": "avvisi", "telegram_limiti": "avvisi", "orari": "avvisi", "riepilogo": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti", "refresh": "collegamenti", "netatmo": "collegamenti", "accessoweb": "collegamenti",
                "dispositivi": "collegamenti", "tariffa": "dati", "bollitore": "dati", "backup": "dati", "storico": "dati"}
 
 
@@ -5527,6 +6917,49 @@ def api_registro(app, q):
         "backup_copie": len(copie), "backup_attivo": bool(cfg_b.get("attivo", True)),
         "versione": VERSIONE, "avviato": int(AVVIO), "ora": int(time.time()),
     }
+
+
+@api_post("/api/database/reset")
+def reset_database(app, corpo, h):
+    """Azzera i dati raccolti (misure, stati, cicli, anomalie). Restano config.json, la password e i login.
+    Prima di toccare qualcosa fa una copia del database; se la copia non riesce non cancella niente."""
+    if app.demo:
+        return {"ok": False, "messaggio": "In modalità demo non si azzera niente."}
+    ip = ip_client(h)
+    if app.limite.bloccato(ip):
+        return {"ok": False, "messaggio": "Troppi tentativi. Riprova più tardi."}
+    if str(corpo.get("conferma", "")).strip() != "RESETTA":
+        return {"ok": False, "messaggio": "Per confermare scrivi esattamente RESETTA (tutto maiuscolo)."}
+    acc = app.cfg.leggi()["accesso"]
+    if not verifica_password(str(corpo.get("password", "")), acc.get("password_hash") or ""):
+        app.limite.fallito(ip)
+        time.sleep(1.0)
+        return {"ok": False, "messaggio": "La password non è corretta: non ho cancellato niente."}
+    cart = Path((app.cfg.leggi().get("backup") or {}).get("cartella") or "dati/backup")
+    cart = cart if cart.is_absolute() else app.base / cart
+    copia = cart / f"prima-del-reset-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    try:
+        cart.mkdir(parents=True, exist_ok=True)
+        with closing(app.db._c()) as src, closing(sqlite3.connect(str(copia))) as dst:
+            src.backup(dst)
+        if not copia.exists() or copia.stat().st_size < 4096:
+            raise OSError("la copia è vuota")
+    except Exception as e:
+        copia.unlink(missing_ok=True)
+        log.error("Reset database annullato: copia non riuscita (%s)", e)
+        return {"ok": False, "messaggio": f"Non sono riuscito a fare la copia di sicurezza ({e}): non ho cancellato niente."}
+    with app.db.lock, closing(app.db._c()) as c, c:
+        for tab in ("misure", "stati", "ultimo", "ciclo", "eventi"):
+            c.execute(f"DELETE FROM {tab}")
+        c.execute("DELETE FROM meta WHERE k IN ('ciclo_ultimo_ts', 'tg_notificati')")
+    try:
+        vacuum(app.db)
+    except Exception:
+        log.exception("reset: compattazione non riuscita (non è grave)")
+    log.warning("DATABASE AZZERATO dal pannello (da %s). Copia di sicurezza: %s", ip, copia.name)
+    for s in app.servizi:
+        s.sveglia.set()     # rileggi subito: i primi dati ricompaiono in pochi secondi
+    return {"ok": True, "messaggio": "Database azzerato. I dati ricominciano da adesso.", "copia": copia.name}
 #@@PARTE cloudflare@@
 # ==========================================================================
 # PEZZO 6: ACCESSO DA INTERNET CON UN TUNNEL CLOUDFLARE (procedura guidata)
@@ -5537,6 +6970,7 @@ import subprocess
 CF_API = "https://api.cloudflare.com/client/v4"
 CF_DOWNLOAD = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
 TITOLI["cf_tunnel"] = "Tunnel Cloudflare"
+TITOLI["cf_esterno"] = "Pannello raggiungibile da internet"
 
 CLOUDFLARE_DEFAULT = {
     "_nota": "Compilato dalla procedura guidata (Impostazioni > Accesso da internet). Il token del tunnel permette solo di "
@@ -5668,6 +7102,8 @@ class TunnelCF:
         self.fallimenti = 0
         self.fermo = threading.Event()
         self.ultimo_errore = None
+        self.esterno_ts = 0       # ultimo controllo dall'esterno
+        self.esterno_ko = 0       # controlli falliti di fila
 
     # ----- ciclo di vita -----
     def _cfg(self):
@@ -5731,8 +7167,10 @@ class TunnelCF:
             args += ["--protocol", c["protocollo"]]
         args.append("run")
         try:
-            if self.log_path.exists() and self.log_path.stat().st_size > 2_000_000:
-                self.log_path.write_bytes(self.log_path.read_bytes()[-200_000:])
+            if self.log_path.exists() and self.log_path.stat().st_size > 500_000:     # oltre 500 KB: si tiene la parte finale, da un inizio di avvio
+                dati = self.log_path.read_bytes()[-400_000:]
+                i = dati.find(b"\n--- avvio")
+                self.log_path.write_bytes(dati[i + 1:] if i >= 0 else dati)
         except OSError:
             pass
         logf = open(self.log_path, "ab")
@@ -5823,6 +7261,46 @@ class TunnelCF:
                 elif time.time() - self.partito_il > 180:
                     self.app.eventi.apri("cf_tunnel", "Il tunnel e' avviato ma non risulta collegato a Cloudflare da oltre 3 minuti. "
                                          + self._ultima_riga_problema(), "avviso")
+            try:
+                self._controllo_esterno()
+            except Exception:
+                log.exception("controllo del pannello da internet in errore")
+
+    # ----- il pannello e' raggiungibile da internet? -----
+    CONTROLLO_OGNI = 120        # secondi fra un controllo e l'altro
+    CONTROLLO_FALLITI = 3       # controlli falliti di fila prima di avvisare (circa 6 minuti)
+
+    def _controllo_esterno(self):
+        """Prova il percorso intero, come lo farebbe il tuo iPhone da fuori casa: da qui a Cloudflare e di nuovo al pannello.
+        Usa la pagina pubblica manifest.webmanifest (non serve la password). Avvisa solo dopo alcuni fallimenti di fila, per
+        non disturbare con un singolo intoppo; quando torna tutto a posto l'avviso si chiude da solo."""
+        if self.app.demo or not self.proc or self.proc.poll() is not None or time.time() - self.partito_il < 120:
+            return
+        if time.time() - self.esterno_ts < self.CONTROLLO_OGNI:
+            return
+        self.esterno_ts = time.time()
+        host = self._cfg()["hostname"]
+        if not host:
+            return
+        motivo = ""
+        try:
+            code, js = http_json("GET", f"https://{host}/manifest.webmanifest",
+                                 {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
+            if code == 200 and isinstance(js, dict) and "start_url" in js:
+                self.esterno_ko = 0
+                self.app.eventi.chiudi("cf_esterno")
+                return
+            if code in (530, 1033):
+                motivo = f"Cloudflare non trova il tunnel (codice {code})"
+            elif code in (502, 504, 521, 522, 523, 524):
+                motivo = f"Cloudflare risponde ma il pannello no (codice {code})"
+            else:
+                motivo = f"risposta inattesa (codice {code})"
+        except ErroreAPI as e:
+            motivo = str(e)
+        self.esterno_ko += 1
+        if self.esterno_ko >= self.CONTROLLO_FALLITI:
+            self.app.eventi.apri("cf_esterno", f"Da internet il pannello non risponde ({host}): {motivo}.", "avviso")
 
     # ----- stato -----
     def _coda_log(self, n=12000):
@@ -6265,7 +7743,8 @@ def cmd_ripristina(app, leggi=input):
         c = app.cfg.leggi().get("backup") or BACKUP_DEFAULT
         cart = Path(c.get("cartella") or "dati/backup")
         cart = cart if cart.is_absolute() else app.base / cart
-        copie = sorted(cart.glob("pdc-*.db"), reverse=True) if cart.is_dir() else []
+        copie = (sorted(list(cart.glob("pdc-*.db")) + list(cart.glob("prima-del-reset-*.db")),
+                        key=lambda f: f.stat().st_mtime, reverse=True) if cart.is_dir() else [])
         if not copie:
             print(f"Non trovo nessuna copia in {cart}. Il backup si fa con:  python pdc_pannello.py backup")
             return 1
@@ -6621,6 +8100,7 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
             _riga("Richiesta di calore", "Sì" if richiesta == 1.0 else "No" if richiesta == 0.0 else None, "b",
                   "warn" if richiesta == 1.0 else "no"),
             _riga("Modalità", MODI_SMARTHER.get(modo, modo)),
+            (lambda vn: _riga("Programma orario", vn[0], nota=vn[1]))(_testo_programma(t("info.nt.programma"))),
             wifi,
         ]},
         {"titolo": "Identificativi", "righe": [
@@ -6638,6 +8118,47 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
     return {"id": "smarther", "titolo": "Termostato", "sotto": "via Netatmo",
             "loghi": ["smarther"], "marca": "Smarther",
             "stato": {"testo": testo, "cls": cls}, "ultimo_dato": r[1] if r else None, "gruppi": gruppi}
+
+
+GIORNI_BREVI = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+
+
+def _testo_programma(raw):
+    """Programma dello Smarther in una frase: 'sempre 20°' oppure i giorni raggruppati con le fasce."""
+    if not raw:
+        return None, ""
+    try:
+        p = json.loads(raw)
+    except ValueError:
+        return None, ""
+    if p.get("errore"):
+        return "Formato non riconosciuto", ""
+    fasce = p.get("fasce") or []
+    if not fasce:
+        return "Non disponibile", "Lo Smarther non ha restituito nessun programma orario."
+    g = lambda v: (f"{v:.1f}".rstrip("0").rstrip(".")).replace(".", ",") + "°"
+    nome = f"«{p['nome']}»" if p.get("nome") else "A fasce"
+    temps = {x[1] for x in fasce}
+    if len(temps) == 1:
+        return f"Fisso a {g(fasce[0][1])}", "Stessa temperatura 24 ore su 24, 7 giorni su 7: nessuna fascia."
+    giorni = []
+    for d in range(7):
+        prima = [x for x in fasce if x[0] < d * 1440]
+        riga = [(x[0] % 1440, x[1]) for x in fasce if d * 1440 <= x[0] < (d + 1) * 1440]
+        if (not riga or riga[0][0] > 0) and (prima or fasce):
+            riga.insert(0, (0, (prima[-1] if prima else fasce[-1])[1]))
+        giorni.append(" ".join(f"{m // 60:02d}:{m % 60:02d} {g(t)}" for m, t in riga))
+    gruppi = []
+    for d, txt in enumerate(giorni):
+        if gruppi and gruppi[-1][1] == txt and gruppi[-1][0][-1] == d - 1:
+            gruppi[-1][0].append(d)
+        else:
+            gruppi.append(([d], txt))
+    parti = []
+    for dd, txt in gruppi:
+        nome_g = GIORNI_BREVI[dd[0]] if len(dd) == 1 else f"{GIORNI_BREVI[dd[0]]}–{GIORNI_BREVI[dd[-1]]}"
+        parti.append(f"{nome_g}: {txt}")
+    return nome, " · ".join(parti)
 
 
 STORICO_SERIE = {
@@ -6808,7 +8329,7 @@ _FSV_VALORI = {
     "2081": {1: "Pavimento radiante", 2: "Ventilconvettori"},
     "3042": {0: "Domenica", 1: "Lunedì", 2: "Martedì", 3: "Mercoledì", 4: "Giovedì", 5: "Venerdì", 6: "Sabato",
              7: "Ogni giorno"},
-    "3071": {0: "Verso l'ambiente (casa)", 1: "Verso il bollitore"},
+    "3071": {0: "Verso il riscaldamento", 1: "Verso il bollitore"},
     "5043": {0: "Bassa", 1: "Alta"},
     "5094": {0: "Solo pompa di calore (55 °C)", 1: "Pompa e resistenza (70 °C)"},
 }
@@ -7289,7 +8810,7 @@ def cmd_stato(app):
         quando = f"{eta} s fa" if eta < 120 else (f"{eta // 60} min fa" if eta < 7200 else f"{eta // 3600} h fa")
         print(f"{serie:26} {fmt_val(num, txt):>12}   {datetime.fromtimestamp(ts):%d/%m %H:%M:%S} ({quando})")
     nf = sum(1 for r in righe if r[0].startswith("fsv."))
-    print(f"\n(+ {nf} impostazioni FSV della pdc salvate)")
+    print(f"\n(+ {nf} impostazioni FSV della PdC salvate)")
     ac = info_accesso_st(app)
     print("Accesso SmartThings:", {"oauth": "OAuth (si rinnova da solo)", "pat": "token personale PAT (24 ore)"}.get(ac["tipo"], ac["tipo"]))
     aperti = [e for e in app.db.eventi_recenti(30) if e[4] is None]

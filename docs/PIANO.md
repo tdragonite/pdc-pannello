@@ -204,128 +204,27 @@ Dai dati reali (`diagnostica.json` + dump) lo stop del riscaldamento e' stato al
 - Regola di stop in `modo_istantaneo` (solo se la modalita' corrente e' casa/acs, non ci sono campioni recenti con compressore in marcia, la valvola non e' cambiata negli ultimi 10 minuti): `crollo` = massimo degli ultimi 10 min meno il massimo delle ultime due letture >= 5 gradi, oppure `spento` = valvola `room` + ultimo `casa.richiesta_calore` = 0 + calo >= 2 gradi dal massimo. La vecchia regola (calo di 1 grado) era sbagliata: con la pdc in marcia l'acqua fa un «dente di sega» di 2-3 gradi (37-40) e dopo un cambio di valvola l'acqua crolla di 25 gradi senza che la pdc si fermi.
 - Prova (`/tmp/t/gh/`, dati reali): stop visto alle 11:18; nessun falso «riposo» durante il riscaldamento. Nota: la linea del tempo per cella usa solo il primo campione della cella, quindi non era la causa del ritardo mostrato in dashboard; quella era la regola di stop troppo lenta/mancante piu' i fantasma nella finestra `marcia` di 4 minuti.
 
+## 0.18 (03/11/2026, refresh e reset database)
+- **Refresh dei dati del ciclo** (nucleo, `ServizioST`): nuova sezione `smartthings.refresh` = {attivo (False), ogni_secondi (60, minimo 30)}. In `passo()`, a fine lettura, `_refresh(dev, ts)`: se attivo e la pompa lavora (`_pdc_lavora`: campione `ciclo.freq_compressore` > 0 negli ultimi 15 min, oppure `casa.richiesta_calore` = 1 negli ultimi 5 min, oppure `risc.acqua` con escursione >= 1,5 gradi negli ultimi 7 min) manda `POST /devices/{id}/commands` con `refresh` (componente `main`); poi `threading.Timer(12, self.sveglia.set)` per rileggere subito. 401 con OAuth: invalida il token e riprova fra 2 min; 401/403: stato `permesso`, blocco 1 ora (serve `x:devices:*`); 429/altri errori/rete: pausa 5 minuti. Mai eccezioni verso il ciclo normale. Stato in `ServizioST.refresh_info` {stato: spento|a riposo|attivo|permesso|errore, inviati, ultimo, messaggio, bloccato_fino}; `/api/dashboard` espone `refresh` (`info_refresh` in 2_web.py); `notaRefresh` in app.js lo scrive accanto al ritardo dei dati.
+- Base empirica (`st-prova-refresh`): 16 + 8 giri con ordine casuale. Con refresh dati nuovi in 7 giri su 12 (sempre alla prima lettura, ~10 s dopo), senza refresh in 1 su 12 (a 81 s). Campioni freschi (< 3 minuti) in 5 refresh su 12, mai senza; gli altri erano arretrati (7 minuti). In meta' dei tentativi non arriva niente. Quindi un miglioramento probabilistico, non una soluzione: l'indicatore continua a usare acqua e Smarther in tempo reale.
+- **Azzera database**: `POST /api/database/reset` (4_impostazioni.py), UI in Impostazioni → Dati. Richiede `conferma` = «RESETTA» e la password (stesso limite di tentativi del cambio password). Prima copia con `sqlite3.backup` in `<backup>/prima-del-reset-AAAAMMGG-OOMMSS.db` (file diverso a ogni reset: un secondo reset non sovrascrive la copia del primo); se la copia manca o e' < 4 KB, non cancella nulla. Poi `DELETE` su misure, stati, ultimo, ciclo, eventi e sulle chiavi `meta` `ciclo_ultimo_ts` e `tg_notificati` (restano `st_pat_*`, `backup_ts`, ecc., le sessioni e config.json), `VACUUM`, e sveglia i raccoglitori. `cmd_ripristina` elenca anche `prima-del-reset-*.db`.
+- Rimosso l'allarme `resistenza_accesa` (vedi sopra). Changelog 0.18 in app.js.
+- Prova: `/tmp/t/r18/t18.py` (31 controlli: refresh spento/ferma/in marcia/Smarther/acqua, 403/429/rete, intervallo minimo, campi in Impostazioni, reset con parola/password sbagliate, copia, tabelle vuote, secondo reset, ripristina, demo) e `/tmp/t/r18/ui.py` (playwright). Regressione completa invariata (27/14/18/7, hot 17, migrazione 21). Serve il riavvio completo (cambiano nucleo e manutenzione).
+
+## 0.19 (04/11/2026, sbrinamenti e cursori)
+- **Elenco sbrinamenti** (`elenco_sbrinamenti(db,da,a,ora)` in 2_web.py, usata da `calcola_efficienza` -> `sbr`): ultimi 50 con inizio, durata, kWh (differenza di `en.totale_wh`) ed esterna media (+-15 min). Tile «Sbrinamenti» in Efficienza con elenco apribile (`data-come`), chip con le medie, righe a zebra (`.sr`). Attenzione: il primo elemento di `q_cambi` e' lo stato a `da`, quindi `cambi[1 if cambi[0][0]==da else 0:]`.
+- **Avvisi Telegram** `sbrinamento_inizio/fine` (3_telegram.py, `Sentinella.avvisa_sbrinamento`): leggono `pdc.sbrinamento` da `db.ultimi()` (scartato se piu' vecchio di 900 s), meta `tg_sbr_inizio`, guardia di 3 ore, nessun avviso al primo giro dopo l'avvio. Sempre `muto=True` (parametro nuovo di `accoda`). Informativi: nessun rientro/promemoria (`AVVISI_INFORMATIVI`). Richiedono il riavvio completo.
+- **Cursore nei grafici di Efficienza** (energia, COP, COP per temperatura esterna): stesso sistema di Analisi (`muoviCursore` controlla prima `#eff svg[data-ef]`); legenda su una riga con i valori. Sulla Curva climatica volutamente NIENTE (scelta dell'utente).
+- `pdc_strumenti.py sbrinamenti` (`--giorni`, `--salva`).
+- Prove: `/tmp/t/sbr/t.py` (19); tutte le altre suite a 0 FAIL. Tempi (demo.db): `calcola_efficienza` su 90 giorni 0,2 s (con cache di 30 min per i giorni tipici). pyflakes 0 avvisi, eslint 0 errori.
+
+
 ### Strumenti e esperimenti (03/11/2026)
 - `pdc_strumenti.py st-prova-refresh`: test del comando SmartThings `refresh` (capability `refresh`, componente `main`) per anticipare i campioni del ciclo. Fa N giri casuali con/senza refresh, pausa di decantazione fra i giri, riepilogo con verdetto. Primo risultato (8 giri, pdc a riposo): con refresh nuovi campioni in 3 giri su 4 dopo ~10 s, campioni vecchi di 0,4-2,5 minuti (invece di >= 4); senza refresh 0 su 4, ma i giri non erano mescolati (4 refresh poi 4 controlli), quindi da confermare con `--giri 16` a pdc in marcia. Se conferma: mandare `refresh` a ogni lettura (intervallo_pdc_secondi, ora 30 s sul PC dell'utente) o ogni ~60 s solo quando la pdc lavora.
 - Rimosso l'allarme `resistenza_accesa` (e la sua voce in Impostazioni): l'impianto non ha la resistenza.
 
-### Da fare (richieste dell'utente, per dopo)
-- Tasto «Resetta database» in Impostazioni, con avvisi: proposta = backup automatico prima, conferma in due passaggi (scrivere una parola).
-- Eventuale uso del `refresh` nel pannello (vedi sopra), se il test lo conferma.
-
-## Stato dopo pezzo 7 (progetto COMPLETO nelle funzioni previste)
-- Fatto: 6_manutenzione.py (compattazione storico: ultimi 365 gg dettagliati, poi medie a 15 min; contatore en.totale_wh = ultimo valore; blob ciclo vecchi eliminati; thread notturno + comando `compatta`; sezione `conservazione` in config e in Impostazioni) e README.md completo (setup SmartThings PAT/OAuth, Netatmo, password, avvio con pythonw, Telegram, Cloudflare, iPhone, comandi, config, manutenzione, troubleshooting, sicurezza).
-- Stato file: pdc_pannello.py 0.7 e' il file unico; si ricostruisce con `python costruisci.py` da sorgenti/ (1_nucleo, 2_web, 3_telegram, 4_impostazioni, 5_cloudflare, 6_manutenzione, 9_comandi + web/*).
-- Da fare solo su richiesta: correzioni dopo i test sui dati veri (soglie allarmi, COP, decodifica ciclo), eventuali aggiunte richieste dall'utente.
-- Limiti noti: Cloudflare/cloudflared non provati su Windows dal sistema di sviluppo (utente dice che funziona); test di crash-restart del tunnel flaky nel test ma il riavvio funziona; nessun test di carico con molti mesi di dati reali.
-
-## Versioni
-- Numerazione dalla 0.8: 0.8 = base dopo i test; 0.8.1, 0.8.2... = correzioni; 0.9 = nuove funzioni; 1.0 = prossima versione maggiore.
-- La versione sta in `VERSIONE` (sorgenti/1_nucleo.py). Ricordati di cambiarla a ogni consegna.
-- 0.8: separatori nello Stato; badge di stato a colori pieni (verde acceso, arancio richiesta calore, giallo sbrinamento, blu fermo/attesa, rosso spento) con suggerimento al passaggio; testi dei badge invariati rispetto alla 0.7.
-- 0.8.1: verde `--ok` più chiaro (#62eba6); le etichette `.pill.si` sono ora piene con testo scuro (leggibili); stesso verde nel badge 'acceso'.
-- 0.8.1 (bug): la regola `.riga span:first-child` colorava di grigio le etichette (pill) prime nella riga; ora `.riga>span:first-child`, quindi 'Problema', 'da configurare' ecc. tornano rossi e 'OK' verde.
-- 0.8.2: le etichette di stato nelle schede vanno a capo sotto il titolo a qualsiasi larghezza (prima solo sotto 720px: su Safari desktop con 5 schede strette sbordavano).
-- 0.8.3: nelle schede della dashboard l'etichetta di stato sta SEMPRE sotto il titolo (classe ch-st; spazio riservato se vuota). 'Spento'/'Problema' sono rossi pieni ovunque (.pill.off/.bad = stesso rosso del badge), 'IN USO'/'IN CORSO' (resistenza, sbrinamento) gialli come il badge sbrinamento.
-- 0.8.4 (bug): l'ultimo intervallo di 5 min (senza ancora il campione del compressore, che SmartThings consegna in ritardo) veniva classificato 'riposo' => Acqua calda 'Standby' durante un ciclo ACS. Ora gli ultimi 15 min senza campione ereditano lo stato dell'ultimo campione noto (calcola_modi); modo_corrente guarda 20 min indietro.
-- 0.9: pagina **Dispositivi** (sorgenti/7_dispositivi.py): schede PdC (da SmartThings: ocf, deviceIdentification, softwareVersion, driver, softwareUpdate; una volta l'ora GET /devices/{id} per data di registrazione) e Smarther (Netatmo homestatus + homesdata orario: firmware_revision, id modulo = MAC, wifi_strength, setup_date); serie `info.pdc.*` e `info.nt.*` nella tabella `stati` (lo storico delle versioni e' la sua cronologia dei cambi); IP/MAC opzionali da config (`dispositivi.ip_*`, MAC via ARP, cache 10 min); modello Smarther dal catalogo BTicino (menu); loghi dalla cartella `loghi/` accanto allo script (NON forniti: i marchi sono di terzi), route `/loghi/<nome>` con whitelist di nomi/estensioni e CSP sandbox per gli SVG; badge Online/Offline in 'Stato del sistema' (+ riga Smarther); campo di tipo `scelta` nelle Impostazioni. Test: /tmp/t/d9 (t1 dati, t2 web/sicurezza, t3 screenshot).
-
-## 0.9.1
-- Stato "In funzione/A riposo": se il campione del compressore e' in ritardo (SmartThings), si tiene l'ultimo campione vero fino a 30 min (prima 15, e partiva da celle gia' dedotte). Se il compressore e' davvero fermo (0 Hz) torna subito a riposo.
-
-## 0.9.2
-- Logo Smarther nel titolo della card Casa: altezza 17px -> 12px, allineato al testo.
-
-## 0.9.3
-- Dispositivi: tolti i loghi piccoli bticino/netatmo sotto il titolo; il logo BTicino sta nella riga "Produttore" (con la nota "con Netatmo"). Logo Smarther a 26px.
-- Cache: indirizzi di stile/script con impronta del contenuto (app.js?v=...) e ricarica automatica delle pagine rimaste aperte quando lo script viene aggiornato (intestazione X-Pdc-Build).
-
-## 0.10
-- Nuova scheda "Installatore" dentro Dispositivi (#/dispositivi/installatore): impostazioni FSV lette dalla pompa, in sola lettura, per menu, con nome italiano, intervallo del manuale, "fuori limiti", ultimo cambio e Copia elenco. Tolto il badge "modificato" (rumore: la curva climatica e' sempre regolata dall'installatore). Nuove sotto-pagine: percorso #/pagina/sotto.
-- Etichette dei codici scritte da me; significati dal manuale EHS Mono (guida FSV di Dwellsee). Default indicativi (variano per modello).
-- Installatore: etichette con "temperatura" esplicita; significati dei valori (2091/2092/2093, 3011, 4011, 4021, 4022, 4041, 4051, 3071) verificati sul manuale Samsung del telecomando cablato MWR-WW10N (modalita' Field Setting).
-
-## 0.11
-- Comandi: interruttori accendi/spegni per Riscaldamento casa (SmartThings, componente INDOOR), Acqua calda (componente main) e Termostato Smarther (Netatmo: setroomthermpoint off/home, ripiego setthermmode hg/schedule) nella card "Stato del sistema". Lucchetto da sbloccare (30 s), conferma allo spegnimento, nessuno stato "in attesa" (l'interruttore resta dove lo metti, il pannello rilegge dopo 4 e 20 s). Registro in Dispositivi (non Telegram). Niente interruttore generale, accessibile anche da fuori.
-- Richiede token con permesso di comando: SmartThings x:devices:*, Netatmo write_smarther. pdc_strumenti.py st-oauth ora chiede entrambi gli scope di SmartThings.
-
-
-## 0.11.1 – 0.11.2 (correzioni dopo le prove sui dispositivi veri, 02/11/2026; la 0.11.1 era il primo tentativo sullo Smarther, la 0.11.2 contiene tutto il resto)
-- **Modo casa/acs con compressore in ritardo**: dal dump reale, i campioni ciclo (ogni 5 min) arrivano con 1-2 min di ritardo e il compressore a 0 Hz del campione vecchio faceva dire "Standby" mentre la pompa partiva (valvola passata a "tank" alle 21:43, Hz=50 solo nel campione delle 21:47). Ora, se i campioni dicono riposo ma `risc.acqua` (INDOOR, in tempo reale) sale di >=3 C in 15 min, il modo e' quello della valvola (room=casa, tank=acs). Tenuta dell'ultimo stato noto ridotta da 30 a 10 min. Tolte le regole resistenza/potenza (la pompa non ha resistenza sull'impianto; non c'e' modo di saperlo dall'API).
-- Scheda "Compressore e circuito": "dato di N min fa".
-- **Smarther: due modi di essere spento** (dump reale): dal pannello casa `therm_mode=hg` + stanza `home` a 7 C; dall'app stanza `therm_setpoint_mode=hg` + casa `schedule`. Lettura: spento se stanza off/hg O casa hg. `homesdata` riletto ogni 2 min (prima 1 h) e subito dopo ogni comando. NON si usa piu' il setpoint <= 9 (insensato per un manuale basso).
-- **Comandi Smarther**: `setstate` con `therm_mode` nella casa NON esiste (errore 21 "should NOT have additional properties"). `setroomthermpoint` accetta solo manual/max/home. Strada giusta: spegni = `setthermmode hg`; accendi = `setthermmode schedule` + `setstate` stanza `therm_setpoint_mode: home`. Ogni tentativo e' seguito da una verifica (homesdata+homestatus dopo 3 s): una risposta "ok" non basta (setstate stanza rispondeva ok senza fare nulla). Il registro riporta strada riuscita e scartate.
-- UI comandi: badge giallo ATTENDI... durante il comando (richiesta dell'utente, rispetto alla scelta iniziale di non avere uno stato di attesa); lo sblocco da 30 s riparte a ogni azione; registro a pagine da 5 (fino a 100 comandi in memoria).
-- Costo energia: `tariffa.prezzo_kwh` (Impostazioni); costo nell'energia della Dashboard, costo stimato nell'Efficienza e costo medio di un ciclo acqua calda.
-- Esporta CSV (`/api/esporta.csv?tipo=giorni|misure`), formato per Excel italiano.
-- Backup notturno (`backup.*`, sorgenti/6_manutenzione.py: `fai_backup`, API di backup di sqlite3) e comando `backup`; rotazione delle ultime N copie.
-- Idee scartate dall'utente: modalita'/temperatura ACS dal pannello, Smarther manuale/assente, nuovi allarmi Telegram. Badge Energia: resta "Consumo".
-- Test: /tmp/t/d9 (t9 UI comandi, t10 comandi con rete simulata), /tmp/t/tg (regressione 4,5,7,9).
-- Changelog: pagina #/changelog (fuori dalla barra del telefono: voce piccola sopra 'Esci' sul desktop, link in Impostazioni > Stato). I testi stanno in `CHANGELOG` in sorgenti/web/app.js: **aggiungere una voce a ogni consegna** (la piu' recente in cima, italiano semplice). Prima della 0.9 e' ricostruita dai 'pezzi' 1-7 e dalle note 0.8.x del piano, senza date.
-- Diagnostica ritardo ciclo: `ServizioST._misura_ritardo` salva `diag.ritardo_ciclo` (s tra l'ora del campione e quella di arrivo, solo per campioni nuovi, meta `ciclo_ultimo_ts`); la Dashboard mostra tipico/massimo 24 h (`ritardo_ciclo` in /api/dashboard, serve >= 5 misure). Motivo: 'dato di 17 min fa' a pompa ferma, che dopo il riavvio del pannello risultava subito 'aggiornato' => sospetto che /status restituisca dati vecchi per un po' (cache SmartThings?) o che il pannello perda campioni. Da verificare con i numeri veri; se il massimo e' alto valutare il comando `refresh` della capability.
-
-
-## 0.12 (03/11/2026)
-- **Confronta** (Efficienza): `/api/efficienza?confronta=1` aggiunge `prec` (stessa durata, finestra da-durata..da: tot, copertura, cicli, bollitore, nodati_min, dati_da, completo). Pulsante `.conf-btn`, stato `S.confronto` non salvato (spento a ogni apertura).
-- **Salute del bollitore**: `calcola_bollitore` in 2_web.py. Perdita notturna = °C/h nella finestra 23-06 piu' lunga (>=3 h) senza cicli ACS, W = °C/h * litri * 1.163; salita = mediana °C/h dai cicli ACS e minuti per 10 C. None se <2 notti/cicli. Config `bollitore.litri`.
-- **Registro** (Impostazioni, tab `#/impostazioni/registro`): `/api/registro` (4_impostazioni.py) con ultime righe del log ripulite da segreti (`pulisci_riga`), pesi di db/log, stato backup.
-- **ripristina** (`cmd_ripristina`, 6_manutenzione.py): richiede il blocco istanza (rifiuta se il pannello e' acceso); copie validate (integrity_check + tabelle) aprendole `mode=ro&immutable=1`; copia di sicurezza del db attuale con l'API backup di sqlite3 (include il -wal), poi cancella -wal/-shm e sostituisce con `os.replace`; config.json opzionale (default no) con copia di sicurezza.
-- Versione 0.12 scelta perche' ci sono funzioni nuove; l'utente puo' cambiarla.
-
-## 0.12.1 (03/11/2026, robustezza)
-- Audit con pyflakes/bandit (solo falsi positivi) e misure su db da 2 M righe: pagine <0,3 s, niente da ottimizzare. Gzip non aggiunto (lo fa Cloudflare).
-- Sicurezza: `riservato()` chmod 600 su config.json (e tmp, copie di backup); Content-Length negativo respinto (login e API); controllo Origin nel login; HSTS se https; `Diffusione.MAX_FLUSSI=20` (503); BUILD con sha256.
-- Stabilita': `Raccoglitore.run` non muore piu' se perfino `eventi.apri` fallisce (disco pieno); stessa protezione per `Sentinella` e `_guardia` del tunnel (supervisore + `_guardia_interna`); `ErroreDB` con messaggio che rimanda a `ripristina`, `App(tollera_db=True)` per il comando ripristina; `ripristina` copia il db guasto com'e' se l'API di backup fallisce; `Config._scrivi` con fsync.
-- SSE: `collega()` riapre il canale (Safari non riprova da solo); il server manda `event: ping` ogni 15 s, il client riapre dopo 45 s di silenzio, al ritorno sulla scheda, su pageshow/online.
-- Non provato: database bloccato da un altro processo per >30 s.
-
-## 0.13 (03/11/2026, Impostazioni in tab)
-- Tab: Stato, Collegamenti (collegamenti + dispositivi), Avvisi (telegram, orari, testi, soglie allarmi), Accesso (password + Cloudflare), Dati (tariffa, bollitore, backup, storico), Registro. Sottopagine via hash `#/impostazioni/<tab>`; il server assegna `tab` a ogni sezione (`TAB_SEZIONI` in 4_impostazioni.py), nuove sezioni `bollitore.litri` e `backup.attivo/copie`.
-- Riquadri = `<details class="card imp riq" data-id>`, stato aperto/chiuso in localStorage (`pdc_imp_aperti`); di default chiusi, tranne il primo di ogni tab. Una sola barra Salva per tutti i tab; `mostraCampo` apre i riquadri e cambia tab per un errore di validazione.
-- Cloudflare: `POST /api/cloudflare/telegram` + pulsante (il bot Telegram resta solo in invio, niente comandi in arrivo).
-- Avvio: `indirizzi()` mostra solo rete di casa e, se configurato, l'indirizzo Cloudflare. UI: `daQuanto()` per «acceso da».
-
-## 0.13.1 (03/11/2026, rifiniture)
-- Dispositivi su telefono (<=560 px): `.dev-head` a griglia (logo | stato sulla stessa riga, titolo/sottotitolo sotto), logo in casella fissa 28 px di altezza con object-fit (un SVG senza dimensioni intrinseche si sovrapponeva al testo con `height:auto`); `Wi-Fi` con trattino non separabile nelle etichette.
-- Analisi: gruppi `casa` = «Temperatura ambiente · Smarther», `umid` = «Umidità · Smarther». Dashboard: la scheda resta «Casa · logo Smarther» (il titolo lungo mandava a capo il logo).
-
-## 0.14 (03/11/2026, umidita')
-- Config `umidita` {giallo 60, rosso 70, minuti 30, rientro_punti 2}: unica fonte per Telegram, Dashboard (`#c-um.um-giallo/.um-rosso`) e grafico Analisi (linee tratteggiate, `soglie_umidita` in /api/dashboard casa e /api/analisi, `soglie_umidita(app)` in 2_web.py). Impostazioni: riquadro «Umidità in casa» nel tab Avvisi, con controllo rosso > giallo in `salva_impostazioni`.
-- Allarmi `umidita_alta` (avviso) e `umidita_molto_alta` (errore) in `Sentinella.valuta`, solo `attivo` e ritardo Telegram nella loro scheda; isteresi: restano aperti finche' umidita' > soglia - rientro_punti, poi i soliti 10 min di calma. Dato: `casa.umidita` (max 30 min di eta').
-- Le linee nel grafico si disegnano solo se i dati arrivano a meno di 10 punti dalla soglia (per non schiacciare la scala).
-
-## 0.14.1 (03/11/2026, riepilogo con la notte)
-- `Sentinella._finestra_notte/_notte_righe`: nel riepilogo (solo li', niente messaggio a parte) la sezione «Di notte» con: temperatura casa (min/max se escursione >= `telegram.silenzio_notturno.oscillazione_gradi`, 2 C), umidita' massima se sopra la soglia gialla, eventi aperti nella finestra (anche gia' chiusi). Finestra = ultimo silenzio notturno finito; se il riepilogo e' prima della fine del silenzio, la notte in corso fino a ora. Con silenzio notturno spento non c'e' sezione.
-- Nota: i messaggi di notte arrivano comunque, senza suoneria (`disable_notification`); gli errori gravi suonano a meno di `anche_errori`.
-
-## 0.14.2 (03/11/2026, grafici)
-- Potenza (Analisi, <= 3 giorni): `q_potenza_a_gradini` usa `en.finestra_s` per disegnare ogni rapporto come tratto [fine - finestra, fine] a valore costante (continuo a gradini); senza finestra resta il punto. Causa dello spezzettamento: un punto ogni ~15 min con tolleranza `buco` di ~1000 s, quindi la linea si interrompeva fra quasi tutti i punti (per 'pot' ora 3600 s).
-- Puntini al passaggio del mouse: `.cur-d` per linea, `valoreInterp` (interpolazione fra punti vicini, nessun puntino nei buchi), scala letta da `data-lo/hi/t0/ph/buco` dell'SVG.
-- Riepilogo «Modo di funzionamento»: «casa» -> «riscaldamento» (la legenda resta «Riscaldamento casa»).
-
-## 0.15 (03/11/2026, grafico del circuito)
-- `GRUPPI_ANALISI`: i gruppi `comp`, `portata`, `pompa` sono sostituiti da `circuito` ("Compressore, portata e pompa"). Le serie possono avere 3 campi extra `(unita, asse, area)`; `/api/analisi` li espone per linea (`u`, `asse`, `area`) e per gruppo (`gradini`).
-- `graficoLineare`: se una linea ha `asse: 1` il grafico ha due scale (destra con numeri colorati come la linea, senza griglia). `percorsoGradini`/`segmentiGradini`: gradini centrati a meta' strada fra due punti, pezzi staccati dove il buco supera `buco`; l'area (compressore) e' chiusa sulla linea dello zero.
-- Puntini al passaggio del mouse: per i gradini `valoreGradino` (valore del punto piu' vicino, se non c'e' un buco), `data-mezzo` sull'svg; ogni puntino ha `data-a` per scegliere la scala. La legenda usa l'unita' di ogni linea (`l.u`).
-- Il target mandata resta com'e' (linea morbida), da rivedere.
-- Dashboard, scheda "Compressore e circuito": con compressore a 0 Hz mostra lo stato "Fermo" e tre riquadri (`.fermo-w`: per cosa, durata, energia) dell'ultimo ciclo concluso; l'API espone `ultimo_ciclo` {inizio, fine, modo, kwh} (da `cicli_compressore`, ultimi 3 giorni; kWh dal contatore `en.totale_wh`, omessi se non leggibili). Le tessere e la nota sul ritardo restano solo con compressore attivo; l'etichetta "dato di N min fa" a compressore fermo compare solo oltre 20 min.
-- La tessera "Gas di scarico" si mostra solo se `prestazioni.scarico` ha un valore (sulla pdc dell'utente e' sempre assente).
-- Grafico "Temperatura ambiente · Smarther": `fasceRichiesta` fonde i campioni consecutivi in blocchi; oltre alla tinta leggera c'e' una striscia piena (7 px) sul fondo del riquadro. La legenda ha `richiestaLegenda` ("Richiesta caldo si/no" all'ora del cursore, o ultimo valore).
-- Nota sul ritardo (`#prest-rit`): ora HTML con `.nw` (nowrap) su ogni gruppo, titolo su una riga a parte.
-
-## 0.16 (03/11/2026, cartelle)
-- Nuova disposizione: radice = `pdc_pannello.py`, `pdc_strumenti.py`, `config.json`; `dati/` (pdc.db, backup/, loghi/, demo.db; i file da mandare in chat stanno in `diagnostica/`, vedi 0.17), `log/` (pdc_pannello.log, cloudflared.log), `cloudflared/` (exe + cloudflared.pid). Default: `generale.database = "dati/pdc.db"`, `backup.cartella = "dati/backup"`.
-- `riordina_cartelle(base, cfg)` (1_nucleo.py), chiamata da `main()` prima di `imposta_log` (non in demo): sposta con `os.replace` (stesso disco = rinomina), mai sovrascrive; `_sposta` per cartelle unisce solo i file mancanti. Il database (+ -wal/-shm) e' tutto o niente con rollback. Aggiorna config.json solo se i valori sono i vecchi predefiniti (`pdc.db`, `backup`). Prima di spostare prova a prendere `porta_lock`: se occupata esce con codice 1. Se esistono sia `pdc.db` sia `dati/pdc.db` esce con codice 1 senza toccare nulla. Un file che non si lascia spostare (es. log aperto da un cloudflared rimasto vivo, su Windows) resta dov'era e viene segnalato nel log.
-- `cartelle_loghi(base)`: `dati/loghi` poi la vecchia `loghi` (stessa logica in `elenco_loghi` e `_logo`). `cartella_log(base)` crea `log/`.
-- Provato (`/tmp/t/mig/mig.py`, 21 controlli): layout vecchio completo con WAL aperto, copia accesa, due database, percorso personalizzato, installazione nuova, idempotenza, `backup` e `ripristina` nei nuovi percorsi.
-- Correzione (stessa 0.16): `_pulisci_vecchio` (tunnel) leggeva l'output di `tasklist` come UTF-8; su Windows e' nella tabella OEM e un byte 0x85 faceva fallire la lettura (`stdout` = None, `AttributeError`) e il pannello non partiva. Non emergeva prima perche' il file `cloudflared.pid` veniva sempre rimosso a pannello chiuso; la migrazione l'ha spostato e il controllo e' partito. Ora si legge in byte, ogni errore di questo controllo e' solo un avviso nel registro, e anche `cloudflared --version` e `arp` leggono con `errors="replace"`.
-
-## 0.17 (03/11/2026, aggiornamento a caldo)
-- `costruisci.py` mette un segnalibro `#@@PARTE nome@@` davanti a ogni parte tranne la prima (nucleo = intestazione + 1_nucleo). Nuovo `9_aggiorna.py` (prima di `9_comandi.py`): `_leggi_parti` divide il file, `_impronta` fa lo sha256 di ogni parte (nel nucleo la riga `VERSIONE = "..."` e' normalizzata, cosi' cambiare solo versione non richiede riavvio), `PARTI_CARICATE` = com'era il file all'avvio.
-- Ricaricabili a caldo (`RICARICABILI`): web, impostazioni, dispositivi, controlli. Il resto (nucleo, telegram, cloudflare, manutenzione, aggiorna, comandi) e' "fisso": se cambia, `applica_aggiornamento` rifiuta e dice di riavviare.
-- `applica_aggiornamento(app)`: 1) rilegge il file; 2) rifiuta se e' cambiata una parte fissa; 3) compila ogni parte cambiata (riempita di righe vuote davanti, cosi' i numeri di riga dei messaggi coincidono col file) e se non compila non tocca nulla; 4) imposta `VERSIONE`, esegue le parti con `exec` nei globali del modulo, con istantanea dei globali per tornare indietro se un'esecuzione lancia un'eccezione; 5) ricalcola `BUILD` (le pagine aperte si ricaricano da sole) e mette `app.server_web.RequestHandlerClass = Gestore`: il server non si ferma, ne' si riapre la porta, ne' si chiudono gli SSE.
-- `API` / `API_POST` ora sono `globals().get("API") or {}`: lo stesso dizionario sopravvive alla ricarica (nessuna finestra con rotte vuote) e le rotte delle parti fisse (tunnel, aggiornamento) non si perdono. `avvia_web` salva `app.server_web`; il `finally` di `main` chiude quello. Il flusso SSE esce se riceve l'evento "chiudi" (non ancora usato).
-- Limiti noti: gli oggetti gia' creati restano col codice vecchio (`Sessioni`, `LimiteLogin`, `Diffusione`, `ServerWeb`: se la loro classe cambia serve il riavvio); lo stato di modulo delle parti ricaricate si azzera (`_cache_*`, `_ultimo_comando`); un thread che sta eseguendo una funzione vecchia la finisce col codice vecchio.
-- API: `GET /api/aggiornamento` ({stato: aggiornato|applicabile|riavvio|errore, parti, versione, versione_disco}), `POST /api/aggiornamento/applica`. UI: riquadro «Aggiornamento» in Impostazioni → Stato (controllo ogni 20 s).
-- Prova (`/tmp/t/hot/hot.py`, 17 controlli): modifica a caldo con rotta nuova, nuova versione e BUILD cambiato; errore di sintassi (riga giusta, nulla cambia); eccezione a meta' (ripristino dei globali); cambio nel nucleo (rifiutato); solo numero di versione (nessuna parte cambiata); thread di raccolta finto che scrive ogni 50 ms durante tutto il test: buco massimo 60 ms.
-- Correzione (stessa 0.16/0.17): i file da mandare in chat hanno una cartella a parte, `diagnostica/`: `esporta-diagnostica` scrive `diagnostica/diagnostica.json` e `pdc_strumenti.py` i `dump_*.json`. `riordina_cartelle` sposta li' quelli gia' creati (`dump_*.json` in radice e `dati/diagnostica.json`).
-- Indicatore Dashboard (`modo_istantaneo`, parte web): la regola "l'acqua sta salendo" ora guarda l'acqua in questo momento (+1,5 gradi in 7 minuti e vicina al massimo), non il minimo degli ultimi 15 minuti; nuova regola di stop (acqua scesa di 1 grado dal massimo recente e nessun campione recente con compressore in marcia). La causa principale del ritardo resta da confermare con diagnostica.json (arrivo dei campioni dopo lo stop) e un nuovo st-dump.
+### Da fare
+- (nessuna richiesta aperta dell'utente; fatte nella 0.18: refresh opzionale e «Azzera database»; fatti dall'utente il riavvio completo e il controllo del ritardo con il refresh acceso)
+- GitHub aggiornato alla 0.19 (04/11). Solo su richiesta: nuovo zip (documenti: README/PIANO non nominano ancora le sezioni Telegram riordinate, il layout a due colonne, le righe «nessun dato» nei grafici e la compressione). La pagina Dispositivi va bene così (confermato dall'utente).
+- Scartate dall'utente (3/11): host solo 127.0.0.1 e riduzione della dimensione del file.
+- DECISA, da fare dopo aver raccolto altre idee (3/11): stima del costo del mese in corso + confronto con il mese scorso (usa `tariffa.prezzo_kwh`; da proporre prima dove metterla: Efficienza o Dashboard).

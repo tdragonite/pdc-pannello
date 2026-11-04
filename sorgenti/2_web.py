@@ -5,6 +5,7 @@
 # ==========================================================================
 
 import bisect
+import gzip
 import hmac
 import math
 import queue
@@ -423,6 +424,506 @@ def modo_istantaneo(db, ora, tol, valvola):
     return modo
 
 
+# --------------------------------------------------------------------------
+# Meteo del giorno (Open-Meteo, due modelli): una riga nella card «Esterna»
+# --------------------------------------------------------------------------
+
+METEO_PREDEFINITO = {"latitudine": 45.23, "longitudine": 7.60}         # Cirié; si cambia solo in config.json (sezione "meteo")
+METEO_URL = "https://api.open-meteo.com/v1/forecast"
+METEO_MODELLI = ("italia_meteo_arpae_icon_2i", "ecmwf_ifs025")         # ICON-2I (2 km, modello italiano) + ECMWF come seconda opinione
+METEO_VARIABILI = ("temperature_2m", "precipitation", "cloud_cover", "weather_code", "is_day")
+METEO_SOGLIA_MM = 0.2          # da questa pioggia oraria (mm) in su si considera che piova
+METEO_OGNI = 1800              # secondi fra una lettura e l'altra
+METEO_VECCHIO = 3 * 3600       # dati più vecchi di così non si mostrano più
+_METEO_NEVE = {71, 73, 75, 77, 85, 86}
+_METEO_TEMPORALE = {95, 96, 99}
+
+
+def meteo_config(app):
+    """(latitudine, longitudine) da config.json -> 'meteo'; None se svuotate (il meteo sparisce)."""
+    c = dict(METEO_PREDEFINITO)
+    try:
+        c.update(app.cfg.leggi().get("meteo") or {})
+        return float(c["latitudine"]), float(c["longitudine"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def meteo_scarica(lat, lon, modo=0):
+    """Legge Open-Meteo. modo: 0 = due modelli, 1 = solo ICON-2I, 2 = modello automatico. -> (dati, modo_riuscito)
+    Se Open-Meteo rifiuta la richiesta (per esempio il nome di un modello) si passa al modo successivo."""
+    ultimo = None
+    for m in range(modo, 3):
+        modelli = METEO_MODELLI if m == 0 else METEO_MODELLI[:1] if m == 1 else ()
+        par = {"latitude": f"{lat:.4f}", "longitude": f"{lon:.4f}", "hourly": ",".join(METEO_VARIABILI),
+               "timezone": "Europe/Rome", "timeformat": "unixtime", "forecast_days": 2}
+        if modelli:
+            par["models"] = ",".join(modelli)
+        # se la rete non c'è http_json solleva ErroreAPI: inutile provare gli altri modi, si esce
+        code, js = http_json("GET", METEO_URL + "?" + urlencode(par), {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
+        if code != 200 or not isinstance(js, dict) or "hourly" not in js:
+            ultimo = f"HTTP {code} {str(js)[:120]}"
+            continue
+        try:
+            dati = meteo_leggi(js, modelli)
+        except (KeyError, TypeError, ValueError) as e:
+            ultimo = f"risposta inattesa ({e})"
+            continue
+        if dati["m"]:
+            return dati, m
+        ultimo = "nessun modello con dati"
+    raise ErroreAPI("richiesta", 0, f"Open-Meteo: {ultimo}")
+
+
+def meteo_leggi(js, modelli):
+    """Risposta di Open-Meteo -> {'t': [epoch], 'off': secondi, 'm': {modello: {variabile: [valori]}}}. Con più modelli i nomi hanno il suffisso _<modello>."""
+    h, tempi = js["hourly"], js["hourly"]["time"]
+    out = {}
+    for nome in (modelli or ("auto",)):
+        d = {}
+        for v in METEO_VARIABILI:
+            chiave = next((k for k in ((f"{v}_{nome}", v) if modelli else (v,)) if k in h), None)
+            d[v] = list(h[chiave]) if chiave else [None] * len(tempi)
+        if any(x is not None for x in d["precipitation"]) and any(x is not None for x in d["temperature_2m"]):
+            out[nome] = d
+    return {"t": [int(t) for t in tempi], "off": int(js.get("utc_offset_seconds", 3600)), "m": out}
+
+
+def _ore_intervalli(livelli):
+    """[(inizio, fine_esclusa, livello_massimo)] dei gruppi di ore consecutive con livello > 0."""
+    gr, cur = [], None
+    for i, lv in enumerate(livelli):
+        if lv > 0:
+            if cur is None:
+                cur = [i, i + 1, lv]
+            else:
+                cur[1], cur[2] = i + 1, max(cur[2], lv)
+        elif cur is not None:
+            gr.append(tuple(cur)); cur = None
+    if cur is not None:
+        gr.append(tuple(cur))
+    return gr
+
+
+def _icona_blocco(prim, idx, p):
+    """Icona di un blocco di ore (p: 0 asciutto, 1 pioggia possibile, 2 pioggia certa)."""
+    cod = [prim["weather_code"][i] for i in idx if prim["weather_code"][i] is not None]
+    notte = prim["is_day"][idx[len(idx) // 2]] == 0
+    temp = [prim["temperature_2m"][i] for i in idx if prim["temperature_2m"][i] is not None]
+    if p and any(c in _METEO_TEMPORALE for c in cod):
+        return "temporale"
+    if p and (any(c in _METEO_NEVE for c in cod) or (temp and min(temp) <= 0.5)):
+        return "neve"
+    if p == 2:
+        return "pioggia"
+    if p == 1:
+        return "luna-pioggia" if notte else "sole-pioggia"
+    if cod and sum(1 for c in cod if c in (45, 48)) * 2 > len(cod):
+        return "nebbia"
+    nuv = [prim["cloud_cover"][i] for i in idx if prim["cloud_cover"][i] is not None]
+    media = sum(nuv) / len(nuv) if nuv else 50
+    if media < 20:
+        return "luna" if notte else "sole"
+    if media < 60:
+        return "luna-nuvola" if notte else "sole-nuvola"
+    return "nuvola"
+
+
+def meteo_riassumi(raw, ora):
+    """Dati grezzi -> {giorno, tmin, tmax, icona, testo, livello, ore[...]}. Funzione pura (si prova con dati finti).
+    Pioggia 'certa' = tutti i modelli la prevedono nell'ora; 'possibile' = solo alcuni. Con un modello solo, se la prevede è 'certa'."""
+    tempi, off, modelli = raw["t"], raw["off"], raw["m"]
+    if not tempi or not modelli:
+        return None
+    nomi = list(modelli)
+    prim = modelli[nomi[0]]
+    loc = [t + off for t in tempi]
+    adesso = ora + off
+    oggi = adesso // 86400
+    giorno_idx = oggi + 1 if (adesso % 86400) // 3600 >= 20 else oggi          # dalle 20 la forchetta e la pioggia guardano al giorno dopo (ma la scritta resta «Oggi»)
+    del_giorno = [i for i, l in enumerate(loc) if l // 86400 == giorno_idx]
+    if not del_giorno:
+        return None
+    finestra = [i for i in del_giorno if giorno_idx != oggi or loc[i] // 3600 >= adesso // 3600]
+    temps = [prim["temperature_2m"][i] for i in del_giorno if prim["temperature_2m"][i] is not None]
+    if not temps:
+        return None
+
+    def mm(nome, i):
+        v = modelli[nome]["precipitation"][i]
+        return v if v is not None else 0.0
+
+    n = len(nomi)
+    def livello(i):
+        k = sum(1 for nome in nomi if mm(nome, i) >= METEO_SOGLIA_MM)
+        return 0 if k == 0 else 2 if k == n else 1
+
+    liv = [livello(i) for i in finestra]
+    gruppi = _ore_intervalli(liv)
+    ora_h = lambda i: (loc[i] % 86400) // 3600
+    notte = giorno_idx == oggi and prim["is_day"][finestra[0]] == 0 if finestra else False
+    testo, lvl, codici = "asciutto", "nessuna", []
+    if gruppi:
+        a, b, mx = gruppi[0]
+        lvl = "certa" if mx == 2 else "possibile"
+        ia, ib = ora_h(finestra[a]), ora_h(finestra[b - 1]) + 1
+        in_corso = giorno_idx == oggi and a == 0
+        fino_sera = ib >= 24
+        if in_corso:
+            quando = "per il resto della giornata" if fino_sera else f"fino alle {ib}"
+        else:
+            quando = f"dalle {ia}" if fino_sera else f"alle {ia}" if ib - ia <= 1 else f"{ia}–{ib}"
+        testo = ("pioggia " if lvl == "certa" else "possibile pioggia ") + quando
+        codici = [prim["weather_code"][finestra[j]] for j in range(a, b) if prim["weather_code"][finestra[j]] is not None]
+        freddo = any((prim["temperature_2m"][finestra[j]] or 9) <= 0.5 for j in range(a, b))
+    # icona
+    if gruppi:
+        if any(c in _METEO_TEMPORALE for c in codici):
+            icona = "temporale"
+        elif any(c in _METEO_NEVE for c in codici) or freddo:
+            icona = "neve"
+        elif lvl == "certa":
+            icona = "pioggia"
+        else:
+            icona = "luna-pioggia" if notte else "sole-pioggia"
+    else:
+        diurne = [i for i in (finestra or del_giorno) if 8 <= ora_h(i) <= 19] or (finestra or del_giorno)
+        nuv = [prim["cloud_cover"][i] for i in diurne if prim["cloud_cover"][i] is not None]
+        cod = [prim["weather_code"][i] for i in diurne if prim["weather_code"][i] is not None]
+        media = sum(nuv) / len(nuv) if nuv else 50
+        if cod and sum(1 for c in cod if c in (45, 48)) * 2 > len(cod):
+            icona = "nebbia"
+        elif media < 20:
+            icona = "luna" if notte else "sole"
+        elif media < 60:
+            icona = "luna-nuvola" if notte else "sole-nuvola"
+        else:
+            icona = "nuvola"
+    # dettaglio a blocchi di 3 ore (per il riquadro al tocco): ora d'inizio, temperatura, pioggia del blocco e icona
+    nomi_liv = ("nessuna", "possibile", "certa")
+    dettaglio = []
+    # il dettaglio sono sempre 3 righe da 3 ore a partire da adesso (a sera tarda le ultime due cadono dopo mezzanotte), sotto la scritta «Oggi»
+    fin_det = [i for i in range(len(loc)) if loc[i] // 3600 >= adesso // 3600][:9]
+    liv_det = [livello(i) for i in fin_det]
+    for j in range(0, len(fin_det), 3):
+        blocco = list(range(j, min(j + 3, len(fin_det))))
+        idx = [fin_det[k] for k in blocco]
+        p = max(liv_det[k] for k in blocco)
+        mm_blocco = sum(max(mm(nome, i) for nome in nomi) for i in idx)
+        dettaglio.append({"h": ora_h(idx[0]), "t": prim["temperature_2m"][idx[0]], "mm": round(mm_blocco, 1),
+                          "p": nomi_liv[p], "i": _icona_blocco(prim, idx, p)})
+        if len(dettaglio) >= 3:
+            break
+    return {"giorno": "Oggi", "tmin": min(temps), "tmax": max(temps),
+            "icona": icona, "testo": testo, "livello": lvl, "ore": dettaglio, "modelli": n}
+
+
+def _meteo_lavoro(app, lat, lon):
+    st = app.meteo_st
+    try:
+        dati, modo = meteo_scarica(lat, lon, st["modo"])
+        st.update(raw=dati, ts=int(time.time()), modo=modo, falliti=0, prossimo=int(time.time()) + METEO_OGNI)
+        if modo:
+            log.info("Meteo: Open-Meteo non ha dato due modelli, uso la modalità %d", modo)
+    except Exception as e:
+        st["falliti"] += 1
+        st["prossimo"] = int(time.time()) + min(300 * st["falliti"], METEO_OGNI)
+        (log.warning if st["falliti"] == 1 else log.debug)("Meteo: lettura non riuscita (%s)", e)
+    finally:
+        st["occupato"] = False
+
+
+def meteo_demo(ora):
+    """Previsione finta per la modalità demo: dalle 17 pioggia (i due modelli concordano), poi asciutto."""
+    off = 3600
+    inizio = (ora + off) // 86400 * 86400 - off
+    tempi = [inizio + h * 3600 for h in range(48)]
+    def serie(f):
+        return [f(h % 24) for h in range(48)]
+    base = {"temperature_2m": serie(lambda h: round(9 + 8 * max(0.0, 1 - abs(h - 15) / 9), 1)),
+            "cloud_cover": serie(lambda h: 30 if h < 14 else 85), "weather_code": serie(lambda h: 3 if h < 17 else 63),
+            "is_day": serie(lambda h: 1 if 7 <= h <= 18 else 0)}
+    a = dict(base, precipitation=serie(lambda h: 0.0 if h < 17 or h > 20 else 1.2))
+    b = dict(base, precipitation=serie(lambda h: 0.0 if h < 18 or h > 21 else 0.8))
+    return {"t": tempi, "off": off, "m": {METEO_MODELLI[0]: a, METEO_MODELLI[1]: b}}
+
+
+def meteo_info(app):
+    """Riassunto del meteo per la Dashboard, o None. La lettura di Open-Meteo parte in un thread (mai nella richiesta della pagina)."""
+    cfg = meteo_config(app)
+    if not cfg:
+        return None
+    ora = int(time.time())
+    if app.demo:
+        r = meteo_riassumi(meteo_demo(ora), ora)
+        return dict(r, agg=ora, modelli_nomi=list(METEO_MODELLI)) if r else None
+    st = app.__dict__.setdefault("meteo_st", {"raw": None, "ts": 0, "prossimo": 0, "occupato": False, "modo": 0, "falliti": 0})
+    if ora >= st["prossimo"] and not st["occupato"]:
+        st["occupato"], st["prossimo"] = True, ora + 60
+        threading.Thread(target=_meteo_lavoro, args=(app, *cfg), daemon=True, name="meteo").start()
+    if not st["raw"] or ora - st["ts"] > METEO_VECCHIO:
+        return None
+    r = meteo_riassumi(st["raw"], ora)
+    return dict(r, agg=st["ts"], modelli_nomi=list(st["raw"]["m"])) if r else None
+
+
+# --------------------------------------------------------------------------
+# Stima: quando riparte il riscaldamento (dalla discesa della temperatura in casa)
+# --------------------------------------------------------------------------
+# Idea: a riscaldamento fermo la casa si raffredda come un corpo caldo in una stanza fredda, T(t) = E + (T0 - E) * exp(-k t),
+# con E la temperatura esterna. Dallo storico ricavo k (quanto "tiene" la casa), di quanto sale ancora la temperatura dopo che lo
+# Smarther smette di chiedere (inerzia del pavimento) e a quanti gradi sotto il target riparte. Poi dalla temperatura di adesso
+# calcolo quando arrivera' a quella soglia. Si ricalcola dallo storico (ultimi 45 giorni, pesando di piu' i piu' recenti).
+RIP_PASSO = 300           # secondi per cella
+RIP_GIORNI = 45           # finestra dello storico
+RIP_MEZZAVITA = 14.0      # giorni: dopo tanto un campione pesa la meta'
+RIP_MIN_CAMPIONI = 5      # senza almeno cosi' tante discese vere la stima non compare
+RIP_TRATTO = 18           # celle (90 minuti) dell'ultimo tratto su cui si misura k
+RIP_MAX_ORE = 12          # oltre questo orizzonte la stima non e' credibile
+
+
+def _med_pesata(vals, pesi):
+    """Mediana pesata: robusta, non si fa spostare da una discesa strana."""
+    coppie = sorted(zip(vals, pesi))
+    meta = sum(p for _, p in coppie) / 2.0
+    acc = 0.0
+    for v, p in coppie:
+        acc += p
+        if acc >= meta:
+            return v
+    return coppie[-1][0]
+
+
+def ripartenza_campioni(T, R, E, S, ok, fine, diag=None):
+    """Cerca nelle celle (dict cella -> valore) le discese a riscaldamento fermo e ne ricava i campioni.
+    T temperatura casa, R richiesta calore (0/1), E esterna, S target, ok(cella) -> True se lo Smarther era in programma.
+    Un campione = una pausa della richiesta, tra due accensioni, di almeno un'ora, con dati completi.
+    diag (opzionale, per 'pdc_strumenti.py rip-diag'): lista in cui annotare ogni pausa trovata e perche' e' valida o scartata."""
+    campioni = []
+    celle = sorted(R)
+    if not celle:
+        return campioni
+    i = 0
+    n = len(celle)
+    while i < n:
+        b = celle[i]
+        # acceso da almeno 3 celle consecutive, poi spento: e' la fine di un ciclo di riscaldamento
+        if R[b] >= 0.5:
+            j = i
+            while j + 1 < n and celle[j + 1] == celle[j] + 1 and R[celle[j + 1]] >= 0.5:
+                j += 1
+            if j - i + 1 >= 3 and j + 1 < n and celle[j + 1] == celle[j] + 1 and R[celle[j + 1]] < 0.5:
+                s = celle[j + 1]                     # prima cella spenta
+                k = j + 1
+                while k + 1 < n and celle[k + 1] == celle[k] + 1 and R[celle[k + 1]] < 0.5:
+                    k += 1
+                # k = ultima cella spenta; la pausa e' valida solo se poi lo Smarther RIPARTE (cella successiva accesa)
+                riparte = k + 1 < n and celle[k + 1] == celle[k] + 1 and R[celle[k + 1]] >= 0.5
+                if riparte and celle[k] - s + 1 >= 12:
+                    e = celle[k + 1]
+                    mot = []
+                    c = _campione(T, E, S, ok, s, e, mot)
+                    if c:
+                        c["cella"] = e
+                        campioni.append(c)
+                    if diag is not None:
+                        diag.append({"da": s * RIP_PASSO, "a": e * RIP_PASSO, "valida": bool(c), "motivo": None if c else (mot[0] if mot else "scartata"),
+                                     "k": c["k"] if c else None, "sovra": c["sovra"] if c else None, "scarto": c["scarto"] if c else None})
+                elif diag is not None:
+                    if not riparte:
+                        mot = "la pausa non e' finita (lo Smarther non e' ancora ripartito) o ci sono buchi nei dati"
+                    else:
+                        mot = "pausa troppo corta (%d min, ne servono almeno 60)" % ((celle[k] - s + 1) * RIP_PASSO // 60)
+                    diag.append({"da": s * RIP_PASSO, "a": (celle[k] + 1) * RIP_PASSO, "valida": False, "motivo": mot,
+                                 "k": None, "sovra": None, "scarto": None})
+                i = k + 1
+                continue
+            i = j + 1
+            continue
+        i += 1
+    return campioni
+
+
+def _campione(T, E, S, ok, s, e, motivo=None):
+    """Una pausa [s, e): s prima cella spenta, e cella in cui lo Smarther riparte.
+    motivo (opzionale): lista in cui annotare perche' la pausa viene scartata (per la diagnostica)."""
+    def no(m):
+        if motivo is not None:
+            motivo.append(m)
+        return None
+    tutte = range(s, e + 1)
+    pres = sum(1 for x in tutte if x in T)
+    if pres < 0.85 * len(tutte):
+        return no("dati di temperatura incompleti (%d%% delle celle, ne servono almeno 85%%)" % (100 * pres // len(tutte)))
+    if not all(ok(x) for x in (s, e)):
+        return no("lo Smarther non era in modo programma/casa all'inizio o alla fine della pausa")
+    t0 = T.get(s - 1, T.get(s))
+    if t0 is None:
+        return no("manca la temperatura prima dello stop")
+    # picco: il massimo nella prima ora e mezza (il pavimento continua a cedere calore dopo lo stop)
+    fin = min(e - 1, s + 17)
+    cand = [(T[x], x) for x in range(s, fin + 1) if x in T]
+    if not cand:
+        return no("nessun dato di temperatura nella prima ora e mezza dopo lo stop")
+    tpk, pk = max(cand)
+    dur_h = (e - pk) * RIP_PASSO / 3600.0
+    te = T.get(e)
+    if te is None:
+        return no("manca la temperatura nel momento della ripartenza")
+    if dur_h < 0.75:
+        return no("discesa troppo breve (%.1f h dal picco, ne servono 0,75)" % dur_h)
+    # k si misura sull'ultimo tratto della discesa (al massimo 90 minuti prima della ripartenza): e' quello che conta per
+    # prevedere quando riparte, e li' la curva e' piu' vicina a un'esponenziale che subito dopo il picco
+    q = max(pk, e - RIP_TRATTO)
+    tq = T.get(q)
+    if tq is None:
+        return no("manca la temperatura all'inizio dell'ultimo tratto di discesa")
+    dq_h = (e - q) * RIP_PASSO / 3600.0
+    es = [E[x] for x in range(q, e + 1) if x in E]
+    if dq_h < 0.5:
+        return no("ultimo tratto di discesa troppo corto (%d min, ne servono 30)" % (dq_h * 60))
+    if len(es) < 0.7 * (e - q + 1):
+        return no("dati della temperatura esterna incompleti nell'ultimo tratto")
+    em = sum(es) / len(es)
+    if tq - em < 3 or te - em < 3:
+        return no("troppo poca differenza tra casa e esterno (casa %.1f / %.1f, esterna %.1f: servono almeno 3 gradi)" % (tq, te, em))
+    if tq <= te + 0.05:
+        return no("la temperatura non scende nell'ultimo tratto (da %.1f a %.1f)" % (tq, te))
+    k = math.log((tq - em) / (te - em)) / dq_h
+    if not (0.003 <= k <= 1.0):
+        return no("coefficiente di raffreddamento fuori dai limiti (k=%.3f, ammessi 0,003-1,0)" % k)
+    bers = S.get(e)
+    return {"k": k, "sovra": max(0.0, tpk - t0), "coda_min": (pk - s) * RIP_PASSO / 60.0,
+            "scarto": (bers - te) if bers is not None else None, "te": te}
+
+
+def ripartenza_fit(campioni, ora, diag=None):
+    """Dai campioni ai parametri: k (1/ora), sovraelongazione, durata della coda, soglia di ripartenza."""
+    if len(campioni) < RIP_MIN_CAMPIONI:
+        if diag is not None:
+            diag.setdefault("motivi", []).append("storico insufficiente: %d pause valide su %d necessarie" % (len(campioni), RIP_MIN_CAMPIONI))
+        return None
+    pesi = [0.5 ** (max(0.0, ora - c["cella"] * RIP_PASSO) / 86400.0 / RIP_MEZZAVITA) for c in campioni]
+    if diag is not None:
+        diag["peso"] = sum(pesi)
+    if sum(pesi) < 3.0:
+        if diag is not None:
+            diag.setdefault("motivi", []).append("pause valide troppo vecchie (peso %.1f, ne servono almeno 3,0): servono dati piu' recenti" % sum(pesi))
+        return None
+    scarti = [(c["scarto"], p) for c, p in zip(campioni, pesi) if c["scarto"] is not None]
+    assoluti = [(c["te"], p) for c, p in zip(campioni, pesi)]
+    return {"k": _med_pesata([c["k"] for c in campioni], pesi),
+            "sovra": _med_pesata([c["sovra"] for c in campioni], pesi),
+            "coda_min": _med_pesata([c["coda_min"] for c in campioni], pesi),
+            "scarto": _med_pesata([v for v, _ in scarti], [p for _, p in scarti]) if scarti else None,
+            "soglia": _med_pesata([v for v, _ in assoluti], [p for _, p in assoluti]),
+            "n": len(campioni)}
+
+
+def ripartenza_eta(fit, ora, t_casa, esterna, target, spenta_da, t_alla_fine, diag=None):
+    """Quando la temperatura in casa arrivera' alla soglia di ripartenza: ora in secondi, oppure None.
+    spenta_da = secondi da quando lo Smarther ha smesso di chiedere; t_alla_fine = temperatura in quel momento."""
+    if not fit or t_casa is None or esterna is None:
+        return None
+    soglia = (target - fit["scarto"]) if (fit["scarto"] is not None and target is not None) else fit["soglia"]
+    t_rif, t_ora = t_casa, ora
+    if spenta_da is not None and t_alla_fine is not None and spenta_da < fit["coda_min"] * 60:
+        # il pavimento sta ancora cedendo calore: la temperatura salira' ancora fino al picco tipico
+        t_rif = max(t_casa, t_alla_fine + fit["sovra"])
+        t_ora = ora + (fit["coda_min"] * 60 - spenta_da)
+    if diag is not None:
+        diag.update({"soglia": soglia, "t_rif": t_rif})
+    if soglia - esterna < 1 or t_rif - esterna < 1:
+        if diag is not None:
+            diag["motivo"] = "casa o soglia troppo vicine alla temperatura esterna (%.1f / %.1f / esterna %.1f)" % (t_rif, soglia, esterna)
+        return None
+    if t_rif <= soglia:
+        if diag is not None:
+            diag["motivo"] = "la casa e' gia' sotto la soglia di ripartenza (%.1f contro %.1f): lo Smarther dovrebbe ripartire subito" % (t_rif, soglia)
+        return None
+    ore = math.log((t_rif - esterna) / (soglia - esterna)) / fit["k"]
+    eta = t_ora + ore * 3600
+    if eta - ora > RIP_MAX_ORE * 3600:
+        if diag is not None:
+            diag["motivo"] = "la ripartenza e' troppo lontana (%.1f ore, oltre il limite di %d)" % ((eta - ora) / 3600.0, RIP_MAX_ORE)
+        return None
+    return max(eta, ora)
+
+
+def _celle_sql(db, serie, da, a, funz):
+    """{cella: valore} con una sola query: media (o massimo) per cella di 5 minuti."""
+    with closing(db._c()) as c:
+        righe = c.execute(f"SELECT ts/{RIP_PASSO} AS b, {funz}(valore) FROM misure WHERE serie=? AND ts BETWEEN ? AND ? "
+                          "GROUP BY b", (serie, int(da), int(a))).fetchall()
+    return {b: v for b, v in righe if v is not None}
+
+
+def stima_ripartenza(app, ora, t_casa, ts_casa, richiesta, esterna, target, diag=None):
+    """Orario (in secondi, arrotondato al quarto d'ora) in cui il riscaldamento dovrebbe ripartire, oppure None.
+    Si calcola solo a richiesta spenta, con dato fresco e con abbastanza discese vere nello storico.
+    diag (opzionale, un dict): se c'e', si riempie con le pause trovate, i parametri e il primo motivo per cui la stima manca;
+    in quel caso non si usa la cache. Serve a 'pdc_strumenti.py rip-diag'."""
+    def no(m):
+        if diag is not None:
+            diag.setdefault("motivi", []).append(m)
+            diag.setdefault("motivo", m)
+        return None
+    blocco = None
+    if richiesta:
+        blocco = "lo Smarther sta chiedendo calore adesso: la stima si fa solo a richiesta spenta"
+    elif t_casa is None:
+        blocco = "manca la temperatura della casa"
+    elif esterna is None:
+        blocco = "manca la temperatura esterna"
+    elif ts_casa is None or ora - ts_casa > 900:
+        blocco = "il dato della casa e' vecchio (%s): serve piu' recente di 15 minuti" % ("mai ricevuto" if ts_casa is None else "%d min" % ((ora - ts_casa) // 60))
+    if blocco:
+        no(blocco)
+        if diag is None:
+            return None
+    db = app.db
+    cache = None if diag is not None else app.__dict__.get("rip_cache")
+    if not cache or ora - cache["ts"] > 600:
+        da = ora - RIP_GIORNI * 86400
+        T = _celle_sql(db, "casa.temperatura", da, ora, "AVG")
+        R = _celle_sql(db, "casa.richiesta_calore", da, ora, "MAX")
+        E = _celle_sql(db, "ciclo.esterna", da, ora, "AVG")
+        S = _celle_sql(db, "casa.setpoint", da, ora, "AVG")
+        cambi = q_cambi(db, "casa.modo", da, ora)
+
+        def ok(b):
+            m = stato_a(cambi, b * RIP_PASSO)
+            return m in (None, "schedule", "home")
+        pause = [] if diag is not None else None
+        campioni = ripartenza_campioni(T, R, E, S, ok, ora // RIP_PASSO, pause)
+        fit = ripartenza_fit(campioni, ora, diag)
+        if diag is not None:
+            diag.update({"pause": pause, "fit": fit, "celle": {"temperatura": len(T), "richiesta": len(R), "esterna": len(E), "target": len(S)}})
+        else:
+            cache = app.__dict__["rip_cache"] = {"ts": ora, "fit": fit}
+    fit = diag["fit"] if diag is not None and "fit" in diag else cache["fit"]
+    if not fit:
+        return None
+    if blocco:
+        return None
+    # da quando lo Smarther ha smesso di chiedere, e a che temperatura eravamo
+    with closing(db._c()) as c:
+        r = c.execute("SELECT MAX(ts) FROM misure WHERE serie='casa.richiesta_calore' AND valore>=0.5 AND ts>?",
+                      (int(ora - 6 * 3600),)).fetchone()
+    spenta_da = t_fine = None
+    if r and r[0] is not None:
+        spenta_da = max(0, ora - r[0])
+        t_fine = q_valore_a(db, "casa.temperatura", r[0])
+    ed = {} if diag is not None else None
+    eta = ripartenza_eta(fit, ora, t_casa, esterna, target, spenta_da, t_fine, ed)
+    if diag is not None:
+        diag["eta_dettagli"] = {**ed, "spenta_da": spenta_da, "t_fine": t_fine}
+    if eta is None:
+        return no((ed or {}).get("motivo") or "stima non calcolabile")
+    q15 = 900
+    return int(round(eta / q15) * q15)
+
+
 @api("/api/dashboard")
 def api_dashboard(app, q):
     ora = int(time.time())
@@ -464,6 +965,8 @@ def api_dashboard(app, q):
         "ora": ora, "da": da, "a": a, "demo": app.demo, "intervallo": app.intervallo_pdc(),
         "ultimo_ok": max([s["ultimo_ok"] or 0 for s in servizi] + [ts_("acs.temperatura") or 0]),
         "modo": modo, "servizi": servizi, "accesso_st": info_accesso_st(app),
+        "refresh": info_refresh(app),
+        "meteo": meteo_info(app),
         "riscaldamento": {
             "stato": stato_risc, "temp": acqua, "target": num("risc.setpoint"), "ritorno": ritorno,
             "delta": round(acqua - ritorno, 1) if acqua is not None and ritorno is not None else None,
@@ -477,6 +980,8 @@ def api_dashboard(app, q):
         "energia": {"kwh": energia_kwh(db, da, a), "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
                     "spark": q_medie(db, "pot.watt", da, a)},
         "casa": {"temp": num("casa.temperatura"), "umidita": num("casa.umidita"), "soglie_umidita": soglie_umidita(app), "target": num("casa.setpoint"),
+                 "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
+                                             num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
                  "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
                  "ts": ts_("casa.temperatura"), "spark": q_medie(db, "casa.temperatura", da, a),
                  "spark_um": q_medie(db, "casa.umidita", da, a)},
@@ -527,6 +1032,18 @@ def ultimo_ciclo(db, ora):
     return {"inizio": i, "fine": f, "modo": m, "kwh": kwh if kwh and kwh > 0 else None}
 
 
+def info_refresh(app):
+    """Stato del 'refresh' dei dati del compressore (smartthings.refresh): {attivo, stato, ogni, inviati, ultimo, messaggio}."""
+    try:
+        cfg = (app.cfg.leggi()["smartthings"].get("refresh")) or {}
+        sv = next((x for x in app.servizi if x.sigla == "st"), None)
+        i = getattr(sv, "refresh_info", None) or {}
+        return {"attivo": bool(cfg.get("attivo")), "stato": i.get("stato", "spento"), "ogni": max(30, int(cfg.get("ogni_secondi") or 60)),
+                "inviati": i.get("inviati", 0), "ultimo": i.get("ultimo"), "messaggio": i.get("messaggio")}
+    except Exception:
+        return {"attivo": False, "stato": "spento"}
+
+
 def ritardo_ciclo(db, ora):
     """Ritardo con cui arrivano i campioni del compressore, ultime 24 h: {n, tipico_min, max_min} (None se pochi dati)."""
     v = sorted(x for _, x in q_serie(db, "diag.ritardo_ciclo", ora - 86400, ora))
@@ -541,6 +1058,38 @@ def prezzo_kwh(app):
         return max(0.0, float(app.cfg.leggi().get("tariffa", {}).get("prezzo_kwh") or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def costo_mese(app, ora):
+    """Costo del mese in corso, stima a fine mese e confronto col mese scorso (None se manca il prezzo o i dati).
+    La stima e' lineare (consumo medio per giorno trascorso x giorni del mese): vale solo come ordine di grandezza."""
+    prezzo = prezzo_kwh(app)
+    if prezzo <= 0:
+        return None
+    db = app.db
+    adesso = datetime.fromtimestamp(ora)
+    inizio = datetime(adesso.year, adesso.month, 1)
+    prec = datetime(adesso.year - (adesso.month == 1), 12 if adesso.month == 1 else adesso.month - 1, 1)
+    fine = datetime(adesso.year + (adesso.month == 12), 1 if adesso.month == 12 else adesso.month + 1, 1)
+    with closing(db._c()) as c:
+        r = c.execute("SELECT MIN(ts) FROM misure WHERE serie='en.totale_wh'").fetchone()
+    primo = r[0] if r and r[0] is not None else None
+    if primo is None:
+        return None
+    t_in, t_prec = inizio.timestamp(), prec.timestamp()
+    kwh = energia_kwh(db, max(t_in, primo), ora)
+    if kwh is None:
+        return None
+    trascorso = (ora - max(t_in, primo)) / 86400
+    durata = (fine - inizio).total_seconds() / 86400
+    stima = None
+    if primo <= t_in and trascorso >= 1.0:
+        stima = kwh / trascorso * durata
+    scorso = energia_kwh(db, t_prec, t_in) if primo <= t_prec + 3600 else None
+    return {"kwh": kwh, "euro": round(kwh * prezzo, 2),
+            "stima_euro": None if stima is None else round(stima * prezzo, 2),
+            "scorso_euro": None if scorso is None else round(scorso * prezzo, 2),
+            "mese": inizio.month, "mese_scorso": prec.month}
 
 
 def cornice(app, ora):
@@ -608,6 +1157,17 @@ def q_potenza_a_gradini(db, da, a):
     return pts
 
 
+def dirada_richiesta(punti, passo_max=600):
+    """Tiene solo i campioni che servono al grafico: quelli dove la richiesta cambia (e quello subito prima), e uno ogni 10 minuti
+    dentro un periodo uguale (la pagina ne ha bisogno per non spezzare le fasce). Su 30 giorni passa da ~800 KB a poche decine."""
+    out, ult = [], None
+    for i, (t, v) in enumerate(punti):
+        cambia = i == 0 or i == len(punti) - 1 or v != punti[i - 1][1] or v != punti[i + 1][1]
+        if cambia or t - ult >= passo_max:
+            out.append([t, v]); ult = t
+    return out
+
+
 @api("/api/analisi")
 def api_analisi(app, q):
     ora = int(time.time())
@@ -632,7 +1192,7 @@ def api_analisi(app, q):
                 linee.append({"id": nome, "nome": et, "col": col, "tratti": tr, "punti": pts, "u": u, "asse": asse, "area": area})
         grafici.append({"id": gid, "titolo": titolo, "unita": unita, "gradini": gid == "circuito", "linee": linee})
     # richiesta di calore della casa: intervalli in cui lo Smarther chiede caldo (fascia sul grafico casa)
-    richiesta = [[t, v] for t, v in q_serie(app.db, "casa.richiesta_calore", da, a)]
+    richiesta = dirada_richiesta(q_serie(app.db, "casa.richiesta_calore", da, a))
     out.update({"da": da, "a": a, "passo": dim, "grafici": grafici, "richiesta": richiesta, "soglie_umidita": soglie_umidita(app),
                 "modi": calcola_modi(app.db, da, a, tol, ora)})
     return out
@@ -680,7 +1240,8 @@ def cicli_compressore(db, da, a, ora, gap=900):
 
 def _mediana(v):
     v = sorted(v)
-    return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
 
 
 def calcola_bollitore(db, da, a, ora, litri=300):
@@ -745,6 +1306,43 @@ def calcola_bollitore(db, da, a, ora, litri=300):
                          "minuti": round(_mediana([d for d, _ in sal]) / 60), "gradi": round(_mediana([g for _, g in sal]), 1),
                          "cicli": len(sal)}
     return out if (out["perdita"] or out["salita"]) else None
+
+
+SBR_MAX_ELENCO = 50
+
+
+def elenco_sbrinamenti(db, da, a, ora):
+    """Sbrinamenti nel periodo, dalle transizioni on/off di pdc.sbrinamento.
+    Inizio = passaggio a "on" dopo 'da'; fine = il "off" successivo (None se ancora in corso).
+    kWh = differenza del contatore tra inizio e fine (approssimata: il contatore e' a scatti); None se non leggibile.
+    Esterna = media dei campioni di ciclo.esterna attorno allo sbrinamento. Piu' recenti per primi."""
+    da, a = int(da), min(int(a), int(ora))
+    cambi = q_cambi(db, "pdc.sbrinamento", da, a)
+    lista, inizio = [], None
+    for ts, v in cambi[1 if cambi and cambi[0][0] == da else 0:]:      # il primo e' lo stato che c'era a 'da' (se c'era)
+        if v == "on" and inizio is None:
+            inizio = ts
+        elif v != "on" and inizio is not None:
+            lista.append((inizio, ts))
+            inizio = None
+    if inizio is not None:
+        lista.append((inizio, None))
+    out = []
+    for i, f in lista:
+        fine = f if f is not None else int(ora)
+        e0, e1 = q_valore_a(db, "en.totale_wh", i), q_valore_a(db, "en.totale_wh", fine)
+        kwh = round(max(0.0, e1 - e0) / 1000, 2) if e0 is not None and e1 is not None else None
+        est = [v for _, v in q_serie(db, "ciclo.esterna", i - 900, fine + 900)]
+        out.append({"ts": i, "fine": f, "min": round((fine - i) / 60), "kwh": kwh,
+                    "esterna": round(sum(est) / len(est), 1) if est else None, "incorso": f is None})
+    out.reverse()
+    chiusi = [s for s in out if not s["incorso"]]
+    kw = [s["kwh"] for s in out if s["kwh"] is not None]
+    est = [s["esterna"] for s in out if s["esterna"] is not None]
+    return {"n": len(out), "kwh": round(sum(kw), 2) if kw else None,
+            "media_min": round(sum(s["min"] for s in chiusi) / len(chiusi), 1) if chiusi else None,
+            "esterna": round(sum(est) / len(est), 1) if est else None,
+            "elenco": out[:SBR_MAX_ELENCO]}
 
 
 def calcola_efficienza(db, da, a, tol, ora, passo=300):
@@ -830,14 +1428,14 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         durate = [(f - i) / 60 for i, f, mm in runs if mm == m]
         cicli[m] = {"n": len(durate), "media_min": round(sum(durate) / len(durate), 1) if durate else None,
                     "brevi": sum(1 for d in durate if d < 10), "max_min": round(max(durate), 1) if durate else None}
-    sbrinamenti = sum(1 for _, v in q_cambi(db, "pdc.sbrinamento", da, a)[1:] if v == "on") \
-        if q_cambi(db, "pdc.sbrinamento", da, a) else 0
+    sbr = elenco_sbrinamenti(db, da, a, ora)
+    sbrinamenti = sbr["n"]
     curva_cop = {}
     for m in ("casa", "acs"):
         curva_cop[m] = [{"da": b, "a": b + 2, "cop": round(d[0] / d[1], 2), "ore": round(d[2] * ore_h, 1)}
                         for b, d in sorted(bins[m].items()) if d[2] >= 6 and d[1] > 0]
     return {
-        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti,
+        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti, "sbr": sbr,
         "tot": {"el_casa": round(tot["el"]["casa"], 1), "el_acs": round(tot["el"]["acs"], 1),
                 "el_riposo": round(tot["el"]["riposo"], 1),
                 "calore_casa": round(tot["calore"]["casa"], 1), "calore_acs": round(tot["calore"]["acs"], 1),
@@ -847,6 +1445,43 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         "copertura": {m: round(100.0 * coperte[m] / totali_celle[m]) if totali_celle[m] else None
                       for m in coperte},
     }
+
+
+# Giorni "tipici": con il pulsante Confronta, per ogni giorno completo si cerca nello storico (ultimi 90 giorni) un gruppo di giorni
+# con la stessa temperatura esterna media (entro 2 gradi) e se ne prende la mediana: e' il consumo / il COP "normale" per
+# quel freddo. Un giorno molto sopra il normale e' segnalato. Servono almeno 3 giorni simili, altrimenti niente (nessun valore inventato).
+TIP_STORICO_GIORNI = 90
+TIP_DELTA_GRADI = 2.0
+TIP_MIN_SIMILI = 3
+TIP_SOPRA = 1.25          # oltre il 25% sopra il tipico ...
+TIP_SOPRA_MIN_KWH = 1.5   # ... e almeno cosi' tanti kWh in piu': segnala un giorno anomalo
+
+
+def giorni_tipici(app, giorni_sel, ora, oggi0, tol):
+    """{giorno: {el, cop_casa, cop_acs, n, sopra}} per i giorni del periodo che hanno abbastanza giorni simili nello storico."""
+    cache = app.__dict__.get("tip_cache")
+    if not cache or cache["giorno"] != oggi0 or ora - cache["ts"] > 1800:
+        da = oggi0 - TIP_STORICO_GIORNI * 86400
+        rif = calcola_efficienza(app.db, da, ora, tol, ora)["giorni"]
+        cache = app.__dict__["tip_cache"] = {"giorno": oggi0, "ts": ora, "rif": rif}
+    tot = lambda g: g["el_casa"] + g["el_acs"] + g["el_riposo"]
+    pieni = lambda g: g["esterna"] is not None and g["nodati_min"] <= 120 and g["ts"] < oggi0 and tot(g) > 0.5
+    rif = [g for g in cache["rif"] if pieni(g)]
+    out = {}
+    for g in giorni_sel:
+        if not pieni(g):
+            continue
+        simili = [r for r in rif if r["giorno"] != g["giorno"] and abs(r["esterna"] - g["esterna"]) <= TIP_DELTA_GRADI]
+        if len(simili) < TIP_MIN_SIMILI:
+            continue
+        el = _mediana([tot(r) for r in simili])
+        cc = [r["cop_casa"] for r in simili if r["cop_casa"] is not None]
+        ca = [r["cop_acs"] for r in simili if r["cop_acs"] is not None]
+        out[g["giorno"]] = {"el": round(el, 2), "n": len(simili), "esterna": g["esterna"],
+                            "cop_casa": round(_mediana(cc), 2) if len(cc) >= TIP_MIN_SIMILI else None,
+                            "cop_acs": round(_mediana(ca), 2) if len(ca) >= TIP_MIN_SIMILI else None,
+                            "sopra": bool(tot(g) > el * TIP_SOPRA and tot(g) - el >= TIP_SOPRA_MIN_KWH)}
+    return out
 
 
 @api("/api/efficienza")
@@ -865,10 +1500,11 @@ def api_efficienza(app, q):
     out = cornice(app, ora)
     out.update(calcola_efficienza(app.db, da, ora, tol, ora))
     out.update({"da": da, "a": ora, "n_giorni": giorni, "prezzo_kwh": prezzo_kwh(app),
-                "energia_contatore": energia_kwh(app.db, da, ora)})
+                "energia_contatore": energia_kwh(app.db, da, ora), "mese": costo_mese(app, ora)})
     litri = int((app.cfg.leggi().get("bollitore") or {}).get("litri") or 300)
     out["bollitore"] = calcola_bollitore(app.db, da, ora, ora, litri)
     if q.get("confronta", ["0"])[0] == "1":
+        out["tipici"] = giorni_tipici(app, out["giorni"], ora, oggi0, tol)
         # periodo di pari durata subito prima: da - (ora - da) ... da
         durata = ora - da
         prec = calcola_efficienza(app.db, da - durata, da, tol, ora)
@@ -973,6 +1609,8 @@ MANIFEST = {"name": "Pompa di calore", "short_name": "PDC", "start_url": "/", "d
             "background_color": "#0b0f17", "theme_color": "#0b0f17", "lang": "it",
             "icons": [{"src": "/icona.png", "sizes": "180x180", "type": "image/png"}]}
 
+TIPI_COMPRIMIBILI = {"text/html", "text/css", "text/javascript", "text/csv", "text/plain", "application/json",
+                     "application/manifest+json", "image/svg+xml"}
 CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -1003,8 +1641,16 @@ class Gestore(BaseHTTPRequestHandler):
     # ---- risposte ----
     def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None):
         dati = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
+        compresso = False
+        # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto via tunnel, dove passano dalla tua linea in upload
+        if (len(dati) > 1024 and tipo.split(";")[0] in TIPI_COMPRIMIBILI and "gzip" in self.headers.get("Accept-Encoding", "")
+                and codice == 200):
+            dati, compresso = gzip.compress(dati, 5, mtime=0), True
         self.send_response(codice)
         self.send_header("Content-Type", tipo)
+        if compresso:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(dati)))
         extra = list(extra or [])
         sost = {k: v for k, v in extra if k in ("Cache-Control", "Content-Security-Policy")}
@@ -1322,7 +1968,8 @@ class Simulatore:
                           "info.pdc.versioni": '[["Software","DB91-02102A 2026-03-20","Version"],["Firmware","DB91-02100A 2020-07-10","Version"],["Firmware","DB91-02103B 2022-06-14",""],["Firmware","DB91-02450A 2022-07-06","EHS MONO LOWTEMP"]]',
                           "info.nt.firmware": "40", "info.nt.tipo": "BNS", "info.nt.id": "70:ee:50:00:00:01",
                           "info.nt.nome": "Smarther Thermostat", "info.nt.stanza": "Entrata", "info.nt.casa": "La mia abitazione",
-                          "info.nt.installato": "1759245643", "info.nt.modo_termico": "schedule"})
+                          "info.nt.installato": "1759245643", "info.nt.modo_termico": "schedule",
+                          "info.nt.programma": '{"nome": "Casa", "fasce": [[0, 20.0]]}'})
         return rec
 
 

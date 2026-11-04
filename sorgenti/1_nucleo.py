@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.17"
+VERSIONE = "0.19"
 
 import argparse
 import base64
@@ -262,6 +262,11 @@ TEMPLATE = {
                  "L'avviso rientra quando scende di 'rientro_punti' sotto la soglia.",
         "giallo": 60.0, "rosso": 70.0, "minuti": 30, "rientro_punti": 2.0,
     },
+    "meteo": {
+        "_nota": "Posizione per il meteo del giorno nella Dashboard (card Esterna), da Open-Meteo. Ora c'è Cirié. Per toglierlo svuota le due coordinate ('').",
+        "latitudine": 45.23,
+        "longitudine": 7.60,
+    },
     "tariffa": {
         "_nota": "Prezzo dell'energia elettrica in euro per kWh (con le tasse, per esempio 0.28). 0 = non mostrare i costi.",
         "prezzo_kwh": 0.0,
@@ -276,6 +281,12 @@ TEMPLATE = {
         "pat": "",
         "oauth": {"client_id": "", "client_secret": "", "access_token": "",
                   "refresh_token": "", "expires_at": 0},
+        "refresh": {
+            "_nota": "Facoltativo. SmartThings consegna i dati del compressore con 4-5 minuti di ritardo. Con 'attivo' il pannello, "
+                     "SOLO mentre la pompa lavora, le chiede di aggiornarsi (comando 'refresh') ogni 'ogni_secondi' secondi. "
+                     "Non cambia nessuna impostazione della pompa; serve il permesso di comando del token (x:devices:*).",
+            "attivo": False, "ogni_secondi": 60,
+        },
     },
     "netatmo": {"client_id": "", "client_secret": "", "access_token": "", "refresh_token": "",
                 "expires_at": 0, "home_id": "", "room_id": ""},
@@ -792,6 +803,39 @@ def estrai_netatmo(js, room_id, ts):
     return rec
 
 
+def _programma_smarther(home, mod):
+    """Programma orario dello Smarther da /api/homesdata: {"nome", "fasce": [[minuti da lunedi' 00:00, temperatura], ...]}.
+    Senza programma (o in un formato che non conosco) 'fasce' e' vuoto."""
+    scheda = None
+    for sc in home.get("schedules") or []:
+        if sc.get("type", "therm") == "therm" and (sc.get("selected") or scheda is None):
+            scheda = sc
+            if sc.get("selected"):
+                break
+    if not scheda:
+        return {"nome": None, "fasce": []}
+    stanza = str(mod.get("room_id")) if mod else None
+    zone = {}
+    for z in scheda.get("zones") or []:
+        temp = None
+        rt = z.get("rooms_temp") or []
+        r = next((x for x in rt if str(x.get("room_id")) == stanza), rt[0] if rt else None)
+        if r is not None:
+            temp = r.get("temp")
+        if temp is None:
+            rr = z.get("rooms") or []
+            r2 = next((x for x in rr if str(x.get("id")) == stanza), rr[0] if rr else None)
+            if r2 is not None:
+                temp = r2.get("therm_setpoint_temperature")
+        zone[z.get("id")] = temp
+    fasce = []
+    for t in sorted(scheda.get("timetable") or [], key=lambda x: x.get("m_offset", 0)):
+        temp = zone.get(t.get("zone_id"))
+        if temp is not None:
+            fasce.append([int(t.get("m_offset", 0)), float(temp)])
+    return {"nome": scheda.get("name"), "fasce": fasce}
+
+
 def estrai_netatmo_casa(js):
     """Dati descrittivi (cambiano di rado) da /api/homesdata: nome del modulo, stanza, data di installazione."""
     rec = Rec()
@@ -808,6 +852,10 @@ def estrai_netatmo_casa(js):
     s("info.nt.casa", home.get("name"))
     s("info.nt.modo_termico", home.get("therm_mode"))
     s("info.nt.controllo", home.get("temperature_control_mode"))
+    try:
+        s("info.nt.programma", json.dumps(_programma_smarther(home, mod), ensure_ascii=False))
+    except Exception:
+        s("info.nt.programma", '{"errore": true}')   # accessorio: la riga dice 'formato non riconosciuto'
     if mod:
         s("info.nt.nome", mod.get("name"))
         s("info.nt.installato", mod.get("setup_date"))
@@ -898,6 +946,8 @@ class ServizioST(Raccoglitore):
         super().__init__(app, "st")
         self.passi = 0
         self.offline = 0
+        # stato del "refresh" (vedi _refresh): lo legge la Dashboard
+        self.refresh_info = {"stato": "spento", "inviati": 0, "ultimo": None, "messaggio": None, "bloccato_fino": 0}
 
     def intervallo(self):
         # SmartThings concede circa 12 richieste/minuto: sotto i 20 secondi non scendiamo
@@ -922,11 +972,11 @@ class ServizioST(Raccoglitore):
             for comp in d.get("components", []) for c in comp.get("capabilities", []))]
         if len(ehs) != 1:
             elenco = ", ".join(f"{d.get('label') or d.get('name')} ({d['deviceId']})" for d in items)
-            raise ErroreConfig("SmartThings: non riesco a capire quale sia la pdc. Scrivi il device_id in "
+            raise ErroreConfig("SmartThings: non riesco a capire quale sia la PdC. Scrivi il device_id in "
                                "config.json (smartthings -> device_id). Dispositivi: " + elenco)
         dev = ehs[0]["deviceId"]
         self.app.cfg.aggiorna(lambda raw: raw.setdefault("smartthings", {}).update(device_id=dev))
-        log.info("pdc trovata e salvata in config.json")
+        log.info("PdC trovata e salvata in config.json")
         return dev
 
     def passo(self):
@@ -939,7 +989,7 @@ class ServizioST(Raccoglitore):
         self._misura_ritardo(rec, ts)
         if rec.problemi:
             self.app.eventi.apri("st_ciclo_formato", "Formato dei dati ciclo non riconosciuto "
-                                 f"({rec.problemi[0]}): forse un aggiornamento della pdc. Fammi vedere "
+                                 f"({rec.problemi[0]}): forse un aggiornamento della PdC. Fammi vedere "
                                  "diagnostica.json.", "avviso")
         elif rec.ciclo:
             self.app.eventi.chiudi("st_ciclo_formato")
@@ -950,7 +1000,69 @@ class ServizioST(Raccoglitore):
             self._info_dispositivo(dev, ts)
         self.passi += 1
         self._controlla_pat()
+        try:
+            self._refresh(dev, ts)
+        except Exception:   # e' un extra: non deve mai rovinare la lettura normale
+            log.exception("refresh: errore inatteso (ignorato)")
         return cambiati
+
+    def _pdc_lavora(self, ts):
+        """La pompa sta lavorando (o sta per partire / appena finito)? Si guarda solo cio' che e' gia' nel database:
+        compressore in marcia in un campione recente, Smarther che chiede calore, acqua dell'impianto che si muove."""
+        with closing(self.app.db._c()) as c:
+            def ultimo(serie, da):
+                r = c.execute("SELECT valore FROM misure WHERE serie=? AND ts>=? ORDER BY ts DESC LIMIT 1", (serie, da)).fetchone()
+                return r[0] if r else None
+            hz = ultimo("ciclo.freq_compressore", ts - 900)
+            if hz is not None and hz > 0:
+                return True
+            if ultimo("casa.richiesta_calore", ts - 300) == 1.0:
+                return True
+            acqua = [v for (v,) in c.execute("SELECT valore FROM misure WHERE serie='risc.acqua' AND ts>=?", (ts - 420,))]
+        return len(acqua) >= 3 and max(acqua) - min(acqua) >= 1.5
+
+    def _refresh(self, dev, ts):
+        """Se attivato in config.json (smartthings.refresh), mentre la pompa lavora manda ogni N secondi il comando 'refresh':
+        la pdc consegna subito i campioni del ciclo che ha (dalle prove: 4 volte su 7 entro 10 secondi, a volte freschi, a volte
+        arretrati). Subito dopo si rilegge. Se il token non ha il permesso di comando, o SmartThings protesta, si smette per un po'."""
+        info = self.refresh_info
+        cfg = (self.app.cfg.leggi()["smartthings"].get("refresh")) or {}
+        if not cfg.get("attivo"):
+            info.update(stato="spento", messaggio=None)
+            return
+        if info["bloccato_fino"] > ts:
+            return
+        ogni = max(30, int(cfg.get("ogni_secondi") or 60))
+        if info["ultimo"] and ts - info["ultimo"] < ogni - 5:
+            return
+        if not self._pdc_lavora(ts):
+            info.update(stato="a riposo", messaggio=None)
+            return
+        corpo = json.dumps({"commands": [{"component": "main", "capability": "refresh", "command": "refresh"}]}).encode()
+        try:
+            token = self.app.token_st.get()
+            code, js = http_json("POST", f"{ST_API}/devices/{dev}/commands",
+                                 {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                                  "Accept": "application/json"}, corpo)
+        except Exception as e:
+            info.update(stato="errore", messaggio=str(e)[:120], bloccato_fino=ts + 300)
+            return
+        if code == 401 and not self.app.token_st.usa_pat():
+            self.app.token_st.invalida()
+            info.update(stato="errore", bloccato_fino=ts + 120, messaggio="token SmartThings da rinnovare, riprovo")
+        elif code in (401, 403):
+            info.update(stato="permesso", bloccato_fino=ts + 3600,
+                        messaggio="il token SmartThings non ha il permesso di comando (x:devices:*)")
+            log.warning("refresh: %s; riprovo tra un'ora", info["messaggio"])
+        elif code == 429:
+            info.update(stato="errore", bloccato_fino=ts + 300, messaggio="troppe richieste a SmartThings")
+        elif code >= 400:
+            info.update(stato="errore", bloccato_fino=ts + 300, messaggio=f"SmartThings ha risposto {code}")
+        else:
+            info.update(stato="attivo", ultimo=ts, messaggio=None, inviati=info["inviati"] + 1)
+            t = threading.Timer(12, self.sveglia.set)   # i dati arrivano in ~10 secondi: rileggi subito dopo
+            t.daemon = True
+            t.start()
 
     def _misura_ritardo(self, rec, ts):
         """Diagnostica: quanto e' vecchio il campione del ciclo quando ARRIVA (serie diag.ritardo_ciclo, in secondi)."""
