@@ -184,7 +184,8 @@ def cmd_ripristina(app, leggi=input):
         c = app.cfg.leggi().get("backup") or BACKUP_DEFAULT
         cart = Path(c.get("cartella") or "dati/backup")
         cart = cart if cart.is_absolute() else app.base / cart
-        copie = sorted(cart.glob("pdc-*.db"), reverse=True) if cart.is_dir() else []
+        copie = (sorted(list(cart.glob("pdc-*.db")) + list(cart.glob("prima-del-reset-*.db")),
+                        key=lambda f: f.stat().st_mtime, reverse=True) if cart.is_dir() else [])
         if not copie:
             print(f"Non trovo nessuna copia in {cart}. Il backup si fa con:  python pdc_pannello.py backup")
             return 1

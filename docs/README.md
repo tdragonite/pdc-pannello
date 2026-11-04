@@ -212,6 +212,7 @@ Tutte le anomalie compaiono sempre anche nel pannello (banner in alto); qui deci
 | `acs_bassa` | acqua calda sotto 35 °C per 30 minuti |
 | `cop_basso` | COP stimato delle ultime 24 ore sotto 2 |
 | `sbrinamenti_frequenti` | 6 o più sbrinamenti in 3 ore |
+| `sbrinamento_inizio` / `sbrinamento_fine` | **avvisi informativi** (dalla 0.19): la pompa inizia / finisce uno sbrinamento (alla fine: durata e consumo). Arrivano **sempre in silenzio** (senza suono), non si ripetono e non hanno “rientro”. Si spengono o si riscrivono in *Impostazioni → Avvisi* (segnaposto `{esterna} {ora}` / `{durata} {consumo}`) |
 
 **Le soglie sono un punto di partenza, non verità**: dopo qualche settimana guardale con i tuoi dati e ritoccale.
 
@@ -279,6 +280,8 @@ Riscaldamento (mandata, ritorno, ΔT), acqua calda sanitaria, temperatura estern
 > - *Si ferma*: l'acqua crolla di almeno 5 °C su due letture di fila, oppure scende di almeno 2 °C mentre lo Smarther ha smesso di chiedere calore. I crolli subito dopo un cambio di valvola (da acqua calda a casa, per esempio) sono normali e si ignorano. Con la pompa in marcia l'acqua oscilla di 2-3 °C: un calo piccolo non basta.
 > - *Campioni «fantasma»*: ogni tanto SmartThings consegna un campione con il compressore acceso mentre l'acqua misurata nello stesso momento dice che è ferma da minuti (la mandata del campione è a più di 5 °C dall'acqua). Questi campioni vengono scartati dall'indicatore e dalla linea del tempo; nei grafici di Analisi restano, perché mostrano i dati così come arrivano.
 > Resta comunque un ritardo di pochi minuti nei momenti di cambio, ed è normale.
+
+**Dati più freschi (opzione, dalla 0.18).** In *Impostazioni → Collegamenti* c'è «SmartThings: chiedi alla pompa di aggiornare i dati mentre lavora» (spenta di default). Se la accendi, **solo mentre la pompa lavora** (compressore in marcia, Smarther che chiede calore o acqua dell'impianto che si muove) il pannello manda ogni 60 secondi (si cambia in *Ogni quanti secondi mandare il refresh*, minimo 30) il comando «refresh» e rilegge subito dopo. Non cambia nessuna impostazione della pompa. Dalle prove (pdc a riposo e in marcia) i dati nuovi arrivano dopo circa 10 secondi in più della metà dei tentativi: a volte freschi (meno di 2 minuti), a volte arretrati, e a volte non arriva niente. Quindi **migliora, ma non elimina il ritardo**. Serve il permesso di comando del token SmartThings (`x:devices:*`, come per gli interruttori): se manca, il pannello lo scrive nella scheda *Compressore e circuito* e riprova dopo un'ora.
 Si aggiorna da sola mentre è aperta: il pallino in alto è verde se i dati sono freschi, giallo se il tempo reale non è collegato o i dati sono vecchi, rosso se c'è un problema.
 
 **Analisi** (6h / 24h / personalizzato)
@@ -286,6 +289,7 @@ I grafici nel dettaglio: temperature, casa (con una striscia rossa quando lo Sma
 
 **Efficienza** (3 / 7 / 28 giorni)
 COP, energia elettrica, calore prodotto, ore di lavoro, energia e COP giorno per giorno, COP in base alla temperatura esterna e i cicli (numero, durata, quanti troppo brevi).
+Il riquadro **Sbrinamenti** (dalla 0.19) conta gli sbrinamenti del periodo; toccandolo si apre l'elenco (ultimi 50: data, durata, kWh consumati e temperatura esterna) con la media in cima. I tre grafici (energia, COP, COP per temperatura esterna) hanno il cursore: passa il mouse o tieni premuto il dito per leggere i valori.
 Se in *Impostazioni → Costo dell'energia* scrivi il prezzo (€ per kWh, tasse comprese), compaiono anche il **costo stimato** del periodo e il costo medio di un ciclo di acqua calda. È una stima: kWh della pompa per il prezzo, senza quota fissa. In fondo alla pagina ci sono i link per **esportare in CSV** (riepilogo per giorno o dati grezzi degli ultimi 7 giorni), pensati per Excel italiano (punto e virgola, virgola decimale).
 
 Il pulsante **Confronta** (spento quando apri la pagina) affianca i numeri del periodo scelto a quelli del periodo precedente della stessa lunghezza, con la differenza in percentuale. Se per il periodo precedente mancano dati, lo dice.
@@ -353,11 +357,13 @@ python pdc_pannello.py imposta-password     scegli utente e password
 python pdc_pannello.py telegram-prova       manda un messaggio di prova
 python pdc_pannello.py compatta             compatta ora lo storico vecchio
 python pdc_pannello.py backup               copia ora database e config.json nella cartella dati\backup
-python pdc_pannello.py ripristina           rimette una copia di backup (a pannello fermo)
+python pdc_pannello.py ripristina           rimette una copia di backup o una fatta prima di un reset (a pannello fermo)
 python pdc_pannello.py ridecodifica         rifà la lettura dei dati grezzi del ciclo
 python pdc_pannello.py esporta-diagnostica  crea un file di diagnosi da mandare a chi ti aiuta
 python pdc_pannello.py --versione
 ```
+
+Nella stessa cartella c'è anche `pdc_strumenti.py` (vedi `README_STRUMENTI.md`): oltre ai dump, `rip-diag` e `sbrinamenti [--giorni 7] [--salva]` (dalla 0.19: elenco degli sbrinamenti letti dal database).
 
 Per pythonw usa gli stessi argomenti, ma non vedrai l'output: i comandi “da guardare” (`stato`, `telegram-prova`…) lanciali con `python`.
 
@@ -369,7 +375,7 @@ Per pythonw usa gli stessi argomenti, ma non vedrai l'output: i comandi “da gu
 |---|---|
 | `generale` | `porta` (7000), `host` (`0.0.0.0` = raggiungibile dalla rete; `127.0.0.1` = solo dal PC), `intervallo_pdc_secondi` (60, minimo 20), `intervallo_netatmo_secondi` (120), `database`, `sessione_giorni` (30), `porta_lock` |
 | `accesso` | utente e hash della password (non scrivere l'hash a mano) |
-| `smartthings` | `device_id`, `pat`, e `oauth` (compilato da `st-oauth`; i token ruotano da soli) |
+| `smartthings` | `device_id`, `pat`, `oauth` (compilato da `st-oauth`; i token ruotano da soli) e `refresh` (`attivo`, `ogni_secondi`: vedi «Dati più freschi») |
 | `netatmo` | chiavi dell'app, token (ruotano da soli), `home_id`, `room_id` |
 | `telegram` | credenziali, orari, testi, limiti |
 | `allarmi` | soglie e interruttori di ogni allarme |
@@ -390,6 +396,7 @@ Le modifiche valgono quasi tutte **subito**; fanno eccezione porta, host e inter
 
 - **Storico:** tengo i dati dettagliati per 365 giorni; più indietro una media ogni 15 minuti, così il database non cresce all'infinito. Lo fa da solo, di notte. Per farlo subito: `python pdc_pannello.py compatta`.
 - **Backup automatico:** ogni notte (tra le 3 e le 6; se il pannello era spento, al primo avvio utile) il pannello copia il database e `config.json` nella cartella **`backup`** accanto allo script, con la data nel nome, e tiene le ultime 7 copie. La copia è coerente anche mentre il pannello lavora. Per farla subito: `python pdc_pannello.py backup`. **Attenzione:** la copia sta sullo stesso computer (e `config.json` contiene password e token): ogni tanto copia la cartella su un altro disco o nel cloud, e non condividerla. **Per ripristinare:** ferma il pannello e lancia `python pdc_pannello.py ripristina`: elenca le copie (con data e dimensione), scegli il numero e scrivi SI. Il database attuale viene prima messo da parte nella cartella `backup` (`prima-del-ripristino-…`). Se c'è anche il `config.json` di quel giorno, ti chiede se rimetterlo: di solito conviene di no, perché i token rinnovabili di una copia vecchia possono essere già scaduti.
+- **Azzerare il database (dalla 0.18):** *Impostazioni → Dati → Azzera il database…*. Cancella tutto lo storico (misure, grafici, anomalie) e riparte da zero; restano impostazioni, password e collegamenti. Chiede di scrivere **RESETTA** e la tua password, e **prima** fa una copia di sicurezza nella cartella dei backup (`prima-del-reset-AAAAMMGG-OOMMSS.db`). Se la copia non riesce, non cancella niente. Per tornare indietro: ferma il pannello e lancia `python pdc_pannello.py ripristina`, che elenca anche queste copie.
 - **Registro:** in *Impostazioni → Registro* vedi le ultime righe del registro del pannello (password e token sono nascosti), le dimensioni di database e log e quando è stato fatto l'ultimo backup.
 - **Backup a mano:** copia, **a pannello fermo**, `config.json` e `dati\pdc.db` (e le loro copie `pdc.db-wal`/`pdc.db-shm` se esistono). Basta questo per spostare tutto su un altro PC.
 - **Aggiornare lo script:** ferma il pannello, sostituisci `pdc_pannello.py`, riavvia. `config.json` e lo storico restano; le nuove impostazioni vengono aggiunte da sole. (Dalla 0.17 c'è anche l'aggiornamento senza fermare la raccolta, qui sotto.)
@@ -428,7 +435,8 @@ Le modifiche valgono quasi tutte **subito**; fanno eccezione porta, host e inter
 | Non ricordo la password | `python pdc_pannello.py imposta-password` (a pannello fermo). |
 | SmartThings 401 | Token personale scaduto (dura 24 ore): generane uno nuovo, oppure configura OAuth. |
 | SmartThings 403 | Al token mancano i permessi (devices: list e see; per i comandi anche control / `x:devices:*`). |
-| SmartThings 429 | Troppe richieste: alza `intervallo_pdc_secondi`. |
+| SmartThings 429 | Troppe richieste: alza `intervallo_pdc_secondi` (e, se l'hai acceso, `refresh.ogni_secondi`). |
+| «refresh fermo: manca il permesso di comando» (Dashboard) | Il token SmartThings non ha lo scope `x:devices:*`: vedi «Servono permessi di comando sui token». Oppure spegni l'opzione. |
 | SmartThings 402/“a pagamento” | Il servizio potrebbe essere diventato a pagamento: guarda il messaggio nella Dashboard. |
 | “Pompa offline” | La pdc non risulta connessa a SmartThings (wifi/modulo): controlla nell'app SmartThings. |
 | Netatmo: token rifiutato | Rigenera i token dal portale con gli scope dello Smarther e incollali (i vecchi sono invalidati). |

@@ -7,6 +7,7 @@ import subprocess
 CF_API = "https://api.cloudflare.com/client/v4"
 CF_DOWNLOAD = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
 TITOLI["cf_tunnel"] = "Tunnel Cloudflare"
+TITOLI["cf_esterno"] = "Pannello raggiungibile da internet"
 
 CLOUDFLARE_DEFAULT = {
     "_nota": "Compilato dalla procedura guidata (Impostazioni > Accesso da internet). Il token del tunnel permette solo di "
@@ -138,6 +139,8 @@ class TunnelCF:
         self.fallimenti = 0
         self.fermo = threading.Event()
         self.ultimo_errore = None
+        self.esterno_ts = 0       # ultimo controllo dall'esterno
+        self.esterno_ko = 0       # controlli falliti di fila
 
     # ----- ciclo di vita -----
     def _cfg(self):
@@ -201,8 +204,10 @@ class TunnelCF:
             args += ["--protocol", c["protocollo"]]
         args.append("run")
         try:
-            if self.log_path.exists() and self.log_path.stat().st_size > 2_000_000:
-                self.log_path.write_bytes(self.log_path.read_bytes()[-200_000:])
+            if self.log_path.exists() and self.log_path.stat().st_size > 500_000:     # oltre 500 KB: si tiene la parte finale, da un inizio di avvio
+                dati = self.log_path.read_bytes()[-400_000:]
+                i = dati.find(b"\n--- avvio")
+                self.log_path.write_bytes(dati[i + 1:] if i >= 0 else dati)
         except OSError:
             pass
         logf = open(self.log_path, "ab")
@@ -293,6 +298,46 @@ class TunnelCF:
                 elif time.time() - self.partito_il > 180:
                     self.app.eventi.apri("cf_tunnel", "Il tunnel e' avviato ma non risulta collegato a Cloudflare da oltre 3 minuti. "
                                          + self._ultima_riga_problema(), "avviso")
+            try:
+                self._controllo_esterno()
+            except Exception:
+                log.exception("controllo del pannello da internet in errore")
+
+    # ----- il pannello e' raggiungibile da internet? -----
+    CONTROLLO_OGNI = 120        # secondi fra un controllo e l'altro
+    CONTROLLO_FALLITI = 3       # controlli falliti di fila prima di avvisare (circa 6 minuti)
+
+    def _controllo_esterno(self):
+        """Prova il percorso intero, come lo farebbe il tuo iPhone da fuori casa: da qui a Cloudflare e di nuovo al pannello.
+        Usa la pagina pubblica manifest.webmanifest (non serve la password). Avvisa solo dopo alcuni fallimenti di fila, per
+        non disturbare con un singolo intoppo; quando torna tutto a posto l'avviso si chiude da solo."""
+        if self.app.demo or not self.proc or self.proc.poll() is not None or time.time() - self.partito_il < 120:
+            return
+        if time.time() - self.esterno_ts < self.CONTROLLO_OGNI:
+            return
+        self.esterno_ts = time.time()
+        host = self._cfg()["hostname"]
+        if not host:
+            return
+        motivo = ""
+        try:
+            code, js = http_json("GET", f"https://{host}/manifest.webmanifest",
+                                 {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
+            if code == 200 and isinstance(js, dict) and "start_url" in js:
+                self.esterno_ko = 0
+                self.app.eventi.chiudi("cf_esterno")
+                return
+            if code in (530, 1033):
+                motivo = f"Cloudflare non trova il tunnel (codice {code})"
+            elif code in (502, 504, 521, 522, 523, 524):
+                motivo = f"Cloudflare risponde ma il pannello no (codice {code})"
+            else:
+                motivo = f"risposta inattesa (codice {code})"
+        except ErroreAPI as e:
+            motivo = str(e)
+        self.esterno_ko += 1
+        if self.esterno_ko >= self.CONTROLLO_FALLITI:
+            self.app.eventi.apri("cf_esterno", f"Da internet il pannello non risponde ({host}): {motivo}.", "avviso")
 
     # ----- stato -----
     def _coda_log(self, n=12000):

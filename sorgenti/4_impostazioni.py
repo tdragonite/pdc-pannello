@@ -37,7 +37,11 @@ DESCRIZIONI_ALLARME = {
     "acs_bassa": "L'acqua calda sanitaria è troppo fredda.",
     "cop_basso": "L'efficienza stimata (COP) è bassa.",
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
+    "sbrinamento_inizio": "Un messaggio, senza suoneria, quando la pompa entra in sbrinamento.",
+    "sbrinamento_fine": "Un messaggio, senza suoneria, quando lo sbrinamento finisce (durata e consumo).",
 }
+
+AVVISI_INFORMATIVI = ("sbrinamento_inizio", "sbrinamento_fine")     # non sono anomalie: solo interruttore, niente soglie né ritardo
 
 
 MODELLI_SMARTHER = [
@@ -51,26 +55,32 @@ MODELLI_SMARTHER = [
 
 def schema_impostazioni():
     sezioni = [
-        {"id": "telegram", "titolo": "Telegram", "nota": "Dove arrivano gli avvisi. Il token si può inserire qui oppure in un "
-         "tuo file .json (campo \"file\"): se il file è indicato ha la precedenza.", "prova": True, "campi": [
+        {"id": "telegram", "titolo": "Telegram", "nota": "Dove arrivano gli avvisi. Il token del bot si può inserire qui oppure in un "
+         "tuo file .json (riquadro sotto): se il file è indicato ha la precedenza.", "prova": True, "campi": [
             _c("telegram.abilitato", "bool", "Invia gli avvisi su Telegram"),
             _c("telegram.bot_token", "segreto", "Token del bot", "Quello che ti ha dato BotFather."),
             _c("telegram.chat_id", "testo", "Chat ID", "Il tuo numero di chat con il bot."),
-            _c("telegram.file_credenziali", "testo", "File con le credenziali (facoltativo)",
-               "Percorso di un tuo .json, per es. C:\\bot\\telegram.json"),
-            _c("telegram.chiave_token", "testo", "Nome della chiave del token nel file", "Per chiavi annidate: a.b"),
-            _c("telegram.chiave_chat", "testo", "Nome della chiave della chat nel file"),
             _c("telegram.nome_impianto", "testo", "Nome mostrato nei messaggi"),
-            _c("telegram.promemoria_ore", "float", "Promemoria se l'anomalia resta aperta (ore, 0 = mai)", min=0, max=168),
+        ]},
+        {"id": "telegram_file", "titolo": "Telegram: credenziali da un tuo file (facoltativo)", "nota": "Se il token e la chat sono già in un tuo "
+         "file .json (per esempio quello di un altro bot), scrivi qui dove sta e come si chiamano le chiavi.", "campi": [
+            _c("telegram.file_credenziali", "testo", "Percorso del file", "Per es. C:\\bot\\telegram.json"),
+            _c("telegram.chiave_token", "testo", "Chiave del token nel file", "Per chiavi annidate: a.b"),
+            _c("telegram.chiave_chat", "testo", "Chiave della chat nel file"),
+        ]},
+        {"id": "telegram_limiti", "titolo": "Telegram: promemoria e limiti", "campi": [
+            _c("telegram.promemoria_ore", "float", "Promemoria ogni (ore)", "Se l'anomalia resta aperta. 0 = mai.", min=0, max=168),
             _c("telegram.max_messaggi_ora", "int", "Massimo messaggi all'ora", min=1, max=200),
         ]},
-        {"id": "orari", "titolo": "Silenzio notturno e riepilogo", "campi": [
-            _c("telegram.silenzio_notturno.attivo", "bool", "Messaggi senza suoneria di notte"),
+        {"id": "orari", "titolo": "Silenzio notturno", "nota": "Di notte i messaggi arrivano senza suoneria.", "campi": [
+            _c("telegram.silenzio_notturno.attivo", "bool", "Silenzio notturno attivo"),
             _c("telegram.silenzio_notturno.da", "ora", "Dalle"),
             _c("telegram.silenzio_notturno.a", "ora", "Alle"),
             _c("telegram.silenzio_notturno.anche_errori", "bool", "Silenzia anche gli errori gravi"),
-            _c("telegram.silenzio_notturno.oscillazione_gradi", "float", "Segnala la notte se la temperatura in casa varia di più di (°C)",
-               "Nel riepilogo del mattino (se attivo) aggiungo cosa è successo durante il silenzio: oscillazioni di temperatura, umidità sopra la soglia gialla, avvisi scattati.", min=0.5, max=20),
+            _c("telegram.silenzio_notturno.oscillazione_gradi", "float", "Oscillazione notturna da segnalare (°C)",
+               "Nel riepilogo del mattino (se attivo) aggiungo cosa è successo durante il silenzio: temperatura in casa variata di almeno questi gradi, umidità sopra la soglia gialla, avvisi scattati.", min=0.5, max=20),
+        ]},
+        {"id": "riepilogo", "titolo": "Riepilogo del mattino", "campi": [
             _c("telegram.riepilogo_mattina.attivo", "bool", "Riepilogo di ieri ogni mattina"),
             _c("telegram.riepilogo_mattina.ora", "ora", "Ora del riepilogo"),
         ]},
@@ -82,25 +92,37 @@ def schema_impostazioni():
             _c("telegram.messaggi.ripristino", "lungo", "Tutto risolto"),
             _c("telegram.messaggi.promemoria", "lungo", "Promemoria"),
             _c("telegram.messaggi.riepilogo", "lungo", "Riepilogo del mattino"),
+            _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {esterna} {ora}."),
+            _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {durata} {consumo}."),
         ]},
-        {"id": "collegamenti", "titolo": "Collegamenti", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
+        {"id": "collegamenti", "titolo": "SmartThings (pompa di calore)", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
          "campi": [
-            _c("smartthings.device_id", "testo", "SmartThings: ID della pompa di calore"),
-            _c("smartthings.pat", "segreto", "SmartThings: token personale (PAT, dura 24 ore)",
-               "Usato solo se l'OAuth non è configurato."),
-            _c("netatmo.home_id", "testo", "Netatmo: ID della casa"),
-            _c("netatmo.room_id", "testo", "Netatmo: ID della stanza (Smarther)"),
-            _c("generale.intervallo_pdc_secondi", "int", "Ogni quanti secondi leggere la pompa", "Minimo 20.", min=20, max=3600),
-            _c("generale.intervallo_netatmo_secondi", "int", "Ogni quanti secondi leggere lo Smarther", min=30, max=3600),
+            _c("smartthings.device_id", "testo", "ID della pompa di calore"),
+            _c("smartthings.pat", "segreto", "Token personale (PAT, dura 24 ore)", "Usato solo se l'OAuth non è configurato."),
+            _c("generale.intervallo_pdc_secondi", "int", "Leggi la pompa ogni (secondi)", "Minimo 20.", min=20, max=3600),
+        ]},
+        {"id": "refresh", "titolo": "Dati più freschi (refresh)", "nota": "SmartThings consegna i dati del compressore con 4-5 minuti di ritardo. "
+         "Con questa opzione, solo mentre la pompa lavora, il pannello le manda il comando «refresh» (non cambia nessuna impostazione) e a volte "
+         "i dati arrivano molto prima. Serve il permesso di comando del token (x:devices:*). È una prova: migliora, non elimina il ritardo.",
+         "campi": [
+            _c("smartthings.refresh.attivo", "bool", "Chiedi alla pompa di aggiornare i dati mentre lavora"),
+            _c("smartthings.refresh.ogni_secondi", "int", "Manda il refresh ogni (secondi)", "Minimo 30, consigliato 60.", min=30, max=600),
+        ]},
+        {"id": "netatmo", "titolo": "Netatmo (Smarther)", "campi": [
+            _c("netatmo.home_id", "testo", "ID della casa"),
+            _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
+            _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
+        ]},
+        {"id": "accessoweb", "titolo": "Login del pannello", "campi": [
             _c("generale.sessione_giorni", "int", "Giorni prima di rifare il login", min=1, max=365),
         ]},
         {"id": "umidita", "titolo": "Umidità in casa", "nota": "Soglie dell'umidità (dallo Smarther): sopra la prima il valore diventa giallo "
          "in Dashboard e parte l'avviso Telegram «Umidità alta»; sopra la seconda diventa rosso e parte «Umidità molto alta». "
          "Valgono per tutto: Dashboard, grafico e Telegram. Gli avvisi si possono spegnere in «Quando avvisarti».", "campi": [
-            _c("umidita.giallo", "float", "Soglia gialla (% di umidità)", "Predefinita 60.", min=20, max=100),
-            _c("umidita.rosso", "float", "Soglia rossa (% di umidità)", "Predefinita 70. Deve essere maggiore della gialla.", min=20, max=100),
-            _c("umidita.minuti", "int", "Prima di avvisare su Telegram, per quanti minuti di fila", "Evita gli avvisi per un picco breve (una doccia).", min=1, max=1440),
-            _c("umidita.rientro_punti", "float", "L'avviso rientra quando scende sotto la soglia di (punti)", "Evita messaggi continui se l'umidità oscilla attorno alla soglia.", min=0, max=20),
+            _c("umidita.giallo", "float", "Soglia gialla (%)", "Predefinita 60.", min=20, max=100),
+            _c("umidita.rosso", "float", "Soglia rossa (%)", "Predefinita 70. Deve essere maggiore della gialla.", min=20, max=100),
+            _c("umidita.minuti", "int", "Avvisa dopo (minuti di fila)", "Evita gli avvisi per un picco breve (una doccia).", min=1, max=1440),
+            _c("umidita.rientro_punti", "float", "Rientro sotto la soglia di (punti)", "Evita messaggi continui se l'umidità oscilla attorno alla soglia.", min=0, max=20),
         ]},
         {"id": "tariffa", "titolo": "Costo dell'energia", "nota": "Se metti il prezzo, il pannello mostra quanto costa l'energia "
          "della pompa (stima: kWh della pompa per il prezzo, senza quota fissa).", "campi": [
@@ -141,8 +163,9 @@ def schema_impostazioni():
             if k in ETICHETTE_ALLARME:
                 et, tipo, mn, mx = ETICHETTE_ALLARME[k]
                 campi.append(_c(f"allarmi.{codice}.{k}", tipo, et, min=mn, max=mx))
-        et, tipo, mn, mx = ETICHETTE_ALLARME["ritardo_minuti"]
-        campi.append(_c(f"allarmi.{codice}.ritardo_minuti", tipo, et, "Se si risolve prima, non ti scrivo.", min=mn, max=mx))
+        if codice not in AVVISI_INFORMATIVI:
+            et, tipo, mn, mx = ETICHETTE_ALLARME["ritardo_minuti"]
+            campi.append(_c(f"allarmi.{codice}.ritardo_minuti", tipo, et, "Se si risolve prima, non ti scrivo.", min=mn, max=mx))
         allarmi.append({"id": codice, "titolo": TITOLI.get(codice, codice), "descrizione": DESCRIZIONI_ALLARME.get(codice, ""),
                         "campi": campi})
     for s in sezioni:  # in quale tab della pagina sta ogni riquadro
@@ -150,7 +173,7 @@ def schema_impostazioni():
     return sezioni, allarmi
 
 
-TAB_SEZIONI = {"telegram": "avvisi", "orari": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti",
+TAB_SEZIONI = {"telegram": "avvisi", "telegram_file": "avvisi", "telegram_limiti": "avvisi", "orari": "avvisi", "riepilogo": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti", "refresh": "collegamenti", "netatmo": "collegamenti", "accessoweb": "collegamenti",
                "dispositivi": "collegamenti", "tariffa": "dati", "bollitore": "dati", "backup": "dati", "storico": "dati"}
 
 
@@ -416,3 +439,46 @@ def api_registro(app, q):
         "backup_copie": len(copie), "backup_attivo": bool(cfg_b.get("attivo", True)),
         "versione": VERSIONE, "avviato": int(AVVIO), "ora": int(time.time()),
     }
+
+
+@api_post("/api/database/reset")
+def reset_database(app, corpo, h):
+    """Azzera i dati raccolti (misure, stati, cicli, anomalie). Restano config.json, la password e i login.
+    Prima di toccare qualcosa fa una copia del database; se la copia non riesce non cancella niente."""
+    if app.demo:
+        return {"ok": False, "messaggio": "In modalità demo non si azzera niente."}
+    ip = ip_client(h)
+    if app.limite.bloccato(ip):
+        return {"ok": False, "messaggio": "Troppi tentativi. Riprova più tardi."}
+    if str(corpo.get("conferma", "")).strip() != "RESETTA":
+        return {"ok": False, "messaggio": "Per confermare scrivi esattamente RESETTA (tutto maiuscolo)."}
+    acc = app.cfg.leggi()["accesso"]
+    if not verifica_password(str(corpo.get("password", "")), acc.get("password_hash") or ""):
+        app.limite.fallito(ip)
+        time.sleep(1.0)
+        return {"ok": False, "messaggio": "La password non è corretta: non ho cancellato niente."}
+    cart = Path((app.cfg.leggi().get("backup") or {}).get("cartella") or "dati/backup")
+    cart = cart if cart.is_absolute() else app.base / cart
+    copia = cart / f"prima-del-reset-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    try:
+        cart.mkdir(parents=True, exist_ok=True)
+        with closing(app.db._c()) as src, closing(sqlite3.connect(str(copia))) as dst:
+            src.backup(dst)
+        if not copia.exists() or copia.stat().st_size < 4096:
+            raise OSError("la copia è vuota")
+    except Exception as e:
+        copia.unlink(missing_ok=True)
+        log.error("Reset database annullato: copia non riuscita (%s)", e)
+        return {"ok": False, "messaggio": f"Non sono riuscito a fare la copia di sicurezza ({e}): non ho cancellato niente."}
+    with app.db.lock, closing(app.db._c()) as c, c:
+        for tab in ("misure", "stati", "ultimo", "ciclo", "eventi"):
+            c.execute(f"DELETE FROM {tab}")
+        c.execute("DELETE FROM meta WHERE k IN ('ciclo_ultimo_ts', 'tg_notificati')")
+    try:
+        vacuum(app.db)
+    except Exception:
+        log.exception("reset: compattazione non riuscita (non è grave)")
+    log.warning("DATABASE AZZERATO dal pannello (da %s). Copia di sicurezza: %s", ip, copia.name)
+    for s in app.servizi:
+        s.sveglia.set()     # rileggi subito: i primi dati ricompaiono in pochi secondi
+    return {"ok": True, "messaggio": "Database azzerato. I dati ricominciano da adesso.", "copia": copia.name}

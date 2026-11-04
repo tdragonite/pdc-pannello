@@ -35,7 +35,7 @@ def cmd_stato(app):
         quando = f"{eta} s fa" if eta < 120 else (f"{eta // 60} min fa" if eta < 7200 else f"{eta // 3600} h fa")
         print(f"{serie:26} {fmt_val(num, txt):>12}   {datetime.fromtimestamp(ts):%d/%m %H:%M:%S} ({quando})")
     nf = sum(1 for r in righe if r[0].startswith("fsv."))
-    print(f"\n(+ {nf} impostazioni FSV della pdc salvate)")
+    print(f"\n(+ {nf} impostazioni FSV della PdC salvate)")
     ac = info_accesso_st(app)
     print("Accesso SmartThings:", {"oauth": "OAuth (si rinnova da solo)", "pat": "token personale PAT (24 ore)"}.get(ac["tipo"], ac["tipo"]))
     aperti = [e for e in app.db.eventi_recenti(30) if e[4] is None]

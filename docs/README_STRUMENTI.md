@@ -116,6 +116,16 @@ Tutti i file stanno nella cartella `diagnostica` accanto allo script.
 
 ---
 
+## 5. Sbrinamenti (dalla 0.19)
+
+```
+python pdc_strumenti.py sbrinamenti                 ultimi 7 giorni
+python pdc_strumenti.py sbrinamenti --giorni 30     altro periodo
+python pdc_strumenti.py sbrinamenti --salva         scrive anche diagnostica/sbrinamenti.json
+```
+
+Legge `dati/pdc.db` (serve `pdc_pannello.py` nella stessa cartella) e stampa data, durata, kWh ed esterna di ogni sbrinamento, con la media. Trova solo quelli registrati dal pannello da quando e' stato avviato: SmartThings non permette di tornare indietro nel tempo.
+
 ## Esperimento: il comando "refresh" anticipa i dati del ciclo?
 
 I dati del compressore arrivano da SmartThings con 4-5 minuti di ritardo, a pacchetti. Questo test prova se il comando `refresh` li fa arrivare prima.
@@ -132,3 +142,5 @@ Tra un giro e l'altro c'e' una pausa di 45 secondi (non conteggiata) cosi' i dat
 
 Opzioni: `--giri 16` (piu' giri = risultato piu' affidabile, sempre un numero pari), `--finestra 180` (secondi per giro), `--ogni 15` (secondi tra le letture).
 Non modifica nessuna impostazione della pdc: manda solo `refresh`, come il pulsante di aggiornamento dell'app.
+
+**Risultato del 3/11/2026** (24 giri complessivi, ordine casuale): con il refresh dati nuovi in 7 giri su 12, quasi sempre dopo 10 secondi; senza refresh in 1 su 12. Dati freschi (meno di 3 minuti) solo con il refresh, ma in circa metà dei tentativi non arriva niente. Il pannello 0.18 ha l'opzione per usarlo (Impostazioni → Collegamenti).
