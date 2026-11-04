@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.19"
+VERSIONE = "0.20"
 
 import argparse
 import base64
@@ -43,6 +43,7 @@ import threading
 import shutil
 import time
 import traceback
+import types
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,6 +299,7 @@ TEMPLATE = {
     "telegram": {},        # riempito sotto da TELEGRAM_DEFAULT (parte Telegram)
     "allarmi": {},         # idem da ALLARMI_DEFAULT
     "cloudflare": {},      # idem da CLOUDFLARE_DEFAULT
+    "plugin": {},          # una sottosezione per plugin (cartella plugin): {"nome": {"attivo": false, ...}}
     "mappa_ciclo": MAPPA_CICLO_DEFAULT,
 }
 

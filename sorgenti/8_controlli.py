@@ -172,12 +172,11 @@ def _registra_comando(app, cosa, acceso, ip, esito):
              "acceso" if acceso else "spento", ip, esito)
 
 
-@api_post("/api/controlli")
-def api_controlli(app, corpo, gestore):
-    cosa, acceso = corpo.get("cosa"), corpo.get("acceso")
+def esegui_comando(app, cosa, acceso, ip):
+    """Un comando alla pompa o allo Smarther, con le stesse regole per tutti (pagina, plugin): -> {'ok': bool, 'errore'?}.
+    'ip' dice da dove e' partito e finisce nel registro dei comandi."""
     if cosa not in NOME_COMANDO or not isinstance(acceso, bool):
         return {"ok": False, "errore": "Comando non valido."}
-    ip = ip_client(gestore)
     if app.demo:
         return {"ok": True, "demo": True}
     with _lock_comandi:
@@ -198,6 +197,11 @@ def api_controlli(app, corpo, gestore):
         return {"ok": False, "errore": str(e)}
     _registra_comando(app, cosa, acceso, ip, "inviato" + (f" ({metodo})" if metodo else ""))
     return {"ok": True}
+
+
+@api_post("/api/controlli")
+def api_controlli(app, corpo, gestore):
+    return esegui_comando(app, corpo.get("cosa"), corpo.get("acceso"), ip_client(gestore))
 
 
 def elenco_comandi(app, massimo=100):

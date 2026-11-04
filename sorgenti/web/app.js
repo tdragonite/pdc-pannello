@@ -1,5 +1,5 @@
 // impronta di questa versione dello script: la prende dall'indirizzo con cui e' stato caricato (app.js?v=...)
-window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch (e) { return ''; } })();
+window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch { return ''; } })();
 (() => {
 'use strict';
 
@@ -7,8 +7,8 @@ window.BUILD = (() => { try { return new URL(document.currentScript.src).searchP
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const ls = {
-  get(k, d) { try { const v = localStorage.getItem('pdc.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem('pdc.' + k, JSON.stringify(v)); } catch (e) {} },
+  get(k, d) { try { const v = localStorage.getItem('pdc.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('pdc.' + k, JSON.stringify(v)); } catch {} },
 };
 const num = (v, d = 1) => (v == null || isNaN(v)) ? '—' : Number(v).toLocaleString('it-IT', {minimumFractionDigits: d, maximumFractionDigits: d});
 const gr = v => v == null ? '—' : num(v) + '°';
@@ -286,7 +286,7 @@ document.addEventListener('change', async e => {
     const r = await inviaPost('/api/controlli', {cosa, acceso});
     if (r.ok) toast(nome + ': comando inviato');
     else { delete S.opt[cosa]; toast(r.errore || 'Comando non riuscito', true); }
-  } catch (err) { delete S.opt[cosa]; toast('Comando non riuscito: il pannello non risponde', true); }
+  } catch { delete S.opt[cosa]; toast('Comando non riuscito: il pannello non risponde', true); }
   delete S.occ[cosa];
   armaSblocco(); ridisegnaComandi();
 });
@@ -517,7 +517,7 @@ function largTesto(t) {   // larghezza vera di un testo dei grafici (11 px, stes
   try {
     if (!cvTesto) { cvTesto = document.createElement('canvas').getContext('2d'); cvTesto.font = '11px ' + getComputedStyle(document.body).fontFamily; }
     return cvTesto.measureText(t).width;
-  } catch (_) { return t.length * 6.5; }
+  } catch { return t.length * 6.5; }
 }
 // colonna dei numeri dell'asse verticale, larga quanto serve. Telefono: stima (2 cifre ≈ 21 px); PC: misura vera col font della pagina,
 // cosi' la prima cifra cade sulla prima lettera del titolo
@@ -743,7 +743,7 @@ function zoomaGiu(e) {
   if (dita.size === 2 && !pizzico) {
     const [a, b] = [...dita.values()], v = S.dati;
     pizzico = {el, dist0: Math.max(30, Math.abs(a.x - b.x)), span0: v.a - v.da, tc: v.da + unita(fraz(el, (a.x + b.x) / 2)) * (v.a - v.da)};
-    try { dita.forEach((_, id) => el.setPointerCapture(id)); } catch (_) {}
+    try { dita.forEach((_, id) => el.setPointerCapture(id)); } catch {}
     togliCursore();
   }
 }
@@ -754,7 +754,7 @@ function zoomaMuovi(e) {
     if (!trascina) {
       if (Math.abs(p.x - p.x0) < 8 || Math.abs(p.x - p.x0) < Math.abs(p.y - p.y0)) return false;
       trascina = {da: S.zoom.da, span: S.zoom.a - S.zoom.da, x0: p.x0};
-      try { p.el.setPointerCapture(e.pointerId); } catch (_) {}
+      try { p.el.setPointerCapture(e.pointerId); } catch {}
       togliCursore(); tocco = null;
     }
     const o = S.dati.pieno || S.dati;
@@ -789,7 +789,7 @@ function zoomaSu(e) {
 }
 
 // ---------- Impostazioni > Registro ----------
-const TAB_IMP = [['', 'Stato'], ['collegamenti', 'Collegamenti'], ['avvisi', 'Avvisi'], ['accesso', 'Accesso'], ['dati', 'Dati'], ['registro', 'Registro']];
+const TAB_IMP = [['', 'Stato'], ['collegamenti', 'Collegamenti'], ['avvisi', 'Avvisi'], ['integrazioni', 'Integrazioni'], ['accesso', 'Accesso'], ['dati', 'Dati'], ['registro', 'Registro']];
 function vistaImp() {
   const tab = $('#imp-tabs'); if (!tab) return;
   const cur = TAB_IMP.some(([k]) => k === S.sub) ? S.sub : '';
@@ -807,7 +807,7 @@ async function caricaRegistro() {
     const r = await fetch('/api/registro?righe=150', {credentials: 'same-origin', cache: 'no-store'});
     if (r.status === 401) { location.href = '/login'; return; }
     S.reg = await r.json(); disegnaRegistro();
-  } catch (e) { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
+  } catch { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
 }
 const pesoTxt = b => b >= 1e6 ? num(b / 1e6, 1) + ' MB' : num(b / 1e3, 0) + ' KB';
 function disegnaRegistro() {
@@ -927,14 +927,19 @@ window.addEventListener('scroll', () => { if (S.meteoAperto) chiudiMeteo(); }, {
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola: i dettagli tecnici stanno in PIANO.md.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
-  ['ora', 'Ripartenza prevista', 'Nella card Smarther: a che ora il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
-  ['tipici', 'Giorni tipici', 'In Efficienza → Confronta: il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
-  ['avviso', 'Avviso dal tunnel', 'Telegram ti scrive se da internet il pannello non risponde, e lo chiude da solo quando torna tutto a posto.'],
-  ['sbr', 'Sbrinamenti', 'In Efficienza l’elenco degli sbrinamenti con consumo e temperatura, e due avvisi Telegram silenziosi: inizio e fine.'],
-  ['login', 'Accesso più comodo', 'Dall’icona della Home non devi più rimettere la password se la sessione è ancora valida.'],
+  ['plugin', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», si accendono e si ricaricano senza riavviare.'],
+  ['alexa', 'Alexa', 'Il primo plugin: chiedi temperatura, umidità, PdC e acqua calda, o accendi e spegni lo Smarther, con le Routine di Alexa.'],
+  ['live', 'Stato in diretta', 'Stato e richieste dei plugin si aggiornano da soli, senza ricaricare la pagina.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', alexa: '🔊', live: '↻'};
 const CHANGELOG = [
+  {v: '0.20', quando: '4 novembre 2026', titolo: 'Integrazioni e Alexa', righe: [
+    ['n', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», con interruttore, campi e stato. Un plugin nuovo parte spento, si ricarica con un tasto e, se si rompe, non ferma mai il pannello.'],
+    ['n', 'Alexa', 'Il primo plugin: con le Routine di Alexa chiedi temperatura e umidità, se il riscaldamento è acceso e quando riparte, cosa fa la PdC, acqua calda e mandata, oppure accendi e spegni lo Smarther. Non devi pronunciare il nome della skill.'],
+    ['n', 'Indirizzo protetto per Alexa', 'L’indirizzo che dai ad Amazon contiene un segreto, accetta solo la tua skill e richieste fresche e uniche; con «Verifica firma Amazon» controlla anche che arrivino davvero da Amazon.'],
+    ['m', 'Stato dei plugin in diretta', 'Stato, contatore e ultima richiesta si aggiornano da soli ogni pochi secondi, senza toccare quello che stai scrivendo.'],
+    ['m', 'Indirizzo da fuori casa', 'Gli indirizzi pubblici dei plugin si mostrano già con il tuo indirizzo Cloudflare, pronti da copiare.'],
+  ]},
   {v: '0.19', quando: '3 novembre 2026', titolo: 'Ripartenza prevista e giorni tipici', righe: [
     ['n', 'Ripartenza prevista', 'Nella card Smarther: l’ora in cui il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
     ['n', 'Giorni tipici', 'Efficienza → Confronta: sui grafici dei giorni compare il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
@@ -1042,7 +1047,7 @@ function disegnaChangelog() {
 // ---------- Efficienza ----------
 const euro = v => v == null ? '—' : v.toLocaleString('it-IT', {style: 'currency', currency: 'EUR'});
 const fm = (v, n = 1) => v == null ? '—' : num(v, n);
-const giornoBreve = g => { const [y, m, d] = g.giorno.split('-'); return `${d}/${m}`; };
+const giornoBreve = g => { const [, m, d] = g.giorno.split('-'); return `${d}/${m}`; };
 
 // confronto con il periodo di pari durata subito prima: differenza in % (null se il dato prima e' troppo piccolo)
 function diffPerc(ora_, prima, minimo = 0.5) {
@@ -1395,12 +1400,12 @@ document.addEventListener('click', e => {
   disegna();
 });
 async function copiaTesto(t) {
-  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true; } } catch (e) { /* si prova l'altro metodo */ }
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true; } } catch { /* si prova l'altro metodo */ }
   try {
     const a = document.createElement('textarea'); a.value = t; a.setAttribute('readonly', '');
     a.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px'; document.body.appendChild(a);
     a.select(); a.setSelectionRange(0, t.length); const ok = document.execCommand('copy'); a.remove(); return ok;
-  } catch (e) { return false; }
+  } catch { return false; }
 }
 document.addEventListener('click', async e => {
   const b = e.target.closest && e.target.closest('.copia'); if (!b) return;
@@ -1422,8 +1427,8 @@ function campoHtml(c) {
 }
 
 // Riquadri collassabili: lo stato aperto/chiuso si ricorda per ogni riquadro (per il primo di ogni tab, aperto di partenza)
-function impAperti() { try { return JSON.parse(localStorage.getItem('pdc_imp_aperti2') || '{}') || {}; } catch (e) { return {}; } }
-function impRicorda(id, aperto) { try { const m = impAperti(); m[id] = aperto; localStorage.setItem('pdc_imp_aperti2', JSON.stringify(m)); } catch (e) { /* niente */ } }
+function impAperti() { try { return JSON.parse(localStorage.getItem('pdc_imp_aperti2') || '{}') || {}; } catch { return {}; } }
+function impRicorda(id, aperto) { try { const m = impAperti(); m[id] = aperto; localStorage.setItem('pdc_imp_aperti2', JSON.stringify(m)); } catch { /* niente */ } }
 function riquadro(id, titolo, corpo, primo, extra = '') {
   const m = impAperti(), ap = id in m ? m[id] : false;   // chiusi di partenza; poi si ricorda cosa apri
   return `<details class="card imp riq" data-id="${id}" ${ap ? 'open' : ''}><summary><h2>${esc(titolo)}</h2>${extra}</summary><div class="riq-c">${corpo}</div></details>`;
@@ -1460,9 +1465,57 @@ function disponiColonne() {
     });
     fine();
     altri.forEach(a => tab.appendChild(a));
+    tab.querySelectorAll(':scope > .cima').forEach(a => tab.prepend(a));
   });
 }
 document.addEventListener('toggle', e => { const t = e.target; if (t.classList && t.classList.contains('riq') && riquadroLargo(t) && t.closest('#imp')) disponiColonne(); }, true);
+// ---------- Impostazioni > Integrazioni (plugin) ----------
+const PLG_STATO = {attivo: ['si', 'attivo'], spento: ['no', 'spento'], errore: ['bad', 'errore']};
+function pluginRighe(p) {
+  const base = p.base || location.origin;      // l'indirizzo da fuori casa, se il tunnel c'è
+  const rotte = p.rotte.map(r => `<span class="cv"><span class="val-c">${esc(base + r)}</span><button type="button" class="copia" data-copia="${esc(base + r)}" aria-label="Copia l'indirizzo">Copia</button></span>`).join('<br>');
+  return [
+    p.messaggio ? riga('Stato', esc(p.messaggio)) : '',
+    p.errore ? riga('Problema', `<small class="msg bad">${esc(p.errore)}</small>`) : '',
+    riga('File', `<span>${esc(p.file)}${SEP}<small class="mut">${p.versione ? 'versione ' + esc(p.versione) + SEP : ''}${esc(p.sha)}</small></span>`),
+    p.rotte.length ? riga('Indirizzi pubblici', rotte) : '',
+    p.rotte.length ? riga('Richieste', `<span>${num(p.richieste, 0)}${SEP}<small class="mut">ultima ${fa(p.ultima)}</small></span>`) : '',
+  ].join('');
+}
+function pluginPillola(p) { const [cl, tx] = PLG_STATO[p.stato] || ['no', p.stato]; return pallino(cl, tx); }
+function pluginRiquadro(s) {
+  const p = s.plugin;
+  return riquadro('s-' + s.id, s.titolo, `${s.nota ? `<p class="nota-sez">${esc(s.nota)}</p>` : ''}<div class="righe plg">${pluginRighe(p)}</div>
+      ${s.campi.length ? `<div class="campi">${s.campi.map(campoHtml).join('')}</div>` : ''}`, false, pluginPillola(p));
+}
+// Stato e contatore dei plugin si aggiornano da soli (ogni 5 s, solo se guardi la scheda Integrazioni): si rifanno le righe e il badge,
+// mai i campi, cosi' quello che stai scrivendo e i riquadri aperti restano com'erano.
+let plgOccupato = false;
+async function plgAggiorna() {
+  if (plgOccupato || document.hidden || S.pagina !== 'impostazioni' || S.sub !== 'integrazioni') return;
+  plgOccupato = true;
+  try {
+    const r = await fetch('/api/impostazioni', {credentials: 'same-origin', cache: 'no-store'});
+    if (!r.ok || S.sub !== 'integrazioni') return;
+    const d = await r.json();
+    d.sezioni.filter(x => x.tab === 'integrazioni' && x.plugin).forEach(x => {
+      const det = document.querySelector(`#imp details.riq[data-id="s-${x.id}"]`); if (!det) return;
+      const righe = det.querySelector('.righe.plg'), pill = det.querySelector('summary .pill'), sel = window.getSelection && window.getSelection();
+      if (righe && !(sel && !sel.isCollapsed && righe.contains(sel.anchorNode))) {      // non toccare un testo che stai selezionando
+        const nuovo = pluginRighe(x.plugin);
+        if (righe.innerHTML !== nuovo) righe.innerHTML = nuovo;
+      }
+      if (pill) { const n = pluginPillola(x.plugin); if (pill.outerHTML !== n) pill.outerHTML = n; }
+    });
+  } catch { /* al prossimo giro */ } finally { plgOccupato = false; }
+}
+setInterval(plgAggiorna, 5000);
+function pluginTab(d) {
+  const lista = d.sezioni.filter(s => s.tab === 'integrazioni');
+  return `<article class="card cima"><div class="ch"><h2>Integrazioni</h2><button type="button" class="sec piccolo" id="plg-ricarica">Ricarica i plugin</button></div>
+      <p class="nota-sez">Le integrazioni sono file nella cartella <code>plugin</code>, accanto a <code>pdc_pannello.py</code>: si aggiungono e si aggiornano senza toccare il pannello.
+      Un plugin nuovo parte spento; un errore dentro un plugin non ferma mai il pannello. Dopo aver cambiato un file premi «Ricarica i plugin».${lista.length ? '' : '<br><b>Nessun plugin trovato.</b>'}</p></article>${lista.map(pluginRiquadro).join('')}`;
+}
 function disegnaImpostazioni(d) {
   const box = $('#imp'); if (!box) return;
   const stato_ = $('#imp-stato'); if (stato_) stato_.innerHTML = statoImpostazioni(d.stato);
@@ -1490,6 +1543,7 @@ function disegnaImpostazioni(d) {
     <div class="imp-tab" data-t="collegamenti" hidden>${sez('collegamenti')}</div>
     <div class="imp-tab" data-t="avvisi" hidden>${sez('avvisi')}
       ${riquadro('allarmi', 'Quando avvisarti', `<p class="nota-sez">Tocca un avviso per cambiarne le soglie o spegnerlo.</p><div class="lista-allarmi">${all}</div>`, false)}</div>
+    <div class="imp-tab" data-t="integrazioni" hidden>${pluginTab(d)}</div>
     <div class="imp-tab" data-t="accesso" hidden>
       ${riquadro('password', 'Password del pannello', pw, true)}
       <details class="card imp riq" data-id="cf" id="cf-d" ${cfAp ? 'open' : ''}><summary><h2>Accesso da internet (Cloudflare)</h2></summary><div class="riq-c" id="cf"><div class="vuoto" style="padding:14px 0">Controllo l'accesso da internet…</div></div></details></div>
@@ -1537,7 +1591,7 @@ async function aggCarica() {
         ? `<p class="agg-riavvio"><b>Per la versione ${esc(a.versione_disco)} serve il riavvio completo</b>${cosa ? ' (cambiato: ' + cosa + ')' : ''}.<br>La raccolta dei dati continua finché non chiudi e rilanci il programma Python.${a.messaggio ? '<br>' + esc(a.messaggio) : ''}</p>`
         : a.stato === 'errore' ? `<p class="agg-riavvio">${esc(a.messaggio || 'Non riesco a controllare.')}</p>`
         : `<p class="agg-ok">Il pannello è aggiornato (versione ${esc(a.versione)}). Quando sostituisci il file, qui compare cosa è cambiato e se si può applicare a caldo.</p>`;
-  } catch (e) { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
+  } catch { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
 }
 setInterval(() => { if (S.pagina === 'impostazioni' && !S.sub && !document.hidden) aggCarica(); }, 20000);
 async function azioniImpostazioni(e) {
@@ -1549,7 +1603,7 @@ async function azioniImpostazioni(e) {
       const r = await inviaPost('/api/aggiornamento/applica', {});
       if (r.ok) { toast(r.messaggio || 'Aggiornato'); setTimeout(() => location.reload(), 900); return; }
       toast(r.messaggio || 'Non è stato possibile aggiornare', true);
-    } catch (err) { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
+    } catch { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
     delete box.dataset.occupato; aggCarica(); return;
   }
   if (id === 'rst-apri' || id === 'rst-annulla') {
@@ -1562,7 +1616,7 @@ async function azioniImpostazioni(e) {
       const r = await inviaPost('/api/database/reset', {conferma: $('#rst-parola').value, password: $('#rst-pw').value});
       if (r.ok) { toast(r.messaggio || 'Fatto'); setTimeout(() => location.reload(), 1500); return; }
       msg.textContent = r.messaggio || 'Non è stato possibile.'; toast(msg.textContent, true);
-    } catch (err) { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
+    } catch { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
     e.target.disabled = false; return;
   }
   if (id === 'b-agg') { S.ricarica = false; carica(); toast('Stato aggiornato'); }
@@ -1577,10 +1631,15 @@ async function azioniImpostazioni(e) {
         Object.entries(r.errori).forEach(([k, m]) => { const el = document.querySelector(`[data-e="${k}"]`); if (el) { el.textContent = m; mostraCampo(el); } });
         toast('Controlla i campi in rosso', true);
       } else toast(r.errore || 'Non salvato', true);
-    } catch (x) { toast('Server non raggiungibile', true); }
+    } catch { toast('Server non raggiungibile', true); }
     e.target.disabled = false;
   } else if (id === 'b-prova') {
-    e.target.disabled = true; try { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); } catch (x) { toast('Server non raggiungibile', true); }
+    e.target.disabled = true; try { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); } catch { toast('Server non raggiungibile', true); }
+    e.target.disabled = false;
+  } else if (id === 'plg-ricarica') {
+    e.target.disabled = true;
+    try { const r = await inviaPost('/api/plugin/ricarica', {}); toast(r.ok ? `Plugin riletti: ${r.plugin}` : 'Non riuscito', !r.ok); S.sporco = false; S.ricarica = true; await carica(); }
+    catch { toast('Server non raggiungibile', true); }
     e.target.disabled = false;
   } else if (id === 'b-pw') {
     const r = await inviaPost('/api/impostazioni/password', {utente: $('#p-ut').value, attuale: $('#p-at').value, nuova: $('#p-nu').value});
@@ -1594,7 +1653,7 @@ const CFS = {zone: null, token: '', passi: null, occupato: false};
 async function cfLeggi() { const r = await fetch('/api/cloudflare', {credentials: 'same-origin', cache: 'no-store'}); if (r.status === 401) { location.href = '/login'; return null; } return r.json(); }
 async function cfCarica(forza) {
   const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
-  let st; try { st = await cfLeggi(); } catch (e) { return; }
+  let st; try { st = await cfLeggi(); } catch { return; }
   if (!st) return;
   S.cfStato = st;
   if (!st.configurato) { if (forza || !el.dataset.wiz) { el.dataset.wiz = '1'; el.innerHTML = cfWizard(st); } return; }
@@ -1663,7 +1722,7 @@ async function cfAzione(e) {
     try { const r = await inviaPost('/api/cloudflare/verifica', {token: CFS.token});
       if (r.ok) { CFS.zone = r.zone; $('#cf-msg').textContent = 'Token valido: ' + r.zone.length + ' dominio/i trovato/i.'; $('#cf-msg').className = 'msg ok'; $('#cf-passo2').innerHTML = cfPasso2(r.zone); cfAnteprima(); }
       else { $('#cf-msg').textContent = r.messaggio; $('#cf-msg').className = 'msg bad'; }
-    } catch (x) { $('#cf-msg').textContent = 'Server non raggiungibile'; $('#cf-msg').className = 'msg bad'; }
+    } catch { $('#cf-msg').textContent = 'Server non raggiungibile'; $('#cf-msg').className = 'msg bad'; }
     e.target.disabled = false;
   } else if (id === 'cf-crea') {
     const z = CFS.zone[+$('#cf-zona').value]; e.target.disabled = true; CFS.occupato = true;
@@ -1682,7 +1741,7 @@ async function cfAzione(e) {
       ul.insertAdjacentHTML('beforeend', a.ok ? '<li class="ok">✓ Tunnel avviato</li>' : `<li class="bad">✗ ${esc(a.messaggio)}</li>`);
       CFS.occupato = false; toast(a.ok ? 'Fatto! Tra qualche secondo l\'indirizzo risponde.' : 'Tunnel creato', !a.ok);
       setTimeout(() => cfCarica(true), 1500);
-    } catch (x) { m.textContent = 'Server non raggiungibile'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; }
+    } catch { m.textContent = 'Server non raggiungibile'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; }
   } else if (id === 'cf-avvia' || id === 'cf-ferma' || id === 'cf-riavvia') {
     e.target.disabled = true; CFS.occupato = true;
     const r = await inviaPost('/api/cloudflare/' + id.slice(3), {}); CFS.occupato = false;
@@ -1734,14 +1793,14 @@ async function carica() {
     // se lo script del pannello e' stato aggiornato mentre la pagina era aperta, si ricarica da sola (una volta sola, per evitare giri a vuoto)
     const nuova = r.headers.get('X-Pdc-Build');
     if (nuova && window.BUILD && nuova !== window.BUILD) {
-      let gia = null; try { gia = sessionStorage.getItem('pdc_build'); } catch (e) { /* niente */ }
-      if (gia !== nuova) { try { sessionStorage.setItem('pdc_build', nuova); } catch (e) { /* niente */ } location.reload(); return; }
+      let gia = null; try { gia = sessionStorage.getItem('pdc_build'); } catch { /* niente */ }
+      if (gia !== nuova) { try { sessionStorage.setItem('pdc_build', nuova); } catch { /* niente */ } location.reload(); return; }
     }
     const dati = await r.json();
     if (pag !== S.pagina) return;
     S.dati = dati; S.dpag = pag; S.off = S.dati.ora - Math.floor(Date.now() / 1000); S.fetchedAt = Date.now();
     disegna();
-  } catch (e) {
+  } catch {
     $('#dot').className = 'dot bad'; $('#agg').textContent = 'Server non raggiungibile';
   } finally {
     caricando = false;
@@ -1756,7 +1815,7 @@ let flusso = null, ultimoMsg = 0;
 // lo si riapre a mano (dopo un errore, al ritorno sulla scheda, quando torna la rete, o se per 45 s non arriva piu' nulla).
 function collega() {
   if (!window.EventSource) return;
-  if (flusso) { try { flusso.close(); } catch (e) { /* niente */ } flusso = null; }
+  if (flusso) { try { flusso.close(); } catch { /* niente */ } flusso = null; }
   const es = new EventSource('/api/flusso');
   flusso = es; ultimoMsg = Date.now();
   const vivo = () => { ultimoMsg = Date.now(); };

@@ -1,0 +1,127 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "centrale termica",
+      "intents": [
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NavigateHomeIntent",
+          "samples": []
+        },
+        {
+          "name": "TemperaturaIntent",
+          "slots": [],
+          "samples": [
+            "temperatura",
+            "la temperatura",
+            "che temperatura c'è",
+            "che temperatura c'è in casa",
+            "quanti gradi ci sono",
+            "quanti gradi ci sono in casa",
+            "temperatura in casa"
+          ]
+        },
+        {
+          "name": "UmiditaIntent",
+          "slots": [],
+          "samples": [
+            "umidità",
+            "l'umidità",
+            "che umidità c'è",
+            "che umidità c'è in casa",
+            "quanta umidità c'è",
+            "umidità in casa"
+          ]
+        },
+        {
+          "name": "AccendiTermostatoIntent",
+          "slots": [],
+          "samples": [
+            "accendi il termostato",
+            "accendi termostato",
+            "accendi lo smarther",
+            "attiva il termostato"
+          ]
+        },
+        {
+          "name": "SpegniTermostatoIntent",
+          "slots": [],
+          "samples": [
+            "spegni il termostato",
+            "spegni termostato",
+            "spegni lo smarther",
+            "disattiva il termostato"
+          ]
+        },
+        {
+          "name": "StatoPdcIntent",
+          "slots": [],
+          "samples": [
+            "cosa sta facendo la pompa di calore",
+            "pompa di calore",
+            "stato della pompa di calore",
+            "cosa fa la pompa di calore",
+            "come va la pompa di calore"
+          ]
+        },
+        {
+          "name": "AcquaCaldaIntent",
+          "slots": [],
+          "samples": [
+            "a che temperatura è l'acqua calda",
+            "acqua calda",
+            "temperatura dell'acqua calda",
+            "quanto è calda l'acqua"
+          ]
+        },
+        {
+          "name": "MandataIntent",
+          "slots": [],
+          "samples": [
+            "che mandata ha il riscaldamento",
+            "mandata",
+            "mandata del riscaldamento",
+            "a che temperatura è la mandata"
+          ]
+        },
+        {
+          "name": "RiscaldamentoAccesoIntent",
+          "slots": [],
+          "samples": [
+            "il riscaldamento è acceso",
+            "riscaldamento acceso",
+            "è acceso il riscaldamento",
+            "sta scaldando"
+          ]
+        },
+        {
+          "name": "RipartenzaIntent",
+          "slots": [],
+          "samples": [
+            "a che ora partirà il riscaldamento",
+            "quando riparte il riscaldamento",
+            "quando riparte",
+            "a che ora riparte il riscaldamento",
+            "ripartenza"
+          ]
+        }
+      ],
+      "types": []
+    }
+  }
+}

@@ -231,6 +231,12 @@ def main(argv=None, base=AQUI):
             app.ferma()
             return 1
         avvia_tunnel_se_serve(app)
+        try:
+            n_plugin = plugin_ricarica(app)
+            if n_plugin:
+                log.info("Plugin trovati: %d", n_plugin)
+        except Exception:
+            log.exception("caricamento dei plugin fallito (il pannello parte lo stesso)")
         porta = srv.server_address[1]
         log.info("Interfaccia web attiva sulla porta %s", porta)
         print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))
@@ -242,6 +248,10 @@ def main(argv=None, base=AQUI):
         except KeyboardInterrupt:
             log.info("Fermato.")
         app.ferma()
+        try:
+            plugin_ferma_tutti()
+        except Exception:
+            log.exception("arresto dei plugin")
         if getattr(app, "tunnel", None):
             app.tunnel.chiudi_con_il_pannello()
         if getattr(app, "telegram", None):

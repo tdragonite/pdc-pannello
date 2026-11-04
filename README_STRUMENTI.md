@@ -1,0 +1,181 @@
+# Strumenti di appoggio (pdc_strumenti.py)
+
+Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`) vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
+
+Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
+
+---
+
+## 0. Preparazione (5 minuti)
+
+1. Crea una cartella, per esempio `pdc`, e mettici dentro `pdc_strumenti.py`.
+2. Apri un terminale **dentro quella cartella**:
+   - **Windows**: apri la cartella in Esplora risorse, tieni premuto *Maiusc* e fai clic destro su uno spazio vuoto → *Apri finestra PowerShell qui*.
+   - **Mac**: tasto destro sulla cartella → *Nuovo Terminale nella cartella*.
+3. Controlla che Python ci sia: scrivi `python --version` (su Mac `python3 --version`). Deve comparire 3.9 o più.
+   Nei comandi qui sotto uso `python`; su Mac scrivi `python3`.
+4. Lancia `python pdc_strumenti.py st-devices`. La prima volta crea un file **`config.json`** vuoto e si ferma. Apri `config.json` con il Blocco note: è l'unico file dove metterai le tue chiavi.
+
+> `config.json` contiene password e token. **Non mandarlo mai a nessuno**, nemmeno a me.
+
+---
+
+## 1. Dump SmartThings (quando serve capire cosa espone la pompa)
+
+Serve a sapere **esattamente come si chiamano** i valori della tua pdc (mandata, ritorno, portata, frequenza del compressore, curva climatica...). Lo script del repo GitHub ne mostra solo una parte.
+
+1. Vai su <https://account.smartthings.com/tokens> → *Generate new token* → dagli un nome → spunta i permessi **Devices: List devices, See devices** → copia il token (si vede una sola volta).
+2. In `config.json`, nella sezione `smartthings`, incolla il token tra le virgolette di `"pat"`. Salva.
+3. Lancia:
+   ```
+   python pdc_strumenti.py st-devices
+   python pdc_strumenti.py st-dump
+   ```
+   Il primo trova la pdc e salva il suo `device_id` nel config. Il secondo crea due file nella cartella **`diagnostica`** (accanto allo script):
+   - `dump_smartthings_status.json`
+   - `dump_smartthings_device.json`
+4. **Allegali a chi ti aiuta.** Sono già ripuliti dai dati personali (id del proprietario e del luogo).
+
+Il token personale (PAT) dura 24 ore, ma per il dump basta.
+
+---
+
+## 2. Token OAuth che si rinnova da solo (consigliato, ma si può fare dopo)
+
+Con il PAT dovresti incollarne uno nuovo ogni giorno. Con OAuth il pannello si rinnova il token da solo.
+
+**Due avvertenze oneste:**
+- Samsung ha dichiarato che l'accesso OAuth alle API non sarà più gratuito. Non ho trovato conferma di cosa sia successo dopo ottobre 2026, quindi **potrebbe non funzionare o chiederti di pagare**. Se la creazione dell'app fallisce, non è colpa tua: resta il PAT (il pannello avrà una pagina dove incollarne uno nuovo e ti avviserà su Telegram prima della scadenza).
+- Il *refresh token* è **monouso**: a ogni rinnovo ne arriva uno nuovo e il vecchio muore. Lo script lo riscrive da solo in `config.json`. Per questo non far girare due programmi con lo stesso `config.json` contemporaneamente.
+
+### 2a. Installa la SmartThings CLI
+- **Mac**: `brew install smartthingscommunity/smartthings/smartthings`
+- **Windows / altri**: scarica l'installer dalla pagina *Releases* di <https://github.com/SmartThingsCommunity/smartthings-cli>, oppure, se hai Node.js, `npm install -g @smartthings/cli`.
+
+### 2b. Crea l'app OAuth
+Nel terminale lancia `smartthings apps:create`. Al primo uso si apre il browser per accedere con l'account Samsung. Poi risponde a una serie di domande (le parole esatte possono cambiare):
+- tipo di app: **OAuth-In App**
+- nome e descrizione: quello che vuoi (es. "Pannello PDC")
+- permessi (*scopes*): seleziona **`r:devices:*`** (lettura) e, se vuoi accendere/spegnere dal pannello, anche **`x:devices:*`** (comando)
+- Redirect URI: **`https://httpbin.org/get`** (scrivilo identico)
+- il resto (icona, target URL...): lascia vuoto
+
+Alla fine ti mostra **Client ID** e **Client Secret**. Il secret **si vede una volta sola**: copialo subito.
+
+### 2c. Autorizza
+Lancia `python pdc_strumenti.py st-oauth`, incolla Client ID e Secret quando li chiede, apri l'indirizzo che ti stampa (**usa Chrome**: con Edge a volte dà errore), accedi con l'account Samsung e consenti. Finisci su una pagina semplice di testo con una riga `"code": "...."`: incolla quel codice (o tutta la pagina) nel terminale **subito**, perché dura poco.
+
+Se tutto va bene scrive i token in `config.json` e hai finito.
+
+---
+
+## 3. Dump Netatmo / Smarther (per diagnosticare temperatura, umidità e richiesta di calore)
+
+1. Vai su <https://dev.netatmo.com> → *My apps* → la tua app → *Token generator*.
+2. **Seleziona gli scope** (permessi) dello Smarther: **`read_smarther`** per leggere e, se vuoi accendere/spegnere dal pannello, anche **`write_smarther`**. Poi *Generate token*.
+   > Rigenerare i token **invalida quelli vecchi**.
+3. In `config.json`, sezione `netatmo`, compila: `client_id`, `client_secret`, `access_token`, `refresh_token`. Salva.
+4. Lancia:
+   ```
+   python pdc_strumenti.py nt-dump
+   ```
+   Stampa gli scope che il token ha davvero, i valori di temperatura/setpoint/caldaia che trova e se trova l'**umidità**. Crea:
+   - `diagnostica/dump_netatmo_homesdata.json`
+   - `diagnostica/dump_netatmo_homestatus_1.json` (e `_2`, ... se hai più case)
+5. **Allegali in chat.** Coordinate, città, email e indirizzi MAC sono già tolti, ma dai comunque un'occhiata con il Blocco note prima di mandarli.
+
+---
+
+## 4. Cosa mandare a chi ti aiuta
+
+| File | Obbligatorio |
+|---|---|
+Tutti i file stanno nella cartella `diagnostica` accanto allo script.
+
+| File | Quando |
+|---|---|
+| `dump_smartthings_status.json` e `dump_smartthings_device.json` | per capire cosa espone la pompa |
+| `dump_netatmo_homesdata.json` e `dump_netatmo_homestatus_1.json` | per lo Smarther |
+| `diagnostica.json` (lo crea il pannello con `python pdc_pannello.py esporta-diagnostica`) | per problemi sui dati o sull'indicatore |
+| `prova_refresh.json` | dopo `st-prova-refresh` |
+| `config.json` | **MAI** |
+
+---
+
+## Se qualcosa non va
+
+| Messaggio | Cosa significa |
+|---|---|
+| `python non e' riconosciuto` | Python non è installato o non è nel PATH. Installalo da python.org spuntando *Add to PATH*. |
+| `config.json non e' un JSON valido` | Hai tolto o aggiunto una virgola/virgoletta. Ogni valore va tra `"virgolette"`, e tutte le righe tranne l'ultima di un blocco finiscono con la virgola. |
+| `SmartThings: 401` | Token scaduto o sbagliato (il PAT dura 24 ore). Generane uno nuovo. |
+| `SmartThings: 403` | Al token mancano i permessi. Rigeneralo spuntando *List* e *See devices*. |
+| `SmartThings: 429` | Troppe richieste. Aspetta un minuto. |
+| `Netatmo ... scope mancante` | Rigenera il token dal portale con gli scope dello Smarther. |
+| `Nessuna casa trovata` (Netatmo) | Il token non vede lo Smarther: stesso rimedio, scope. |
+
+---
+
+## 5. Sbrinamenti (dalla 0.19)
+
+```
+python pdc_strumenti.py sbrinamenti                 ultimi 7 giorni
+python pdc_strumenti.py sbrinamenti --giorni 30     altro periodo
+python pdc_strumenti.py sbrinamenti --salva         scrive anche diagnostica/sbrinamenti.json
+```
+
+Legge `dati/pdc.db` (serve `pdc_pannello.py` nella stessa cartella) e stampa data, durata, kWh ed esterna di ogni sbrinamento, con la media. Trova solo quelli registrati dal pannello da quando e' stato avviato: SmartThings non permette di tornare indietro nel tempo.
+
+## 6. Prova dei webhook Netatmo (novembre 2026)
+
+Netatmo ridurra' i limiti del polling dal 1 marzo 2027 e propone i webhook (il servizio ti avvisa quando cambia qualcosa). Prima di cambiare il pannello, questo comando guarda cosa arriva davvero dallo Smarther.
+
+**Il pannello puo' restare acceso**: il comando non lo tocca. Apre un ricevitore sul tuo PC (su una porta libera scelta da solo), lo rende raggiungibile con un tunnel temporaneo di Cloudflare (indirizzo casuale `*.trycloudflare.com`, senza account, il tuo `pdc.cosedafare.me` non c'entra), registra quell'indirizzo come webhook su Netatmo e, alla fine, **lo rimuove**.
+
+```
+python pdc_strumenti.py nt-webhook-prova
+```
+
+1. Lancia il comando (di default resta in ascolto 30 minuti; `--minuti 10` per una prova breve).
+2. Quando compare "Ascolto per ...", muovi lo Smarther: cambia la temperatura impostata dall'app BTicino, accendi e spegni, aspetta una partenza o uno stop del riscaldamento. Vedrai comparire gli eventi riga per riga.
+3. A fine tempo c'e' un riepilogo e il file `diagnostica/webhook_eventi.json` (user_id, home_id e indirizzi sono gia' omessi): controllalo con il Blocco note e mandalo a Claude.
+
+Cosa guarda: quali tipi di evento arrivano, con che ritardo, quali campi portano (temperatura, setpoint, umidita', richiesta di calore) e, dopo ogni evento, li confronta con quello che dice `homestatus` (al massimo 12 confronti, per non consumare richieste).
+
+Note:
+- Se Ctrl+C o un errore lo interrompe, il comando prova comunque a rimuovere il webhook. Se restasse registrato: `python pdc_strumenti.py nt-webhook-prova --elimina`.
+- Usa il token Netatmo del pannello **senza rinnovarlo** (Netatmo cambia il refresh token a ogni rinnovo: farlo a pannello acceso lo romperebbe). Se il token sta per scadere ti dice di riprovare tra qualche minuto; con il pannello FERMO puoi usare `--rinnova`.
+- **`--metodo nuovo`**: registra con il servizio nuovo di Netatmo (`POST /webhooks/v1/`) invece di `/api/addwebhook`, e alla fine toglie con `DELETE /webhooks/v1/`. Parte solo se l'elenco dei webhook dell'account e' vuoto (il DELETE li toglie *tutti*). Se resta registrato: `python pdc_strumenti.py nt-webhook-prova --metodo nuovo --elimina`.
+- Servono `cloudflared` nella cartella `cloudflared` accanto allo script (c'e' gia' se il pannello usa il tunnel) e il `client_secret` Netatmo in `config.json`.
+- Se il tunnel temporaneo e' bloccato o Netatmo lo rifiuta, il comando lo dice: manda l'output a Claude.
+
+## 7. Ripartenza prevista (rip-diag, dalla 0.19)
+
+Se nella card dello Smarther non compare «Ripartenza prevista», questo comando dice perché.
+
+```
+python pdc_strumenti.py rip-diag                 ultime 15 pause del riscaldamento
+python pdc_strumenti.py rip-diag --ultime 30     piu' pause
+python pdc_strumenti.py rip-diag --salva         scrive anche diagnostica/rip_diag.json
+```
+
+Legge `dati/pdc.db` (come `sbrinamenti`, anche a pannello acceso; serve `pdc_pannello.py` nella stessa cartella) e usa le stesse funzioni del pannello. Stampa i dati dello Smarther che ci sono nel database, poi le pause del riscaldamento trovate nello storico, una per riga: «OK» con la velocita' di discesa della temperatura (`k`) oppure «scartata» con il motivo (pausa troppo corta, la temperatura non scende, la pausa non e' finita, buchi nei dati). Servono almeno 5 pause valide per una stima. Con `--salva` scrive il rapporto in `diagnostica/rip_diag.json`: mandalo a chi ti aiuta.
+
+## Esperimento: il comando "refresh" anticipa i dati del ciclo?
+
+I dati del compressore arrivano da SmartThings con 4-5 minuti di ritardo, a pacchetti. Questo test prova se il comando `refresh` li fa arrivare prima.
+Per non scambiare il caso per un effetto, fa 8 giri da 2 minuti in ordine casuale: 4 CON il refresh e 4 SENZA (controllo), poi confronta quante volte arrivano dati nuovi nei due casi (circa 22 minuti con le pause).
+
+1. **Ferma il pannello** (usa lo stesso token OAuth: in due insieme si pestano i piedi).
+2. Dalla cartella dello script:
+   ```
+   python pdc_strumenti.py st-prova-refresh
+   ```
+3. Aspetta la fine (compare il "Riepilogo" con il verdetto). Riavvia il pannello e allega `diagnostica/prova_refresh.json`.
+
+Tra un giro e l'altro c'e' una pausa di 45 secondi (non conteggiata) cosi' i dati in ritardo non sporcano il giro dopo.
+
+Opzioni: `--giri 16` (piu' giri = risultato piu' affidabile, sempre un numero pari), `--finestra 180` (secondi per giro), `--ogni 15` (secondi tra le letture).
+Non modifica nessuna impostazione della pdc: manda solo `refresh`, come il pulsante di aggiornamento dell'app.
+
+**Risultato del 3/11/2026** (24 giri complessivi, ordine casuale): con il refresh dati nuovi in 7 giri su 12, quasi sempre dopo 10 secondi; senza refresh in 1 su 12. Dati freschi (meno di 3 minuti) solo con il refresh, ma in circa metà dei tentativi non arriva niente. Il pannello 0.18 ha l'opzione per usarlo (Impostazioni → Collegamenti).

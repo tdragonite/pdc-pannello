@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.19"
+VERSIONE = "0.20"
 
 import argparse
 import base64
@@ -43,6 +43,7 @@ import threading
 import shutil
 import time
 import traceback
+import types
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,6 +299,7 @@ TEMPLATE = {
     "telegram": {},        # riempito sotto da TELEGRAM_DEFAULT (parte Telegram)
     "allarmi": {},         # idem da ALLARMI_DEFAULT
     "cloudflare": {},      # idem da CLOUDFLARE_DEFAULT
+    "plugin": {},          # una sottosezione per plugin (cartella plugin): {"nome": {"attivo": false, ...}}
     "mappa_ciclo": MAPPA_CICLO_DEFAULT,
 }
 
@@ -1700,9 +1702,9 @@ a{color:var(--acs)}
 .dev-st{display:grid;gap:4px;justify-items:end}
 .dev-gr{margin-top:12px}
 .dev-gr h3{margin:0 0 2px}
-.dev .riga b{max-width:68%;word-break:break-word;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
-.dev .riga b .val-c{font-variant-numeric:tabular-nums}
-.dev .riga{align-items:flex-start}
+.dev .riga b,.plg .riga b{max-width:68%;word-break:break-word;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.dev .riga b .val-c,.plg .riga b .val-c{font-variant-numeric:tabular-nums}
+.dev .riga,.plg .riga{align-items:flex-start}
 .nota-r{font-weight:400;font-size:12px;text-align:right}
 .cv{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:4px 8px}
 .copia{font:inherit;font-size:11.5px;font-weight:600;color:var(--mut);background:var(--card2);border:1px solid var(--linea);border-radius:8px;padding:2px 9px;cursor:pointer}
@@ -1720,7 +1722,8 @@ a{color:var(--acs)}
 .fsv-gr>summary .d{font-weight:400;font-size:12.5px;color:var(--mut)}
 .fsv-gr[open]>summary{margin-bottom:6px}
 .fsv-id{display:inline-block;min-width:42px;margin-right:8px;font-style:normal;font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:var(--mut2)}
-.dev .riga>span:first-child{max-width:62%}
+.dev .riga>span:first-child,.plg .riga>span:first-child{max-width:62%}
+details.riq>summary .pill{margin-left:auto}
 .rosso{color:#ff6b6b}
 details.riq>summary::after,.fsv-gr>summary .d::after,.cl-vecchie>summary::before,.come-b::after,.tile[data-come] small::after{content:"";display:inline-block;flex:none;width:var(--chv,7px);height:var(--chv,7px);border:solid currentColor;border-width:0 var(--chw,2px) var(--chw,2px) 0;transform:rotate(-45deg);transition:transform .15s}
 details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[open]>summary::before,.come-b.on::after,.tile[data-come].on small::after{transform:rotate(45deg)}
@@ -1779,7 +1782,6 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 .conf-d.buono{color:var(--ok,#62eba6)}.conf-d.cattivo{color:var(--casa,#ff6b57)}
 .nota.conf-nota{margin-top:0}
 .conf-t{display:block;margin-top:4px;color:var(--mut);font-size:12px}
-#imp-tabs .sub-tabs{margin-bottom:14px}
 .azioni-t{display:flex;gap:8px}
 .azioni-t .sec{padding:6px 12px;font-size:13px}
 .reg-filtro{display:flex;align-items:center;gap:8px;margin:12px 0 8px;font-size:14px;color:var(--mut)}
@@ -1790,7 +1792,7 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 /* Impostazioni: tab e riquadri collassabili */
 #imp-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
 #imp-tabs::-webkit-scrollbar{display:none}
-#imp-tabs .sub-tabs{display:flex;width:max-content;min-width:100%}
+#imp-tabs .sub-tabs{margin-bottom:14px;display:flex;width:max-content;min-width:100%}
 #imp-tabs .sub-tabs a{white-space:nowrap;padding:7px 14px}
 .imp-tab[hidden]{display:none}
 .imp-tab>details.riq{margin-bottom:12px}
@@ -1897,7 +1899,7 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 @media(max-width:560px){.exp{grid-template-columns:1fr}}
 ''',
     'app.js': r'''// impronta di questa versione dello script: la prende dall'indirizzo con cui e' stato caricato (app.js?v=...)
-window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch (e) { return ''; } })();
+window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch { return ''; } })();
 (() => {
 'use strict';
 
@@ -1905,8 +1907,8 @@ window.BUILD = (() => { try { return new URL(document.currentScript.src).searchP
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const ls = {
-  get(k, d) { try { const v = localStorage.getItem('pdc.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem('pdc.' + k, JSON.stringify(v)); } catch (e) {} },
+  get(k, d) { try { const v = localStorage.getItem('pdc.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('pdc.' + k, JSON.stringify(v)); } catch {} },
 };
 const num = (v, d = 1) => (v == null || isNaN(v)) ? '—' : Number(v).toLocaleString('it-IT', {minimumFractionDigits: d, maximumFractionDigits: d});
 const gr = v => v == null ? '—' : num(v) + '°';
@@ -2184,7 +2186,7 @@ document.addEventListener('change', async e => {
     const r = await inviaPost('/api/controlli', {cosa, acceso});
     if (r.ok) toast(nome + ': comando inviato');
     else { delete S.opt[cosa]; toast(r.errore || 'Comando non riuscito', true); }
-  } catch (err) { delete S.opt[cosa]; toast('Comando non riuscito: il pannello non risponde', true); }
+  } catch { delete S.opt[cosa]; toast('Comando non riuscito: il pannello non risponde', true); }
   delete S.occ[cosa];
   armaSblocco(); ridisegnaComandi();
 });
@@ -2415,7 +2417,7 @@ function largTesto(t) {   // larghezza vera di un testo dei grafici (11 px, stes
   try {
     if (!cvTesto) { cvTesto = document.createElement('canvas').getContext('2d'); cvTesto.font = '11px ' + getComputedStyle(document.body).fontFamily; }
     return cvTesto.measureText(t).width;
-  } catch (_) { return t.length * 6.5; }
+  } catch { return t.length * 6.5; }
 }
 // colonna dei numeri dell'asse verticale, larga quanto serve. Telefono: stima (2 cifre ≈ 21 px); PC: misura vera col font della pagina,
 // cosi' la prima cifra cade sulla prima lettera del titolo
@@ -2641,7 +2643,7 @@ function zoomaGiu(e) {
   if (dita.size === 2 && !pizzico) {
     const [a, b] = [...dita.values()], v = S.dati;
     pizzico = {el, dist0: Math.max(30, Math.abs(a.x - b.x)), span0: v.a - v.da, tc: v.da + unita(fraz(el, (a.x + b.x) / 2)) * (v.a - v.da)};
-    try { dita.forEach((_, id) => el.setPointerCapture(id)); } catch (_) {}
+    try { dita.forEach((_, id) => el.setPointerCapture(id)); } catch {}
     togliCursore();
   }
 }
@@ -2652,7 +2654,7 @@ function zoomaMuovi(e) {
     if (!trascina) {
       if (Math.abs(p.x - p.x0) < 8 || Math.abs(p.x - p.x0) < Math.abs(p.y - p.y0)) return false;
       trascina = {da: S.zoom.da, span: S.zoom.a - S.zoom.da, x0: p.x0};
-      try { p.el.setPointerCapture(e.pointerId); } catch (_) {}
+      try { p.el.setPointerCapture(e.pointerId); } catch {}
       togliCursore(); tocco = null;
     }
     const o = S.dati.pieno || S.dati;
@@ -2687,7 +2689,7 @@ function zoomaSu(e) {
 }
 
 // ---------- Impostazioni > Registro ----------
-const TAB_IMP = [['', 'Stato'], ['collegamenti', 'Collegamenti'], ['avvisi', 'Avvisi'], ['accesso', 'Accesso'], ['dati', 'Dati'], ['registro', 'Registro']];
+const TAB_IMP = [['', 'Stato'], ['collegamenti', 'Collegamenti'], ['avvisi', 'Avvisi'], ['integrazioni', 'Integrazioni'], ['accesso', 'Accesso'], ['dati', 'Dati'], ['registro', 'Registro']];
 function vistaImp() {
   const tab = $('#imp-tabs'); if (!tab) return;
   const cur = TAB_IMP.some(([k]) => k === S.sub) ? S.sub : '';
@@ -2705,7 +2707,7 @@ async function caricaRegistro() {
     const r = await fetch('/api/registro?righe=150', {credentials: 'same-origin', cache: 'no-store'});
     if (r.status === 401) { location.href = '/login'; return; }
     S.reg = await r.json(); disegnaRegistro();
-  } catch (e) { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
+  } catch { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
 }
 const pesoTxt = b => b >= 1e6 ? num(b / 1e6, 1) + ' MB' : num(b / 1e3, 0) + ' KB';
 function disegnaRegistro() {
@@ -2825,13 +2827,19 @@ window.addEventListener('scroll', () => { if (S.meteoAperto) chiudiMeteo(); }, {
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola: i dettagli tecnici stanno in PIANO.md.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
-  ['ora', 'Ripartenza prevista', 'Nella card Smarther: a che ora il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
-  ['tipici', 'Giorni tipici', 'In Efficienza → Confronta: il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
-  ['avviso', 'Avviso dal tunnel', 'Telegram ti scrive se da internet il pannello non risponde, e lo chiude da solo quando torna tutto a posto.'],
-  ['sbr', 'Sbrinamenti', 'In Efficienza l’elenco degli sbrinamenti con consumo e temperatura, e due avvisi Telegram silenziosi: inizio e fine.'],
+  ['plugin', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», si accendono e si ricaricano senza riavviare.'],
+  ['alexa', 'Alexa', 'Il primo plugin: chiedi temperatura, umidità, PdC e acqua calda, o accendi e spegni lo Smarther, con le Routine di Alexa.'],
+  ['live', 'Stato in diretta', 'Stato e richieste dei plugin si aggiornano da soli, senza ricaricare la pagina.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', alexa: '🔊', live: '↻'};
 const CHANGELOG = [
+  {v: '0.20', quando: '4 novembre 2026', titolo: 'Integrazioni e Alexa', righe: [
+    ['n', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», con interruttore, campi e stato. Un plugin nuovo parte spento, si ricarica con un tasto e, se si rompe, non ferma mai il pannello.'],
+    ['n', 'Alexa', 'Il primo plugin: con le Routine di Alexa chiedi temperatura e umidità, se il riscaldamento è acceso e quando riparte, cosa fa la PdC, acqua calda e mandata, oppure accendi e spegni lo Smarther. Non devi pronunciare il nome della skill.'],
+    ['n', 'Indirizzo protetto per Alexa', 'L’indirizzo che dai ad Amazon contiene un segreto, accetta solo la tua skill e richieste fresche e uniche; con «Verifica firma Amazon» controlla anche che arrivino davvero da Amazon.'],
+    ['m', 'Stato dei plugin in diretta', 'Stato, contatore e ultima richiesta si aggiornano da soli ogni pochi secondi, senza toccare quello che stai scrivendo.'],
+    ['m', 'Indirizzo da fuori casa', 'Gli indirizzi pubblici dei plugin si mostrano già con il tuo indirizzo Cloudflare, pronti da copiare.'],
+  ]},
   {v: '0.19', quando: '3 novembre 2026', titolo: 'Ripartenza prevista e giorni tipici', righe: [
     ['n', 'Ripartenza prevista', 'Nella card Smarther: l’ora in cui il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
     ['n', 'Giorni tipici', 'Efficienza → Confronta: sui grafici dei giorni compare il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
@@ -2847,6 +2855,7 @@ const CHANGELOG = [
     ['m', 'Avvisi nelle card', '«Smarther non collegato» in rosso, «Ultimo dato delle…» in giallo, nello stesso box della ripartenza (anche per la PdC ferma nella card Esterna).'],
     ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra sempre 3 righe da 3 ore a partire da adesso, con la scritta «Oggi»: mai «Domani», nemmeno a sera tarda.'],
     ['m', 'Card Smarther stabile', 'Su PC la card ha sempre la stessa altezza, con o senza la riga della ripartenza: niente più saltelli.'],
+    ['s', 'Password chiesta a ogni apertura', 'Su iPhone, se l’icona della Home era stata salvata mentre eri sulla pagina di accesso, ogni apertura mostrava il modulo di login anche con la sessione ancora valida (30 giorni). Ora, se sei già dentro, «/login» ti porta subito alla dashboard. Il login, i tentativi massimi e la sicurezza dei cookie non sono cambiati.'],
   ]},
   {v: '0.18', quando: '3 novembre 2026', titolo: 'Meteo, costo del mese e dati più freschi', righe: [
     ['n', 'Meteo', 'Nella scheda Esterna: icona e forchetta di oggi, due modelli a confronto; toccala per il dettaglio ogni 3 ore.'],
@@ -2938,7 +2947,7 @@ function disegnaChangelog() {
 // ---------- Efficienza ----------
 const euro = v => v == null ? '—' : v.toLocaleString('it-IT', {style: 'currency', currency: 'EUR'});
 const fm = (v, n = 1) => v == null ? '—' : num(v, n);
-const giornoBreve = g => { const [y, m, d] = g.giorno.split('-'); return `${d}/${m}`; };
+const giornoBreve = g => { const [, m, d] = g.giorno.split('-'); return `${d}/${m}`; };
 
 // confronto con il periodo di pari durata subito prima: differenza in % (null se il dato prima e' troppo piccolo)
 function diffPerc(ora_, prima, minimo = 0.5) {
@@ -3291,12 +3300,12 @@ document.addEventListener('click', e => {
   disegna();
 });
 async function copiaTesto(t) {
-  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true; } } catch (e) { /* si prova l'altro metodo */ }
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true; } } catch { /* si prova l'altro metodo */ }
   try {
     const a = document.createElement('textarea'); a.value = t; a.setAttribute('readonly', '');
     a.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px'; document.body.appendChild(a);
     a.select(); a.setSelectionRange(0, t.length); const ok = document.execCommand('copy'); a.remove(); return ok;
-  } catch (e) { return false; }
+  } catch { return false; }
 }
 document.addEventListener('click', async e => {
   const b = e.target.closest && e.target.closest('.copia'); if (!b) return;
@@ -3318,8 +3327,8 @@ function campoHtml(c) {
 }
 
 // Riquadri collassabili: lo stato aperto/chiuso si ricorda per ogni riquadro (per il primo di ogni tab, aperto di partenza)
-function impAperti() { try { return JSON.parse(localStorage.getItem('pdc_imp_aperti2') || '{}') || {}; } catch (e) { return {}; } }
-function impRicorda(id, aperto) { try { const m = impAperti(); m[id] = aperto; localStorage.setItem('pdc_imp_aperti2', JSON.stringify(m)); } catch (e) { /* niente */ } }
+function impAperti() { try { return JSON.parse(localStorage.getItem('pdc_imp_aperti2') || '{}') || {}; } catch { return {}; } }
+function impRicorda(id, aperto) { try { const m = impAperti(); m[id] = aperto; localStorage.setItem('pdc_imp_aperti2', JSON.stringify(m)); } catch { /* niente */ } }
 function riquadro(id, titolo, corpo, primo, extra = '') {
   const m = impAperti(), ap = id in m ? m[id] : false;   // chiusi di partenza; poi si ricorda cosa apri
   return `<details class="card imp riq" data-id="${id}" ${ap ? 'open' : ''}><summary><h2>${esc(titolo)}</h2>${extra}</summary><div class="riq-c">${corpo}</div></details>`;
@@ -3356,9 +3365,57 @@ function disponiColonne() {
     });
     fine();
     altri.forEach(a => tab.appendChild(a));
+    tab.querySelectorAll(':scope > .cima').forEach(a => tab.prepend(a));
   });
 }
 document.addEventListener('toggle', e => { const t = e.target; if (t.classList && t.classList.contains('riq') && riquadroLargo(t) && t.closest('#imp')) disponiColonne(); }, true);
+// ---------- Impostazioni > Integrazioni (plugin) ----------
+const PLG_STATO = {attivo: ['si', 'attivo'], spento: ['no', 'spento'], errore: ['bad', 'errore']};
+function pluginRighe(p) {
+  const base = p.base || location.origin;      // l'indirizzo da fuori casa, se il tunnel c'è
+  const rotte = p.rotte.map(r => `<span class="cv"><span class="val-c">${esc(base + r)}</span><button type="button" class="copia" data-copia="${esc(base + r)}" aria-label="Copia l'indirizzo">Copia</button></span>`).join('<br>');
+  return [
+    p.messaggio ? riga('Stato', esc(p.messaggio)) : '',
+    p.errore ? riga('Problema', `<small class="msg bad">${esc(p.errore)}</small>`) : '',
+    riga('File', `<span>${esc(p.file)}${SEP}<small class="mut">${p.versione ? 'versione ' + esc(p.versione) + SEP : ''}${esc(p.sha)}</small></span>`),
+    p.rotte.length ? riga('Indirizzi pubblici', rotte) : '',
+    p.rotte.length ? riga('Richieste', `<span>${num(p.richieste, 0)}${SEP}<small class="mut">ultima ${fa(p.ultima)}</small></span>`) : '',
+  ].join('');
+}
+function pluginPillola(p) { const [cl, tx] = PLG_STATO[p.stato] || ['no', p.stato]; return pallino(cl, tx); }
+function pluginRiquadro(s) {
+  const p = s.plugin;
+  return riquadro('s-' + s.id, s.titolo, `${s.nota ? `<p class="nota-sez">${esc(s.nota)}</p>` : ''}<div class="righe plg">${pluginRighe(p)}</div>
+      ${s.campi.length ? `<div class="campi">${s.campi.map(campoHtml).join('')}</div>` : ''}`, false, pluginPillola(p));
+}
+// Stato e contatore dei plugin si aggiornano da soli (ogni 5 s, solo se guardi la scheda Integrazioni): si rifanno le righe e il badge,
+// mai i campi, cosi' quello che stai scrivendo e i riquadri aperti restano com'erano.
+let plgOccupato = false;
+async function plgAggiorna() {
+  if (plgOccupato || document.hidden || S.pagina !== 'impostazioni' || S.sub !== 'integrazioni') return;
+  plgOccupato = true;
+  try {
+    const r = await fetch('/api/impostazioni', {credentials: 'same-origin', cache: 'no-store'});
+    if (!r.ok || S.sub !== 'integrazioni') return;
+    const d = await r.json();
+    d.sezioni.filter(x => x.tab === 'integrazioni' && x.plugin).forEach(x => {
+      const det = document.querySelector(`#imp details.riq[data-id="s-${x.id}"]`); if (!det) return;
+      const righe = det.querySelector('.righe.plg'), pill = det.querySelector('summary .pill'), sel = window.getSelection && window.getSelection();
+      if (righe && !(sel && !sel.isCollapsed && righe.contains(sel.anchorNode))) {      // non toccare un testo che stai selezionando
+        const nuovo = pluginRighe(x.plugin);
+        if (righe.innerHTML !== nuovo) righe.innerHTML = nuovo;
+      }
+      if (pill) { const n = pluginPillola(x.plugin); if (pill.outerHTML !== n) pill.outerHTML = n; }
+    });
+  } catch { /* al prossimo giro */ } finally { plgOccupato = false; }
+}
+setInterval(plgAggiorna, 5000);
+function pluginTab(d) {
+  const lista = d.sezioni.filter(s => s.tab === 'integrazioni');
+  return `<article class="card cima"><div class="ch"><h2>Integrazioni</h2><button type="button" class="sec piccolo" id="plg-ricarica">Ricarica i plugin</button></div>
+      <p class="nota-sez">Le integrazioni sono file nella cartella <code>plugin</code>, accanto a <code>pdc_pannello.py</code>: si aggiungono e si aggiornano senza toccare il pannello.
+      Un plugin nuovo parte spento; un errore dentro un plugin non ferma mai il pannello. Dopo aver cambiato un file premi «Ricarica i plugin».${lista.length ? '' : '<br><b>Nessun plugin trovato.</b>'}</p></article>${lista.map(pluginRiquadro).join('')}`;
+}
 function disegnaImpostazioni(d) {
   const box = $('#imp'); if (!box) return;
   const stato_ = $('#imp-stato'); if (stato_) stato_.innerHTML = statoImpostazioni(d.stato);
@@ -3386,6 +3443,7 @@ function disegnaImpostazioni(d) {
     <div class="imp-tab" data-t="collegamenti" hidden>${sez('collegamenti')}</div>
     <div class="imp-tab" data-t="avvisi" hidden>${sez('avvisi')}
       ${riquadro('allarmi', 'Quando avvisarti', `<p class="nota-sez">Tocca un avviso per cambiarne le soglie o spegnerlo.</p><div class="lista-allarmi">${all}</div>`, false)}</div>
+    <div class="imp-tab" data-t="integrazioni" hidden>${pluginTab(d)}</div>
     <div class="imp-tab" data-t="accesso" hidden>
       ${riquadro('password', 'Password del pannello', pw, true)}
       <details class="card imp riq" data-id="cf" id="cf-d" ${cfAp ? 'open' : ''}><summary><h2>Accesso da internet (Cloudflare)</h2></summary><div class="riq-c" id="cf"><div class="vuoto" style="padding:14px 0">Controllo l'accesso da internet…</div></div></details></div>
@@ -3433,7 +3491,7 @@ async function aggCarica() {
         ? `<p class="agg-riavvio"><b>Per la versione ${esc(a.versione_disco)} serve il riavvio completo</b>${cosa ? ' (cambiato: ' + cosa + ')' : ''}.<br>La raccolta dei dati continua finché non chiudi e rilanci il programma Python.${a.messaggio ? '<br>' + esc(a.messaggio) : ''}</p>`
         : a.stato === 'errore' ? `<p class="agg-riavvio">${esc(a.messaggio || 'Non riesco a controllare.')}</p>`
         : `<p class="agg-ok">Il pannello è aggiornato (versione ${esc(a.versione)}). Quando sostituisci il file, qui compare cosa è cambiato e se si può applicare a caldo.</p>`;
-  } catch (e) { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
+  } catch { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
 }
 setInterval(() => { if (S.pagina === 'impostazioni' && !S.sub && !document.hidden) aggCarica(); }, 20000);
 async function azioniImpostazioni(e) {
@@ -3445,7 +3503,7 @@ async function azioniImpostazioni(e) {
       const r = await inviaPost('/api/aggiornamento/applica', {});
       if (r.ok) { toast(r.messaggio || 'Aggiornato'); setTimeout(() => location.reload(), 900); return; }
       toast(r.messaggio || 'Non è stato possibile aggiornare', true);
-    } catch (err) { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
+    } catch { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
     delete box.dataset.occupato; aggCarica(); return;
   }
   if (id === 'rst-apri' || id === 'rst-annulla') {
@@ -3458,7 +3516,7 @@ async function azioniImpostazioni(e) {
       const r = await inviaPost('/api/database/reset', {conferma: $('#rst-parola').value, password: $('#rst-pw').value});
       if (r.ok) { toast(r.messaggio || 'Fatto'); setTimeout(() => location.reload(), 1500); return; }
       msg.textContent = r.messaggio || 'Non è stato possibile.'; toast(msg.textContent, true);
-    } catch (err) { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
+    } catch { toast('Il pannello non risponde: riprova fra qualche secondo', true); }
     e.target.disabled = false; return;
   }
   if (id === 'b-agg') { S.ricarica = false; carica(); toast('Stato aggiornato'); }
@@ -3473,10 +3531,15 @@ async function azioniImpostazioni(e) {
         Object.entries(r.errori).forEach(([k, m]) => { const el = document.querySelector(`[data-e="${k}"]`); if (el) { el.textContent = m; mostraCampo(el); } });
         toast('Controlla i campi in rosso', true);
       } else toast(r.errore || 'Non salvato', true);
-    } catch (x) { toast('Server non raggiungibile', true); }
+    } catch { toast('Server non raggiungibile', true); }
     e.target.disabled = false;
   } else if (id === 'b-prova') {
-    e.target.disabled = true; try { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); } catch (x) { toast('Server non raggiungibile', true); }
+    e.target.disabled = true; try { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); } catch { toast('Server non raggiungibile', true); }
+    e.target.disabled = false;
+  } else if (id === 'plg-ricarica') {
+    e.target.disabled = true;
+    try { const r = await inviaPost('/api/plugin/ricarica', {}); toast(r.ok ? `Plugin riletti: ${r.plugin}` : 'Non riuscito', !r.ok); S.sporco = false; S.ricarica = true; await carica(); }
+    catch { toast('Server non raggiungibile', true); }
     e.target.disabled = false;
   } else if (id === 'b-pw') {
     const r = await inviaPost('/api/impostazioni/password', {utente: $('#p-ut').value, attuale: $('#p-at').value, nuova: $('#p-nu').value});
@@ -3490,7 +3553,7 @@ const CFS = {zone: null, token: '', passi: null, occupato: false};
 async function cfLeggi() { const r = await fetch('/api/cloudflare', {credentials: 'same-origin', cache: 'no-store'}); if (r.status === 401) { location.href = '/login'; return null; } return r.json(); }
 async function cfCarica(forza) {
   const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
-  let st; try { st = await cfLeggi(); } catch (e) { return; }
+  let st; try { st = await cfLeggi(); } catch { return; }
   if (!st) return;
   S.cfStato = st;
   if (!st.configurato) { if (forza || !el.dataset.wiz) { el.dataset.wiz = '1'; el.innerHTML = cfWizard(st); } return; }
@@ -3559,7 +3622,7 @@ async function cfAzione(e) {
     try { const r = await inviaPost('/api/cloudflare/verifica', {token: CFS.token});
       if (r.ok) { CFS.zone = r.zone; $('#cf-msg').textContent = 'Token valido: ' + r.zone.length + ' dominio/i trovato/i.'; $('#cf-msg').className = 'msg ok'; $('#cf-passo2').innerHTML = cfPasso2(r.zone); cfAnteprima(); }
       else { $('#cf-msg').textContent = r.messaggio; $('#cf-msg').className = 'msg bad'; }
-    } catch (x) { $('#cf-msg').textContent = 'Server non raggiungibile'; $('#cf-msg').className = 'msg bad'; }
+    } catch { $('#cf-msg').textContent = 'Server non raggiungibile'; $('#cf-msg').className = 'msg bad'; }
     e.target.disabled = false;
   } else if (id === 'cf-crea') {
     const z = CFS.zone[+$('#cf-zona').value]; e.target.disabled = true; CFS.occupato = true;
@@ -3578,7 +3641,7 @@ async function cfAzione(e) {
       ul.insertAdjacentHTML('beforeend', a.ok ? '<li class="ok">✓ Tunnel avviato</li>' : `<li class="bad">✗ ${esc(a.messaggio)}</li>`);
       CFS.occupato = false; toast(a.ok ? 'Fatto! Tra qualche secondo l\'indirizzo risponde.' : 'Tunnel creato', !a.ok);
       setTimeout(() => cfCarica(true), 1500);
-    } catch (x) { m.textContent = 'Server non raggiungibile'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; }
+    } catch { m.textContent = 'Server non raggiungibile'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; }
   } else if (id === 'cf-avvia' || id === 'cf-ferma' || id === 'cf-riavvia') {
     e.target.disabled = true; CFS.occupato = true;
     const r = await inviaPost('/api/cloudflare/' + id.slice(3), {}); CFS.occupato = false;
@@ -3630,14 +3693,14 @@ async function carica() {
     // se lo script del pannello e' stato aggiornato mentre la pagina era aperta, si ricarica da sola (una volta sola, per evitare giri a vuoto)
     const nuova = r.headers.get('X-Pdc-Build');
     if (nuova && window.BUILD && nuova !== window.BUILD) {
-      let gia = null; try { gia = sessionStorage.getItem('pdc_build'); } catch (e) { /* niente */ }
-      if (gia !== nuova) { try { sessionStorage.setItem('pdc_build', nuova); } catch (e) { /* niente */ } location.reload(); return; }
+      let gia = null; try { gia = sessionStorage.getItem('pdc_build'); } catch { /* niente */ }
+      if (gia !== nuova) { try { sessionStorage.setItem('pdc_build', nuova); } catch { /* niente */ } location.reload(); return; }
     }
     const dati = await r.json();
     if (pag !== S.pagina) return;
     S.dati = dati; S.dpag = pag; S.off = S.dati.ora - Math.floor(Date.now() / 1000); S.fetchedAt = Date.now();
     disegna();
-  } catch (e) {
+  } catch {
     $('#dot').className = 'dot bad'; $('#agg').textContent = 'Server non raggiungibile';
   } finally {
     caricando = false;
@@ -3652,7 +3715,7 @@ let flusso = null, ultimoMsg = 0;
 // lo si riapre a mano (dopo un errore, al ritorno sulla scheda, quando torna la rete, o se per 45 s non arriva piu' nulla).
 function collega() {
   if (!window.EventSource) return;
-  if (flusso) { try { flusso.close(); } catch (e) { /* niente */ } flusso = null; }
+  if (flusso) { try { flusso.close(); } catch { /* niente */ } flusso = null; }
   const es = new EventSource('/api/flusso');
   flusso = es; ultimoMsg = Date.now();
   const vivo = () => { ultimoMsg = Date.now(); };
@@ -5487,6 +5550,8 @@ class Gestore(BaseHTTPRequestHandler):
                 if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
                     return self._vai("/")   # gia' dentro (es. icona della Home salvata sulla pagina di login)
                 return self._invia(200, self._pagina("login.html", errore=""))
+            if p.startswith("/plugin/"):      # rotte pubbliche dei plugin (l'autenticazione e' del plugin)
+                return plugin_pubblico(app, self, p, q)
             autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
             if p == "/logout" and self.command == "POST":
                 app.sessioni.elimina(self._cookie("pdc_sid"))
@@ -6656,6 +6721,7 @@ def schema_impostazioni():
                         "campi": campi})
     for s in sezioni:  # in quale tab della pagina sta ogni riquadro
         s["tab"] = TAB_SEZIONI.get(s["id"], "dati")
+    sezioni += sezioni_plugin()
     return sezioni, allarmi
 
 
@@ -6736,10 +6802,17 @@ def api_impostazioni(app, q):
     for s in sezioni + allarmi:
         for c in s["campi"]:
             v = _leggi_percorso(cfg, c["chiave"])
+            if v is None and c.get("default") is not None:
+                v = c["default"]
             if c["tipo"] == "segreto":
                 c["valore"], c["impostato"] = "", bool(v)
             else:
                 c["valore"] = v if v is not None else ("" if c["tipo"] in ("testo", "lungo", "ora", "scelta") else (False if c["tipo"] == "bool" else 0))
+    cf = cfg.get("cloudflare") or {}
+    base = f"https://{cf['hostname']}" if cf.get("tunnel_token") and cf.get("hostname") else ""      # indirizzo da fuori casa, per i plugin
+    for s in sezioni:
+        if s.get("plugin"):
+            s["plugin"]["base"] = base
     out = cornice(app, ora)
     out.update({"stato": stato_collegamenti(app, ora), "sezioni": sezioni, "allarmi": allarmi,
                 "utente": cfg["accesso"].get("utente") or ""})
@@ -6823,6 +6896,8 @@ def salva_impostazioni(app, corpo, h):
     app.cfg.aggiorna(scrivi)
     log.info("Impostazioni modificate dal pannello: %s", ", ".join(sorted(k for k in puliti if campi[k]["tipo"] != "segreto"))
              + (" (+ segreti)" if any(campi[k]["tipo"] == "segreto" for k in puliti) else ""))
+    if any(k.startswith("plugin.") for k in puliti):
+        plugin_sincronizza(app)
     riavvio = [k for k in puliti if k.startswith("generale.")]
     return {"ok": True, "salvati": len(puliti), "riavvio": bool(riavvio)}
 
@@ -8600,12 +8675,11 @@ def _registra_comando(app, cosa, acceso, ip, esito):
              "acceso" if acceso else "spento", ip, esito)
 
 
-@api_post("/api/controlli")
-def api_controlli(app, corpo, gestore):
-    cosa, acceso = corpo.get("cosa"), corpo.get("acceso")
+def esegui_comando(app, cosa, acceso, ip):
+    """Un comando alla pompa o allo Smarther, con le stesse regole per tutti (pagina, plugin): -> {'ok': bool, 'errore'?}.
+    'ip' dice da dove e' partito e finisce nel registro dei comandi."""
     if cosa not in NOME_COMANDO or not isinstance(acceso, bool):
         return {"ok": False, "errore": "Comando non valido."}
-    ip = ip_client(gestore)
     if app.demo:
         return {"ok": True, "demo": True}
     with _lock_comandi:
@@ -8628,6 +8702,11 @@ def api_controlli(app, corpo, gestore):
     return {"ok": True}
 
 
+@api_post("/api/controlli")
+def api_controlli(app, corpo, gestore):
+    return esegui_comando(app, corpo.get("cosa"), corpo.get("acceso"), ip_client(gestore))
+
+
 def elenco_comandi(app, massimo=100):
     """Gli ultimi comandi dati dal pannello: [{ts, cosa, acceso, ip, esito}], dal piu' recente."""
     with closing(app.db._c()) as c:
@@ -8639,6 +8718,308 @@ def elenco_comandi(app, massimo=100):
         out.append({"ts": ts, "cosa": NOME_COMANDO.get(serie[4:], serie[4:]), "acceso": parti[0] == "acceso",
                     "ip": parti[1], "esito": parti[2]})
     return out
+#@@PARTE plugin@@
+
+# ==========================================================================
+# PLUGIN: integrazioni opzionali in file esterni (cartella «plugin», accanto a pdc_pannello.py)
+# ==========================================================================
+# Un plugin e' un file plugin/nome.py che il pannello carica all'avvio (e con «Ricarica i plugin» in Impostazioni > Integrazioni).
+# Un errore dentro un plugin non ferma mai il pannello: lo segna e basta. Il plugin gira con gli stessi permessi del pannello,
+# quindi nella cartella plugin ci va solo codice di cui ci si fida.
+#
+# Cosa deve contenere un plugin (INTERFACCIA 1):
+#   INFO  = {"titolo": "Alexa", "versione": "1.0", "interfaccia": 1, "descrizione": "..."}
+#   CAMPI = [{"chiave": "segreto", "tipo": "segreto", "et": "...", "aiuto": "...", "default": ...}, ...]   (facoltativo)
+#   def avvia(ctx): ...        (deve tornare subito; per lavori lunghi si usa un thread)
+#   def ferma(ctx): ...        (facoltativa)
+# Il campo «attivo» (interruttore) lo aggiunge il pannello: un plugin nuovo parte SPENTO.
+# `ctx` (ContestoPlugin) e' tutto quello che il plugin puo' usare del pannello: config, dati, comandi, rotte pubbliche, registro.
+
+PLUGIN_INTERFACCIA = 1
+PLUGIN_MAX_FILE = 500_000       # byte
+PLUGIN_MAX_CORPO = 65_536       # byte di una richiesta pubblica
+PLUGIN_RICHIESTE_MIN = 60       # richieste al minuto, per plugin e per indirizzo
+PLUGIN_ATTESA_AVVIO = 10        # secondi concessi a avvia()
+_RX_NOME_PLUGIN = re.compile(r"[a-z][a-z0-9_]{0,23}")
+
+PLUGIN = globals().get("PLUGIN") or {}               # nome -> Plug (sopravvive alla ricarica a caldo di questa parte)
+PLUGIN_ROTTE = globals().get("PLUGIN_ROTTE") or {}   # "/plugin/nome/percorso" -> (nome, funzione, metodi)
+_lock_plugin = globals().get("_lock_plugin") or threading.RLock()
+_ritmo_plugin = globals().get("_ritmo_plugin") or {}  # (nome, ip) -> orari delle ultime richieste
+
+
+class Plug:
+    """Un plugin trovato nella cartella: stato = spento | attivo | errore."""
+    def __init__(self, nome, file):
+        self.nome, self.file = nome, file
+        self.modulo = None
+        self.info, self.campi = {}, []
+        self.sha = ""
+        self.stato, self.errore = "errore", ""
+        self.avviato = False
+        self.ctx = None
+        self.messaggio = ""            # una riga che il plugin puo' mostrare in Impostazioni (ctx.stato)
+        self.richieste, self.ultima = 0, None
+        self.ultimo_errore = ""
+
+
+class Richiesta:
+    """Cio' che una rotta pubblica di un plugin riceve."""
+    def __init__(self, metodo, percorso, query, corpo, intestazioni, ip):
+        self.metodo, self.percorso, self.query, self.corpo, self.intestazioni, self.ip = metodo, percorso, query, corpo, intestazioni, ip
+
+    def json(self):
+        """Il corpo come JSON (dict), oppure ValueError."""
+        v = json.loads(self.corpo.decode("utf-8") or "{}")
+        if not isinstance(v, dict):
+            raise ValueError("serve un oggetto JSON")
+        return v
+
+
+class ContestoPlugin:
+    """L'unica porta fra un plugin e il pannello. Piccola e stabile (PLUGIN_INTERFACCIA)."""
+    def __init__(self, app, plug):
+        self._app, self._plug = app, plug
+        self.nome = plug.nome
+        self.log = logging.getLogger("pdc.plugin." + plug.nome)
+        self.demo = app.demo
+
+    def config(self):
+        """I valori del plugin (campi + «attivo»), con i predefiniti dove l'utente non ha scritto nulla."""
+        sal = (self._app.cfg.leggi().get("plugin") or {}).get(self.nome) or {}
+        out = {c["chiave"]: c.get("default") for c in self._plug.campi}
+        out.update({k: v for k, v in sal.items() if k in out or k == "attivo"})
+        return out
+
+    def salva(self, chiave, valore):
+        """Scrive un valore nel config.json, nella sezione del plugin (per esempio un segreto generato al primo avvio)."""
+        def f(raw):
+            raw.setdefault("plugin", {}).setdefault(self.nome, {})[chiave] = valore
+        self._app.cfg.aggiorna(f)
+
+    def ultimi(self):
+        """{serie: (ts, numero, testo)}: gli ultimi valori letti dalla pompa e dallo Smarther."""
+        return {s: (ts, num, txt) for s, ts, num, txt in self._app.db.ultimi()}
+
+    def dashboard(self):
+        """Lo stesso riepilogo che mostra la Dashboard (dict)."""
+        return API["/api/dashboard"](self._app, {})
+
+    def comando(self, cosa, acceso):
+        """cosa = 'smarther' | 'riscaldamento' | 'acqua'. Stesse regole e stesso registro dei comandi del pannello."""
+        return esegui_comando(self._app, cosa, acceso, "plugin " + self.nome)
+
+    def rotta(self, percorso, funzione, metodi=("POST",)):
+        """Una pagina PUBBLICA (senza login) su /plugin/<nome>/<percorso>. funzione(Richiesta) -> dict | (codice, dict) |
+        (codice, testo_o_byte, tipo). Il pannello limita dimensione e frequenza delle richieste; l'autenticazione e' del plugin."""
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", percorso):
+            raise ValueError("percorso non valido: solo lettere, numeri, - e _")
+        PLUGIN_ROTTE[f"/plugin/{self.nome}/{percorso}"] = (self.nome, funzione, tuple(m.upper() for m in metodi))
+
+    def stato(self, testo):
+        """Una riga di stato mostrata in Impostazioni > Integrazioni."""
+        self._plug.messaggio = str(testo)[:200]
+
+
+def _riassunto(e):
+    return f"{type(e).__name__}: {e}"[:300]
+
+
+def _leggi_plugin(f):
+    """Carica il file di un plugin SENZA avviarlo. Mai eccezioni: l'errore finisce nel Plug."""
+    p = Plug(f.stem, f)
+    try:
+        if f.stat().st_size > PLUGIN_MAX_FILE:
+            raise ValueError("file troppo grande")
+        dati = f.read_bytes()
+        p.sha = hashlib.sha256(dati).hexdigest()[:8]
+        modulo = types.ModuleType("pdc_plugin_" + p.nome)
+        modulo.__file__ = str(f)
+        exec(compile(dati, str(f), "exec"), modulo.__dict__)
+        info = getattr(modulo, "INFO", None)
+        if not isinstance(info, dict):
+            raise ValueError("manca INFO (un dizionario con titolo, versione, interfaccia)")
+        p.info = {k: str(v)[:300] for k, v in info.items()}
+        if info.get("interfaccia") != PLUGIN_INTERFACCIA:
+            raise ValueError(f"pensato per l'interfaccia {info.get('interfaccia')!r}, questo pannello usa la {PLUGIN_INTERFACCIA}: "
+                             "serve una versione del plugin adatta")
+        if not callable(getattr(modulo, "avvia", None)):
+            raise ValueError("manca la funzione avvia(ctx)")
+        campi = []
+        for c in getattr(modulo, "CAMPI", None) or []:
+            if not isinstance(c, dict) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", str(c.get("chiave", ""))) or c.get("chiave") == "attivo":
+                raise ValueError(f"campo non valido: {str(c)[:80]}")
+            campi.append({"chiave": c["chiave"], "tipo": c.get("tipo", "testo"), "et": str(c.get("et", c["chiave"])),
+                          "aiuto": str(c.get("aiuto", "")), "default": c.get("default"),
+                          **{k: c[k] for k in ("min", "max", "opzioni") if k in c}})
+        p.campi, p.modulo = campi, modulo
+        p.stato = "spento"
+    except BaseException as e:            # anche SystemExit: un plugin non deve mai fermare il pannello
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        p.stato, p.errore = "errore", _riassunto(e)
+        log.error("Plugin %s: non lo carico (%s)", p.nome, p.errore)
+    return p
+
+
+def _togli_rotte(nome):
+    for k in [k for k, v in PLUGIN_ROTTE.items() if v[0] == nome]:
+        del PLUGIN_ROTTE[k]
+
+
+def _avvia_plugin(app, p):
+    """avvia(ctx) con un limite di tempo. Se fallisce il plugin va in «errore» e le sue rotte vengono tolte."""
+    ctx = ContestoPlugin(app, p)
+    esito = {}
+
+    def lavoro():
+        try:
+            p.modulo.avvia(ctx)
+        except BaseException as e:
+            esito["errore"] = _riassunto(e)
+            log.exception("Plugin %s: errore in avvia()", p.nome)
+    th = threading.Thread(target=lavoro, daemon=True, name="plugin-" + p.nome)
+    th.start()
+    th.join(PLUGIN_ATTESA_AVVIO)
+    if th.is_alive():
+        esito["errore"] = f"avvia() non è tornata entro {PLUGIN_ATTESA_AVVIO} secondi (per i lavori lunghi serve un thread)"
+    if esito.get("errore"):
+        _togli_rotte(p.nome)
+        p.stato, p.errore, p.avviato = "errore", esito["errore"], False
+        return
+    p.ctx, p.avviato, p.stato, p.errore = ctx, True, "attivo", ""
+    log.info("Plugin %s avviato", p.nome)
+
+
+def _ferma_plugin(p):
+    _togli_rotte(p.nome)
+    f = getattr(p.modulo, "ferma", None)
+    if p.avviato and callable(f):
+        try:
+            f(p.ctx)
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            log.warning("Plugin %s: errore in ferma() (%s)", p.nome, _riassunto(e))
+    if p.avviato:
+        log.info("Plugin %s fermato", p.nome)
+    p.avviato = False
+    if p.stato == "attivo":
+        p.stato = "spento"
+
+
+def plugin_sincronizza(app):
+    """Accende i plugin con l'interruttore su «attivo», spegne gli altri."""
+    with _lock_plugin:
+        sal = app.cfg.leggi().get("plugin") or {}
+        for p in PLUGIN.values():
+            if p.modulo is None:
+                continue
+            voglio = bool((sal.get(p.nome) or {}).get("attivo"))
+            if voglio and not p.avviato:
+                _avvia_plugin(app, p)
+            elif not voglio and p.avviato:
+                _ferma_plugin(p)
+            elif not voglio and p.stato == "errore" and p.modulo is not None:
+                p.stato, p.errore = "spento", ""
+
+
+def plugin_ferma_tutti():
+    with _lock_plugin:
+        for p in PLUGIN.values():
+            if p.avviato:
+                _ferma_plugin(p)
+
+
+def plugin_ricarica(app):
+    """Rilegge la cartella plugin e riavvia quelli accesi. -> numero di plugin trovati."""
+    with _lock_plugin:
+        plugin_ferma_tutti()
+        PLUGIN.clear()
+        PLUGIN_ROTTE.clear()
+        cart = app.base / "plugin"
+        if cart.is_dir():
+            for f in sorted(cart.glob("*.py"))[:20]:
+                if f.name.startswith(("_", ".")) or f.is_symlink() or not _RX_NOME_PLUGIN.fullmatch(f.stem):
+                    continue
+                PLUGIN[f.stem] = _leggi_plugin(f)
+        plugin_sincronizza(app)
+        return len(PLUGIN)
+
+
+def sezioni_plugin():
+    """I riquadri di Impostazioni > Integrazioni: uno per plugin, con interruttore e campi (stessa forma delle altre sezioni)."""
+    out = []
+    with _lock_plugin:
+        for p in PLUGIN.values():
+            campi = [] if p.modulo is None else (
+                [{"chiave": f"plugin.{p.nome}.attivo", "tipo": "bool", "et": "Attivo", "aiuto": "Accende o spegne il plugin.", "default": False}]
+                + [{**c, "chiave": f"plugin.{p.nome}.{c['chiave']}"} for c in p.campi])
+            out.append({"id": "plugin_" + p.nome, "tab": "integrazioni", "campi": campi,
+                        "titolo": p.info.get("titolo") or p.nome, "nota": p.info.get("descrizione", ""),
+                        "plugin": {"nome": p.nome, "file": p.file.name, "sha": p.sha, "versione": p.info.get("versione", ""),
+                                   "stato": p.stato, "errore": p.errore or p.ultimo_errore, "messaggio": p.messaggio,
+                                   "richieste": p.richieste, "ultima": p.ultima,
+                                   "rotte": sorted(k for k, v in PLUGIN_ROTTE.items() if v[0] == p.nome)}})
+    return out
+
+
+def _troppo_veloce(nome, ip):
+    ora = time.time()
+    q = _ritmo_plugin.setdefault((nome, ip), [])
+    while q and q[0] < ora - 60:
+        q.pop(0)
+    if len(q) >= PLUGIN_RICHIESTE_MIN:
+        return True
+    q.append(ora)
+    if len(_ritmo_plugin) > 2000:       # non cresce senza limite
+        for k in [k for k, v in _ritmo_plugin.items() if not v or v[-1] < ora - 60]:
+            del _ritmo_plugin[k]
+    return False
+
+
+def plugin_pubblico(app, h, p, q):
+    """Risponde alle rotte pubbliche dei plugin (chiamata dal server web PRIMA del controllo del login)."""
+    voce = PLUGIN_ROTTE.get(p)
+    plug = PLUGIN.get(voce[0]) if voce else None
+    if not voce or not plug or not plug.avviato:
+        return h._invia(404, "Non trovato", "text/plain; charset=utf-8")
+    _, funzione, metodi = voce
+    if h.command not in metodi:
+        return h._invia(405, "Metodo non consentito", "text/plain; charset=utf-8")
+    ip = ip_client(h)
+    if _troppo_veloce(plug.nome, ip):
+        return h._json({"errore": "troppe richieste"}, 429)
+    try:
+        n = int(h.headers.get("Content-Length", "0"))
+    except ValueError:
+        n = -1
+    if n < 0 or n > PLUGIN_MAX_CORPO:
+        return h._json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
+    corpo = h.rfile.read(n) if n else b""
+    plug.richieste, plug.ultima = plug.richieste + 1, int(time.time())
+    req = Richiesta(h.command, p, q, corpo, {k.lower(): v for k, v in h.headers.items()}, ip)
+    try:
+        r = funzione(req)
+    except Exception as e:
+        plug.ultimo_errore = _riassunto(e)
+        log.exception("Plugin %s: errore nella rotta %s", plug.nome, p)
+        return h._json({"errore": "errore interno"}, 500)
+    plug.ultimo_errore = ""
+    if isinstance(r, dict):
+        return h._json(r)
+    if isinstance(r, tuple) and len(r) == 2 and isinstance(r[1], dict):
+        return h._json(r[1], int(r[0]))
+    if isinstance(r, tuple) and len(r) == 3:
+        return h._invia(int(r[0]), r[1], str(r[2]))
+    plug.ultimo_errore = "la rotta ha risposto con un tipo non previsto"
+    return h._json({"errore": "errore interno"}, 500)
+
+
+@api_post("/api/plugin/ricarica")
+def api_plugin_ricarica(app, corpo, h):
+    n = plugin_ricarica(app)
+    return {"ok": True, "plugin": n}
 #@@PARTE aggiorna@@
 
 
@@ -8649,10 +9030,10 @@ def elenco_comandi(app, massimo=100):
 # comandi) si possono rieseguire dentro il programma gia' acceso; le altre (nucleo della raccolta, Telegram, tunnel, backup,
 # avvio) no: se cambiano serve il riavvio completo. Il server web non si ferma: gli si cambia solo la classe che risponde.
 
-RICARICABILI = ("web", "impostazioni", "dispositivi", "controlli")
+RICARICABILI = ("web", "impostazioni", "dispositivi", "controlli", "plugin")
 NOMI_PARTI = {"nucleo": "nucleo della raccolta dati", "web": "pagine e API", "telegram": "avvisi Telegram",
               "impostazioni": "Impostazioni", "cloudflare": "tunnel Cloudflare", "manutenzione": "backup e manutenzione",
-              "dispositivi": "Dispositivi", "controlli": "comandi allo Smarther", "aggiorna": "aggiornamento a caldo",
+              "dispositivi": "Dispositivi", "controlli": "comandi allo Smarther", "plugin": "plugin e integrazioni", "aggiorna": "aggiornamento a caldo",
               "comandi": "avvio e comandi"}
 _RX_PARTE = re.compile(r"^#@@PARTE (\w+)@@\n", re.M)
 _RX_VERSIONE = re.compile(r'^VERSIONE = "([^"]*)"$', re.M)
@@ -8759,6 +9140,11 @@ def applica_aggiornamento(app):
         g["BUILD"] = hashlib.sha256((g["VERSIONE"] + "".join(g["WEB_ASSETS"][k] for k in sorted(g["WEB_ASSETS"]))).encode("utf-8")).hexdigest()[:8]
         for n in cambiate:
             PARTI_CARICATE[n] = _impronta(n, parti[n][0])
+        if "plugin" in cambiate and "plugin_ricarica" in g:      # il caricatore e' nuovo: rilegge la cartella plugin
+            try:
+                g["plugin_ricarica"](app)
+            except Exception:
+                log.exception("ricarica dei plugin fallita")
         srv = getattr(app, "server_web", None)
         if srv is not None:
             srv.RequestHandlerClass = g["Gestore"]   # le richieste nuove usano il codice nuovo; il server non si ferma
@@ -9014,6 +9400,12 @@ def main(argv=None, base=AQUI):
             app.ferma()
             return 1
         avvia_tunnel_se_serve(app)
+        try:
+            n_plugin = plugin_ricarica(app)
+            if n_plugin:
+                log.info("Plugin trovati: %d", n_plugin)
+        except Exception:
+            log.exception("caricamento dei plugin fallito (il pannello parte lo stesso)")
         porta = srv.server_address[1]
         log.info("Interfaccia web attiva sulla porta %s", porta)
         print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))
@@ -9025,6 +9417,10 @@ def main(argv=None, base=AQUI):
         except KeyboardInterrupt:
             log.info("Fermato.")
         app.ferma()
+        try:
+            plugin_ferma_tutti()
+        except Exception:
+            log.exception("arresto dei plugin")
         if getattr(app, "tunnel", None):
             app.tunnel.chiudi_con_il_pannello()
         if getattr(app, "telegram", None):

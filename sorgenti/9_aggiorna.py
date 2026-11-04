@@ -7,10 +7,10 @@
 # comandi) si possono rieseguire dentro il programma gia' acceso; le altre (nucleo della raccolta, Telegram, tunnel, backup,
 # avvio) no: se cambiano serve il riavvio completo. Il server web non si ferma: gli si cambia solo la classe che risponde.
 
-RICARICABILI = ("web", "impostazioni", "dispositivi", "controlli")
+RICARICABILI = ("web", "impostazioni", "dispositivi", "controlli", "plugin")
 NOMI_PARTI = {"nucleo": "nucleo della raccolta dati", "web": "pagine e API", "telegram": "avvisi Telegram",
               "impostazioni": "Impostazioni", "cloudflare": "tunnel Cloudflare", "manutenzione": "backup e manutenzione",
-              "dispositivi": "Dispositivi", "controlli": "comandi allo Smarther", "aggiorna": "aggiornamento a caldo",
+              "dispositivi": "Dispositivi", "controlli": "comandi allo Smarther", "plugin": "plugin e integrazioni", "aggiorna": "aggiornamento a caldo",
               "comandi": "avvio e comandi"}
 _RX_PARTE = re.compile(r"^#@@PARTE (\w+)@@\n", re.M)
 _RX_VERSIONE = re.compile(r'^VERSIONE = "([^"]*)"$', re.M)
@@ -117,6 +117,11 @@ def applica_aggiornamento(app):
         g["BUILD"] = hashlib.sha256((g["VERSIONE"] + "".join(g["WEB_ASSETS"][k] for k in sorted(g["WEB_ASSETS"]))).encode("utf-8")).hexdigest()[:8]
         for n in cambiate:
             PARTI_CARICATE[n] = _impronta(n, parti[n][0])
+        if "plugin" in cambiate and "plugin_ricarica" in g:      # il caricatore e' nuovo: rilegge la cartella plugin
+            try:
+                g["plugin_ricarica"](app)
+            except Exception:
+                log.exception("ricarica dei plugin fallita")
         srv = getattr(app, "server_web", None)
         if srv is not None:
             srv.RequestHandlerClass = g["Gestore"]   # le richieste nuove usano il codice nuovo; il server non si ferma
