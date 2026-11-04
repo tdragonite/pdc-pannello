@@ -931,8 +931,9 @@ const CL_BREVE = [
   ['tipici', 'Giorni tipici', 'In Efficienza → Confronta: il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
   ['avviso', 'Avviso dal tunnel', 'Telegram ti scrive se da internet il pannello non risponde, e lo chiude da solo quando torna tutto a posto.'],
   ['sbr', 'Sbrinamenti', 'In Efficienza l’elenco degli sbrinamenti con consumo e temperatura, e due avvisi Telegram silenziosi: inizio e fine.'],
+  ['login', 'Accesso più comodo', 'Dall’icona della Home non devi più rimettere la password se la sessione è ancora valida.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑'};
 const CHANGELOG = [
   {v: '0.19', quando: '3 novembre 2026', titolo: 'Ripartenza prevista e giorni tipici', righe: [
     ['n', 'Ripartenza prevista', 'Nella card Smarther: l’ora in cui il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
@@ -949,6 +950,7 @@ const CHANGELOG = [
     ['m', 'Avvisi nelle card', '«Smarther non collegato» in rosso, «Ultimo dato delle…» in giallo, nello stesso box della ripartenza (anche per la PdC ferma nella card Esterna).'],
     ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra sempre 3 righe da 3 ore a partire da adesso, con la scritta «Oggi»: mai «Domani», nemmeno a sera tarda.'],
     ['m', 'Card Smarther stabile', 'Su PC la card ha sempre la stessa altezza, con o senza la riga della ripartenza: niente più saltelli.'],
+    ['s', 'Password chiesta a ogni apertura', 'Su iPhone, se l’icona della Home era stata salvata mentre eri sulla pagina di accesso, ogni apertura mostrava il modulo di login anche con la sessione ancora valida (30 giorni). Ora, se sei già dentro, «/login» ti porta subito alla dashboard. Il login, i tentativi massimi e la sicurezza dei cookie non sono cambiati.'],
   ]},
   {v: '0.18', quando: '3 novembre 2026', titolo: 'Meteo, costo del mese e dati più freschi', righe: [
     ['n', 'Meteo', 'Nella scheda Esterna: icona e forchetta di oggi, due modelli a confronto; toccala per il dettaglio ogni 3 ore.'],
