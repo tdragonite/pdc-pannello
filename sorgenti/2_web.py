@@ -246,7 +246,7 @@ def campioni_freq(db, da, a, soglia=5.0):
         vicini = [acqua[j] for j in (i - 1, i) if 0 <= j < len(acqua) and abs(acqua[j][0] - ts) <= 120]
         if not vicini:
             continue
-        t_v, v = min(vicini, key=lambda x: abs(x[0] - ts))
+        v = min(vicini, key=lambda x: abs(x[0] - ts))[1]
         if abs(mandata[ts] - v) > soglia:
             freq[ts] = 0.0
     return freq
@@ -674,6 +674,81 @@ def meteo_info(app):
 
 
 # --------------------------------------------------------------------------
+# Umidità esterna da una stazione meteo vicina (WeatherLink, dati grezzi): un solo valore nella card «Esterna»
+# --------------------------------------------------------------------------
+
+STAZIONE_OGNI = 600            # secondi fra una lettura e l'altra
+STAZIONE_VECCHIO = 3600        # se la stazione non manda dati da più di così il valore non si mostra
+STAZIONE_ATTESA = 5            # secondi di attesa massima della rete
+
+
+def stazione_url_valido(u):
+    """Solo https verso weatherlink.com (o un suo sottodominio), senza utente né password: l'indirizzo lo scrive una persona."""
+    try:
+        p = urlparse(u)
+        h = (p.hostname or "").lower()
+    except ValueError:
+        return False
+    return p.scheme == "https" and not p.username and not p.password and (h == "weatherlink.com" or h.endswith(".weatherlink.com"))
+
+
+def stazione_url(app):
+    """Indirizzo dei dati da config.json -> 'stazione'; '' se vuoto o non valido (la funzione resta spenta)."""
+    u = str((app.cfg.leggi().get("stazione") or {}).get("url") or "").strip()
+    return u if stazione_url_valido(u) else ""
+
+
+def stazione_leggi(js):
+    """JSON della stazione -> (umidità %, epoch dell'ultimo dato o None). ValueError se manca o non ha senso."""
+    if not isinstance(js, dict):
+        raise ValueError("risposta inattesa")
+    um = float(str(js.get("humidity")).replace(",", "."))
+    if not 0 <= um <= 100:
+        raise ValueError("umidità fuori scala")
+    ult = js.get("lastReceived")
+    ts = int(ult / 1000) if isinstance(ult, (int, float)) and not isinstance(ult, bool) and ult > 1e11 else None   # millisecondi
+    return round(um, 1), ts
+
+
+def _stazione_lavoro(app, url):
+    st = app.stazione_st
+    try:
+        code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=STAZIONE_ATTESA)
+        if code != 200:
+            raise ValueError(f"HTTP {code}")
+        um, ts = stazione_leggi(js)
+        ora = int(time.time())
+        if st["url"] == url:                                  # nel frattempo l'indirizzo e' cambiato: scarto
+            st.update(um=um, ts=ts or ora, errore=None, falliti=0, prossimo=ora + STAZIONE_OGNI)
+    except Exception as e:
+        st["falliti"] += 1
+        st["errore"] = str(e)[:120]
+        st["prossimo"] = int(time.time()) + min(300 * st["falliti"], STAZIONE_OGNI)
+        (log.warning if st["falliti"] == 1 else log.debug)("Stazione meteo: lettura non riuscita (%s)", e)
+    finally:
+        st["occupato"] = False
+
+
+def stazione_info(app):
+    """None se la funzione è spenta, altrimenti {'umidita': % o None, 'ts': ultimo dato della stazione, 'errore': testo o None}.
+    La lettura parte in un thread (mai nella richiesta della pagina); il valore più vecchio di un'ora non si mostra."""
+    ora = int(time.time())
+    if app.demo:                                              # nella demo si vede sempre, come il meteo
+        return {"umidita": 78.0, "ts": ora - 120, "errore": None}
+    url = stazione_url(app)
+    if not url:
+        return None
+    st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "occupato": False})
+    if st["url"] != url:
+        st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0)
+    if ora >= st["prossimo"] and not st["occupato"]:
+        st["occupato"], st["prossimo"] = True, ora + 60
+        threading.Thread(target=_stazione_lavoro, args=(app, url), daemon=True, name="stazione").start()
+    um = st["um"] if st["um"] is not None and ora - st["ts"] <= STAZIONE_VECCHIO else None
+    return {"umidita": um, "ts": st["ts"] or None, "errore": st["errore"]}
+
+
+# --------------------------------------------------------------------------
 # Stima: quando riparte il riscaldamento (dalla discesa della temperatura in casa)
 # --------------------------------------------------------------------------
 # Idea: a riscaldamento fermo la casa si raffredda come un corpo caldo in una stanza fredda, T(t) = E + (T0 - E) * exp(-k t),
@@ -965,6 +1040,7 @@ def api_dashboard(app, q):
     stato_risc = ("spento" if not risc_acc else "sbrinamento" if sbrina else "attivo" if modo == "casa" else "riposo")
     stato_acs = "spento" if not pdc_acc else ("attivo" if modo == "acs" else "standby")
     curva = dati_curva(db, ult, da, a, num("ciclo.esterna"))
+    stz = stazione_info(app)
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     return {
@@ -982,6 +1058,7 @@ def api_dashboard(app, q):
             "modo": NOMI_MODO_ACS.get(txt("pdc.modo"), txt("pdc.modo")),
             "spark": q_medie(db, "acs.temperatura", da, a)},
         "esterna": {"temp": num("ciclo.esterna"), "ts": ts_("ciclo.esterna"), "min": es_min, "max": es_max,
+                    "umidita": (stz or {}).get("umidita"), "umidita_attiva": stz is not None,
                     "spark": q_medie(db, "ciclo.esterna", da, a)},
         "energia": {"kwh": energia_kwh(db, da, a), "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
                     "spark": q_medie(db, "pot.watt", da, a)},
@@ -1615,6 +1692,7 @@ MANIFEST = {"name": "Pompa di calore", "short_name": "PDC", "start_url": "/", "d
             "background_color": "#0b0f17", "theme_color": "#0b0f17", "lang": "it",
             "icons": [{"src": "/icona.png", "sizes": "180x180", "type": "image/png"}]}
 
+_GZ_CACHE = {}
 TIPI_COMPRIMIBILI = {"text/html", "text/css", "text/javascript", "text/csv", "text/plain", "application/json",
                      "application/manifest+json", "image/svg+xml"}
 CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
@@ -1645,13 +1723,21 @@ class Gestore(BaseHTTPRequestHandler):
         log.debug("web %s - %s", self.address_string(), fmt % args)
 
     # ---- risposte ----
-    def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None):
+    def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None, gz_chiave=None):
         dati = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
         compresso = False
         # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto via tunnel, dove passano dalla tua linea in upload
         if (len(dati) > 1024 and tipo.split(";")[0] in TIPI_COMPRIMIBILI and "gzip" in self.headers.get("Accept-Encoding", "")
                 and codice == 200):
-            dati, compresso = gzip.compress(dati, 5, mtime=0), True
+            if gz_chiave:       # file fissi (app.js, app.css): si comprimono una volta per versione, non a ogni richiesta
+                k = (gz_chiave, BUILD)
+                if k not in _GZ_CACHE:
+                    for vecchia in [x for x in _GZ_CACHE if x[1] != BUILD]:      # le versioni vecchie non servono piu'
+                        del _GZ_CACHE[vecchia]
+                    _GZ_CACHE[k] = gzip.compress(dati, 6, mtime=0)
+                dati, compresso = _GZ_CACHE[k], True
+            else:
+                dati, compresso = gzip.compress(dati, 5, mtime=0), True
         self.send_response(codice)
         self.send_header("Content-Type", tipo)
         if compresso:
@@ -1714,8 +1800,11 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(503, self._pagina("setup.html"))
             pubbliche = {"/app.css": "text/css; charset=utf-8", "/app.js": "text/javascript; charset=utf-8"}
             if p in pubbliche and p[1:] in WEB_ASSETS:
-                return self._invia(200, WEB_ASSETS[p[1:]], pubbliche[p],
-                                   [("Cache-Control", "no-cache")])
+                etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta via tunnel)
+                extra = [("Cache-Control", "no-cache"), ("ETag", etag)]
+                if self.headers.get("If-None-Match") == etag:
+                    return self._invia(304, b"", pubbliche[p], extra)
+                return self._invia(200, WEB_ASSETS[p[1:]], pubbliche[p], extra, gz_chiave=p)
             if p == "/icona.png":
                 return self._invia(200, icona(), "image/png", [("Cache-Control", "max-age=86400")])
             if p == "/manifest.webmanifest":

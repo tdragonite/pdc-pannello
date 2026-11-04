@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.20"
+VERSIONE = "0.21.1"
 
 import argparse
 import base64
@@ -267,6 +267,11 @@ TEMPLATE = {
         "_nota": "Posizione per il meteo del giorno nella Dashboard (card Esterna), da Open-Meteo. Ora c'è Cirié. Per toglierlo svuota le due coordinate ('').",
         "latitudine": 45.23,
         "longitudine": 7.60,
+    },
+    "stazione": {
+        "_nota": "Facoltativo. Indirizzo dei DATI di una stazione meteo WeatherLink vicina (non quello della pagina: lo stampa 'python pdc_strumenti.py meteo-prova'). "
+                 "Il pannello ne legge l'umidita' esterna ogni 10 minuti e la mostra nella card Esterna. Vuoto = funzione spenta.",
+        "url": "",
     },
     "tariffa": {
         "_nota": "Prezzo dell'energia elettrica in euro per kWh (con le tasse, per esempio 0.28). 0 = non mostrare i costi.",
@@ -757,7 +762,7 @@ def estrai_st(status, mappa, ts):
             if not t or not hx:
                 continue
             rec.ciclo.append((tipo, t, hx))
-            layout, valori, problema = decodifica_ciclo(tipo, hx, mappa)
+            _, valori, problema = decodifica_ciclo(tipo, hx, mappa)
             if problema:
                 rec.problemi.append(problema)
             for nome, v in valori.items():
@@ -1470,9 +1475,11 @@ main{min-width:0;padding:22px 26px 40px}
 .sub b{color:var(--txt);font-variant-numeric:tabular-nums}
 .flash{animation:flash .9s ease-out}
 .card .nota{margin-top:8px;color:var(--mut2);font-size:12px}
+.card .nota .um-n{display:block;color:var(--mut);font-size:12.5px;line-height:15px}
+.card .nota .um-n b{color:var(--txt);font-variant-numeric:tabular-nums}
 .card .nota:empty{display:none}
-.card .nota:has(.ora-n){margin-top:6px}
-@media (min-width:761px){#c-n{display:block;min-height:15px;margin-top:6px}} /* PC: riga sempre riservata, la card non cambia altezza */
+.card .nota:has(.ora-n,.um-n){margin-top:6px}
+@media (min-width:761px){#c-n,#e-n{display:block;min-height:15px;margin-top:6px}} /* PC: riga sempre riservata, la card non cambia altezza */
 .ora-n{display:flex;align-items:center;gap:7px;line-height:1.3}
 .ora-n .ck{flex:none;box-sizing:border-box;width:11px;height:11px;border-radius:50%;border:1.5px solid #fff;position:relative}
 .ora-n .ck:before,.ora-n .ck:after{content:"";position:absolute;background:#fff}
@@ -1897,6 +1904,14 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 .exp svg{flex:none;color:var(--mut)}
 .exp b{display:block;font-size:14px}.exp small{display:block;margin-top:1px;color:var(--mut);font-size:12px}
 @media(max-width:560px){.exp{grid-template-columns:1fr}}
+
+/* Changelog: tab Pannello / Plugin e filtro per plugin */
+.cl-tabs{display:flex;width:max-content;min-width:100%;margin-bottom:0}
+.cl-tabs a{white-space:nowrap}
+.cl-filtro{width:max-content;max-width:100%;overflow-x:auto;scrollbar-width:none}
+.cl-filtro::-webkit-scrollbar{display:none}
+.cl-filtro button{white-space:nowrap;flex:none}
+.cl-v .cl-h .pill.up{align-self:center}
 ''',
     'app.js': r'''// impronta di questa versione dello script: la prende dall'indirizzo con cui e' stato caricato (app.js?v=...)
 window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch { return ''; } })();
@@ -2013,7 +2028,7 @@ function mostraPagina() {
     vistaImp();
   }
   else if (S.pagina === 'dispositivi') { $('#pagina').innerHTML = '<div id="dsp"><div class="card vuoto">Carico…</div></div>'; }
-  else if (S.pagina === 'changelog') { $('#pagina').innerHTML = disegnaChangelog(); window.scrollTo(0, 0); }
+  else if (S.pagina === 'changelog') { clDati = null; vistaChangelog(); }
   else { $('#pagina').innerHTML = '<div id="eff"><div class="card vuoto">Calcolo in corso…</div></div>'; }
 }
 
@@ -2093,7 +2108,8 @@ function disegna() {
 
   set('e-t', num(e.temp)); set('e-mn', gr(e.min)); set('e-mx', gr(e.max)); html('e-sp', spark(e.spark)); meteoRiga(d.meteo);
   badge('e-b', 'Temperatura', 'tema', 'Temperatura dell\'aria esterna');
-  html('e-n', e.ts && d.ora - e.ts > 7200 ? avviso('Dato delle ' + hhmm(e.ts) + ' (PdC ferma)', 'warn') : '');
+  html('e-n', e.ts && d.ora - e.ts > 7200 ? avviso('Dato delle ' + hhmm(e.ts) + ' (PdC ferma)', 'warn')
+    : e.umidita != null ? `<span class="um-n" title="Umidità dell'aria esterna (stazione meteo vicina)">Umidità <b>${num(e.umidita, 0)}%</b></span>` : '');   // l'avviso, quando c'è, prende il posto dell'umidità
 
   set('w-t', num(w.kwh, w.kwh != null && w.kwh < 10 ? 2 : 1)); set('w-per', periodo(d)); set('w-pw', w.potenza_w == null ? '—' : num(w.potenza_w, 0) + ' W');
   { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); } }
@@ -2833,6 +2849,15 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', alexa: '🔊', live: '↻'};
 const CHANGELOG = [
+  {v: '0.21.1', quando: '4 novembre 2026', titolo: 'Changelog dei plugin', righe: [
+    ['n', 'Tab «Plugin» nel Changelog', 'Il Changelog ha due tab: Pannello (come prima) e Plugin, con la cronologia di ogni plugin, tutti insieme in ordine di data o uno alla volta con il filtro. La versione che hai installata è segnata «Installato».'],
+    ['m', 'Pannello più veloce da fuori', 'Le pagine (app.js e app.css) si scaricano una volta sola e, se non cambiano, il browser riceve soltanto «invariato»: meno dati sul tunnel e caricamento più rapido, soprattutto da telefono.'],
+    ['m', 'Indirizzi dei plugin più protetti', 'Anche i tentativi su indirizzi sbagliati hanno un limite al minuto, come quelli giusti.'],
+    ['m', 'Plugin nuovi senza lavoro in più', 'Ogni plugin porta la sua cronologia nel proprio file (lista CHANGELOG): un plugin nuovo compare da solo nella tab.'],
+  ]},
+  {v: '0.21', quando: '4 novembre 2026', titolo: 'Umidità esterna', righe: [
+    ['n', 'Umidità esterna', 'Nella card Esterna, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink). Sta nella riga degli avvisi: se appare «Dato delle… (PdC ferma)» prende il suo posto. Le dimensioni della Dashboard non cambiano. Si accende incollando l’indirizzo dei dati in Impostazioni → Collegamenti; senza indirizzo o senza dato non compare niente.'],
+  ]},
   {v: '0.20', quando: '4 novembre 2026', titolo: 'Integrazioni e Alexa', righe: [
     ['n', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», con interruttore, campi e stato. Un plugin nuovo parte spento, si ricarica con un tasto e, se si rompe, non ferma mai il pannello.'],
     ['n', 'Alexa', 'Il primo plugin: con le Routine di Alexa chiedi temperatura e umidità, se il riscaldamento è acceso e quando riparte, cosa fa la PdC, acqua calda e mandata, oppure accendi e spegni lo Smarther. Non devi pronunciare il nome della skill.'],
@@ -2932,17 +2957,62 @@ const CHANGELOG = [
   ]},
 ];
 
-function disegnaChangelog() {
+function disegnaChangelogPannello() {
   const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
   const voce = (c, attuale) => `<section class="cl-v${attuale ? ' att' : ''}"><div class="cl-h"><span class="cl-n">${esc(c.v)}</span>` +
     `${attuale ? '<span class="pill en">Attuale</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.quando ? `<span class="cl-d">${esc(c.quando)}</span>` : ''}</div>` +
     `<ul>${c.righe.map(riga).join('')}</ul></section>`;
   const recenti = CHANGELOG.filter((c, k) => k < 3), prima = CHANGELOG.filter((c, k) => k >= 3 && !c.antico), antiche = CHANGELOG.filter(c => c.antico);
   const breve = `<div class="cl-breve"><div class="eti">In breve</div>${CL_BREVE.map(b => `<div class="cl-bi">${CL_IC[b[0]] ? `<span class="cl-ic">${CL_IC[b[0]]}</span>` : iconaMeteo(b[0], 22)}<span><b>${esc(b[1])}</b> ${esc(b[2])}</span></div>`).join('')}</div>`;
-  return `<div class="changelog">${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
+  return `${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
     `<details class="cl-vecchie"><summary>Versioni precedenti</summary>${prima.map(c => voce(c)).join('')}` +
-    `<div class="eti">Le prime versioni</div>${antiche.map(c => voce(c)).join('')}</details></div></div>`;
+    `<div class="eti">Le prime versioni</div>${antiche.map(c => voce(c)).join('')}</details></div>`;
 }
+
+// Changelog: due tab, Pannello (qui sopra) e Plugin (la cronologia che ogni plugin dichiara nel suo file, dall'API)
+S.clPlugin = S.clPlugin || '';      // filtro della tab Plugin: '' = tutti, altrimenti il nome del plugin
+let clDati = null;
+const MESI_IT = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
+const dataIt = d => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(d || ''); return m ? `${+m[3]} ${MESI_IT[+m[2] - 1]} ${m[1]}` : ''; };
+function disegnaChangelogPlugin() {
+  if (!clDati) return '<div class="card vuoto">Carico…</div>';
+  const plug = clDati.plugin || [];
+  if (!plug.length) return '<div class="card vuoto">Nessun plugin con una cronologia. Un plugin la dichiara con la lista <code>CHANGELOG</code> nel suo file.</div>';
+  const filtro = plug.some(p => p.nome === S.clPlugin) ? S.clPlugin : '';
+  const chips = `<div class="chips cl-filtro">${[['', 'Tutti']].concat(plug.map(p => [p.nome, p.titolo])).map(([k, t]) =>
+    `<button data-clp="${esc(k)}" class="${k === filtro ? 'on' : ''}">${esc(t)}</button>`).join('')}</div>`;
+  const voci = [];
+  for (const p of plug) if (!filtro || p.nome === filtro) for (const c of p.changelog) voci.push({p, c});
+  voci.sort((a, b) => (b.c.data || '').localeCompare(a.c.data || ''));   // stabile: a pari data resta l'ordine del plugin
+  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
+  const corpo = voci.map(({p, c}) => {
+    const att = c.v === p.versione;
+    return `<section class="cl-v${att ? ' att' : ''}"><div class="cl-h">${filtro ? '' : `<span class="pill up">${esc(p.titolo)}</span>`}<span class="cl-n">${esc(c.v)}</span>` +
+      `${att ? '<span class="pill en">Installato</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.data ? `<span class="cl-d">${esc(dataIt(c.data))}</span>` : ''}</div>` +
+      `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+  }).join('');
+  return `${chips}<div class="cl-tl">${corpo}</div>`;
+}
+function vistaChangelog() {
+  const plugin = S.sub === 'plugin';
+  const tabs = `<nav class="sub-tabs cl-tabs" aria-label="Sezioni"><a href="#/changelog" class="${plugin ? '' : 'on'}">Pannello</a><a href="#/changelog/plugin" class="${plugin ? 'on' : ''}">Plugin</a></nav>`;
+  $('#pagina').innerHTML = `<div class="changelog">${tabs}${plugin ? disegnaChangelogPlugin() : disegnaChangelogPannello()}</div>`;
+  window.scrollTo(0, 0);
+  if (plugin && !clDati) caricaChangelogPlugin();
+}
+async function caricaChangelogPlugin() {
+  try {
+    const r = await fetch('/api/plugin/changelog', {credentials: 'same-origin', cache: 'no-store'});
+    if (r.status === 401) { location.href = '/login'; return; }
+    clDati = r.ok ? await r.json() : {plugin: []};
+  } catch (e) { clDati = {plugin: []}; }
+  if (S.pagina === 'changelog' && S.sub === 'plugin') { const y = window.scrollY; vistaChangelog(); window.scrollTo(0, y); }
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('button[data-clp]');
+  if (!b || S.pagina !== 'changelog') return;
+  S.clPlugin = b.dataset.clp; vistaChangelog();
+});
 
 // ---------- Efficienza ----------
 const euro = v => v == null ? '—' : v.toLocaleString('it-IT', {style: 'currency', currency: 'EUR'});
@@ -3419,12 +3489,14 @@ function pluginTab(d) {
 function disegnaImpostazioni(d) {
   const box = $('#imp'); if (!box) return;
   const stato_ = $('#imp-stato'); if (stato_) stato_.innerHTML = statoImpostazioni(d.stato);
+  { const z = $('#stz-st'); if (z) z.textContent = d.stato.stazione || ''; }                 // riga di stato della stazione meteo vicina
   if (box.dataset.pronto && S.sporco) return;            // non cancellare quello che stai scrivendo
   if (box.dataset.pronto === '1' && !S.ricarica) return;
   S.ricarica = false; box.dataset.pronto = '1';
   const sez = t => d.sezioni.filter(s => s.tab === t).sort((a, b) => (a.id === 'testi') - (b.id === 'testi')).map((s, i) => riquadro('s-' + s.id, s.titolo, `
       ${s.nota ? `<p class="nota-sez">${esc(s.nota)}</p>` : ''}
       <div class="campi">${s.campi.map(campoHtml).join('')}</div>
+      ${s.id === 'stazione' ? `<p class="nota-sez" id="stz-st">${esc(d.stato.stazione || '')}</p>` : ''}
       ${s.prova ? '<div class="azioni"><button type="button" class="sec" id="b-prova">Invia messaggio di prova</button><small class="mut">Usa i valori già salvati: salva prima.</small></div>' : ''}`, i === 0)).join('');
   const all = d.allarmi.map(a => `
     <details class="allarme"><summary><span class="t">${esc(a.titolo)}</span><span class="d">${esc(a.descrizione)}</span></summary>
@@ -3742,6 +3814,7 @@ function avvia() {
     else if (p === S.pagina && sub !== S.sub) {
       S.sub = sub;
       if (p === 'impostazioni') vistaImp();
+      else if (p === 'changelog') vistaChangelog();
       else if (S.dati) { const b = $('#dsp'); if (b) b.dataset.h = ''; disegna(); }
     }
   });
@@ -4070,7 +4143,7 @@ def campioni_freq(db, da, a, soglia=5.0):
         vicini = [acqua[j] for j in (i - 1, i) if 0 <= j < len(acqua) and abs(acqua[j][0] - ts) <= 120]
         if not vicini:
             continue
-        t_v, v = min(vicini, key=lambda x: abs(x[0] - ts))
+        v = min(vicini, key=lambda x: abs(x[0] - ts))[1]
         if abs(mandata[ts] - v) > soglia:
             freq[ts] = 0.0
     return freq
@@ -4498,6 +4571,81 @@ def meteo_info(app):
 
 
 # --------------------------------------------------------------------------
+# Umidità esterna da una stazione meteo vicina (WeatherLink, dati grezzi): un solo valore nella card «Esterna»
+# --------------------------------------------------------------------------
+
+STAZIONE_OGNI = 600            # secondi fra una lettura e l'altra
+STAZIONE_VECCHIO = 3600        # se la stazione non manda dati da più di così il valore non si mostra
+STAZIONE_ATTESA = 5            # secondi di attesa massima della rete
+
+
+def stazione_url_valido(u):
+    """Solo https verso weatherlink.com (o un suo sottodominio), senza utente né password: l'indirizzo lo scrive una persona."""
+    try:
+        p = urlparse(u)
+        h = (p.hostname or "").lower()
+    except ValueError:
+        return False
+    return p.scheme == "https" and not p.username and not p.password and (h == "weatherlink.com" or h.endswith(".weatherlink.com"))
+
+
+def stazione_url(app):
+    """Indirizzo dei dati da config.json -> 'stazione'; '' se vuoto o non valido (la funzione resta spenta)."""
+    u = str((app.cfg.leggi().get("stazione") or {}).get("url") or "").strip()
+    return u if stazione_url_valido(u) else ""
+
+
+def stazione_leggi(js):
+    """JSON della stazione -> (umidità %, epoch dell'ultimo dato o None). ValueError se manca o non ha senso."""
+    if not isinstance(js, dict):
+        raise ValueError("risposta inattesa")
+    um = float(str(js.get("humidity")).replace(",", "."))
+    if not 0 <= um <= 100:
+        raise ValueError("umidità fuori scala")
+    ult = js.get("lastReceived")
+    ts = int(ult / 1000) if isinstance(ult, (int, float)) and not isinstance(ult, bool) and ult > 1e11 else None   # millisecondi
+    return round(um, 1), ts
+
+
+def _stazione_lavoro(app, url):
+    st = app.stazione_st
+    try:
+        code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=STAZIONE_ATTESA)
+        if code != 200:
+            raise ValueError(f"HTTP {code}")
+        um, ts = stazione_leggi(js)
+        ora = int(time.time())
+        if st["url"] == url:                                  # nel frattempo l'indirizzo e' cambiato: scarto
+            st.update(um=um, ts=ts or ora, errore=None, falliti=0, prossimo=ora + STAZIONE_OGNI)
+    except Exception as e:
+        st["falliti"] += 1
+        st["errore"] = str(e)[:120]
+        st["prossimo"] = int(time.time()) + min(300 * st["falliti"], STAZIONE_OGNI)
+        (log.warning if st["falliti"] == 1 else log.debug)("Stazione meteo: lettura non riuscita (%s)", e)
+    finally:
+        st["occupato"] = False
+
+
+def stazione_info(app):
+    """None se la funzione è spenta, altrimenti {'umidita': % o None, 'ts': ultimo dato della stazione, 'errore': testo o None}.
+    La lettura parte in un thread (mai nella richiesta della pagina); il valore più vecchio di un'ora non si mostra."""
+    ora = int(time.time())
+    if app.demo:                                              # nella demo si vede sempre, come il meteo
+        return {"umidita": 78.0, "ts": ora - 120, "errore": None}
+    url = stazione_url(app)
+    if not url:
+        return None
+    st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "occupato": False})
+    if st["url"] != url:
+        st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0)
+    if ora >= st["prossimo"] and not st["occupato"]:
+        st["occupato"], st["prossimo"] = True, ora + 60
+        threading.Thread(target=_stazione_lavoro, args=(app, url), daemon=True, name="stazione").start()
+    um = st["um"] if st["um"] is not None and ora - st["ts"] <= STAZIONE_VECCHIO else None
+    return {"umidita": um, "ts": st["ts"] or None, "errore": st["errore"]}
+
+
+# --------------------------------------------------------------------------
 # Stima: quando riparte il riscaldamento (dalla discesa della temperatura in casa)
 # --------------------------------------------------------------------------
 # Idea: a riscaldamento fermo la casa si raffredda come un corpo caldo in una stanza fredda, T(t) = E + (T0 - E) * exp(-k t),
@@ -4789,6 +4937,7 @@ def api_dashboard(app, q):
     stato_risc = ("spento" if not risc_acc else "sbrinamento" if sbrina else "attivo" if modo == "casa" else "riposo")
     stato_acs = "spento" if not pdc_acc else ("attivo" if modo == "acs" else "standby")
     curva = dati_curva(db, ult, da, a, num("ciclo.esterna"))
+    stz = stazione_info(app)
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     return {
@@ -4806,6 +4955,7 @@ def api_dashboard(app, q):
             "modo": NOMI_MODO_ACS.get(txt("pdc.modo"), txt("pdc.modo")),
             "spark": q_medie(db, "acs.temperatura", da, a)},
         "esterna": {"temp": num("ciclo.esterna"), "ts": ts_("ciclo.esterna"), "min": es_min, "max": es_max,
+                    "umidita": (stz or {}).get("umidita"), "umidita_attiva": stz is not None,
                     "spark": q_medie(db, "ciclo.esterna", da, a)},
         "energia": {"kwh": energia_kwh(db, da, a), "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
                     "spark": q_medie(db, "pot.watt", da, a)},
@@ -5439,6 +5589,7 @@ MANIFEST = {"name": "Pompa di calore", "short_name": "PDC", "start_url": "/", "d
             "background_color": "#0b0f17", "theme_color": "#0b0f17", "lang": "it",
             "icons": [{"src": "/icona.png", "sizes": "180x180", "type": "image/png"}]}
 
+_GZ_CACHE = {}
 TIPI_COMPRIMIBILI = {"text/html", "text/css", "text/javascript", "text/csv", "text/plain", "application/json",
                      "application/manifest+json", "image/svg+xml"}
 CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
@@ -5469,13 +5620,21 @@ class Gestore(BaseHTTPRequestHandler):
         log.debug("web %s - %s", self.address_string(), fmt % args)
 
     # ---- risposte ----
-    def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None):
+    def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None, gz_chiave=None):
         dati = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
         compresso = False
         # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto via tunnel, dove passano dalla tua linea in upload
         if (len(dati) > 1024 and tipo.split(";")[0] in TIPI_COMPRIMIBILI and "gzip" in self.headers.get("Accept-Encoding", "")
                 and codice == 200):
-            dati, compresso = gzip.compress(dati, 5, mtime=0), True
+            if gz_chiave:       # file fissi (app.js, app.css): si comprimono una volta per versione, non a ogni richiesta
+                k = (gz_chiave, BUILD)
+                if k not in _GZ_CACHE:
+                    for vecchia in [x for x in _GZ_CACHE if x[1] != BUILD]:      # le versioni vecchie non servono piu'
+                        del _GZ_CACHE[vecchia]
+                    _GZ_CACHE[k] = gzip.compress(dati, 6, mtime=0)
+                dati, compresso = _GZ_CACHE[k], True
+            else:
+                dati, compresso = gzip.compress(dati, 5, mtime=0), True
         self.send_response(codice)
         self.send_header("Content-Type", tipo)
         if compresso:
@@ -5538,8 +5697,11 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(503, self._pagina("setup.html"))
             pubbliche = {"/app.css": "text/css; charset=utf-8", "/app.js": "text/javascript; charset=utf-8"}
             if p in pubbliche and p[1:] in WEB_ASSETS:
-                return self._invia(200, WEB_ASSETS[p[1:]], pubbliche[p],
-                                   [("Cache-Control", "no-cache")])
+                etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta via tunnel)
+                extra = [("Cache-Control", "no-cache"), ("ETag", etag)]
+                if self.headers.get("If-None-Match") == etag:
+                    return self._invia(304, b"", pubbliche[p], extra)
+                return self._invia(200, WEB_ASSETS[p[1:]], pubbliche[p], extra, gz_chiave=p)
             if p == "/icona.png":
                 return self._invia(200, icona(), "image/png", [("Cache-Control", "max-age=86400")])
             if p == "/manifest.webmanifest":
@@ -6664,6 +6826,12 @@ def schema_impostazioni():
             _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
             _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
         ]},
+        {"id": "stazione", "titolo": "Stazione meteo vicina (umidità esterna)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
+         "stazione WeatherLink vicina (non quello della pagina: lo trovi con «python pdc_strumenti.py meteo-prova», che lo stampa pronto da incollare; "
+         "se la stazione cambia, rilancialo). Il pannello legge l'umidità ogni 10 minuti e la mostra nella card Esterna della Dashboard. "
+         "Vuoto = funzione spenta.", "campi": [
+            _c("stazione.url", "testo", "Indirizzo dei dati", "Deve iniziare con https:// e stare su weatherlink.com."),
+        ]},
         {"id": "accessoweb", "titolo": "Login del pannello", "campi": [
             _c("generale.sessione_giorni", "int", "Giorni prima di rifare il login", min=1, max=365),
         ]},
@@ -6725,7 +6893,7 @@ def schema_impostazioni():
     return sezioni, allarmi
 
 
-TAB_SEZIONI = {"telegram": "avvisi", "telegram_file": "avvisi", "telegram_limiti": "avvisi", "orari": "avvisi", "riepilogo": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti", "refresh": "collegamenti", "netatmo": "collegamenti", "accessoweb": "collegamenti",
+TAB_SEZIONI = {"telegram": "avvisi", "telegram_file": "avvisi", "telegram_limiti": "avvisi", "orari": "avvisi", "riepilogo": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti", "refresh": "collegamenti", "netatmo": "collegamenti", "stazione": "collegamenti", "accessoweb": "collegamenti",
                "dispositivi": "collegamenti", "tariffa": "dati", "bollitore": "dati", "backup": "dati", "storico": "dati"}
 
 
@@ -6771,6 +6939,17 @@ def info_database(app):
     return v
 
 
+def stato_stazione(app):
+    """Riga di stato della stazione meteo vicina per Impostazioni: testo breve (vuoto se la funzione è spenta)."""
+    i = stazione_info(app)
+    if i is None:
+        return ""
+    if i["umidita"] is None:
+        return "In attesa del primo dato…" if not i["errore"] else "Non riesco a leggere la stazione: " + i["errore"]
+    quando = datetime.fromtimestamp(i["ts"]).strftime("%H:%M") if i["ts"] else "?"
+    return f"Umidità esterna {num_it(i['umidita'])} % · ultimo dato della stazione alle {quando}" + (" · ultima lettura non riuscita" if i["errore"] else "")
+
+
 def stato_collegamenti(app, ora):
     cfg = app.cfg.leggi()
     srv = {s.sigla: s for s in app.servizi}
@@ -6789,6 +6968,7 @@ def stato_collegamenti(app, ora):
                     "configurato": bool(nt.get("client_id") and nt.get("refresh_token"))},
         "telegram": {"abilitato": bool(cfg["telegram"]["abilitato"]), "attivo": tg.attivo(), "problema": err,
                      "ultimo_ok": tg.stato["ultimo_ok"], "messaggio": tg.stato["messaggio"]},
+        "stazione": stato_stazione(app),
         "database": info_database(app),
         "eventi_aperti": sum(1 for e in app.db.eventi_recenti(50) if e[4] is None),
     }
@@ -6852,6 +7032,8 @@ def _valida(c, v):
             return None, "Le parentesi graffe non tornano: i segnaposto vanno scritti come {testo}"
         return s, None
     s = s.strip()
+    if c["chiave"] == "stazione.url" and s and not stazione_url_valido(s):
+        return None, "Scrivi un indirizzo https:// di weatherlink.com"
     if c["chiave"] in ("dispositivi.ip_pdc", "dispositivi.ip_smarther") and s:
         try:
             ipaddress.IPv4Address(s)
@@ -8730,6 +8912,8 @@ def elenco_comandi(app, massimo=100):
 # Cosa deve contenere un plugin (INTERFACCIA 1):
 #   INFO  = {"titolo": "Alexa", "versione": "1.0", "interfaccia": 1, "descrizione": "..."}
 #   CAMPI = [{"chiave": "segreto", "tipo": "segreto", "et": "...", "aiuto": "...", "default": ...}, ...]   (facoltativo)
+#   CHANGELOG = [{"v": "1.1", "data": "2026-11-04T18:00", "titolo": "...", "righe": [["n", "Titoletto", "Una frase."], ...]}, ...]   (facoltativo)
+#       la cronologia del plugin, la piu' recente in alto: compare in Changelog > Plugin. Tipo riga: n = Novita', m = Migliorato, s = Sistemato.
 #   def avvia(ctx): ...        (deve tornare subito; per lavori lunghi si usa un thread)
 #   def ferma(ctx): ...        (facoltativa)
 # Il campo «attivo» (interruttore) lo aggiunge il pannello: un plugin nuovo parte SPENTO.
@@ -8754,6 +8938,7 @@ class Plug:
         self.nome, self.file = nome, file
         self.modulo = None
         self.info, self.campi = {}, []
+        self.changelog = []
         self.sha = ""
         self.stato, self.errore = "errore", ""
         self.avviato = False
@@ -8825,6 +9010,22 @@ def _riassunto(e):
     return f"{type(e).__name__}: {e}"[:300]
 
 
+def _pulisci_changelog(grezzo):
+    """La cronologia dichiarata da un plugin, ripulita (testi corti, limiti). Mai eccezioni: se e' sbagliata, resta vuota."""
+    out = []
+    try:
+        for c in list(grezzo or [])[:60]:
+            righe = [[str(x[0]) if str(x[0]) in ("n", "m", "s") else "m", str(x[1])[:80], str(x[2])[:600]]
+                     for x in list(c.get("righe") or [])[:12] if isinstance(x, (list, tuple)) and len(x) >= 3]
+            data = str(c.get("data", ""))[:16]
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2})?", data):
+                data = ""
+            out.append({"v": str(c.get("v", ""))[:20], "data": data, "titolo": str(c.get("titolo", ""))[:80], "righe": righe})
+    except Exception:
+        return []
+    return out
+
+
 def _leggi_plugin(f):
     """Carica il file di un plugin SENZA avviarlo. Mai eccezioni: l'errore finisce nel Plug."""
     p = Plug(f.stem, f)
@@ -8853,6 +9054,7 @@ def _leggi_plugin(f):
                           "aiuto": str(c.get("aiuto", "")), "default": c.get("default"),
                           **{k: c[k] for k in ("min", "max", "opzioni") if k in c}})
         p.campi, p.modulo = campi, modulo
+        p.changelog = _pulisci_changelog(getattr(modulo, "CHANGELOG", None))
         p.stato = "spento"
     except BaseException as e:            # anche SystemExit: un plugin non deve mai fermare il pannello
         if isinstance(e, KeyboardInterrupt):
@@ -8947,6 +9149,14 @@ def plugin_ricarica(app):
         return len(PLUGIN)
 
 
+@api("/api/plugin/changelog")
+def api_plugin_changelog(app, q):
+    """Le cronologie dei plugin, per la tab Changelog > Plugin."""
+    with _lock_plugin:
+        return {"plugin": [{"nome": p.nome, "titolo": p.info.get("titolo") or p.nome, "versione": p.info.get("versione", ""),
+                            "changelog": p.changelog} for p in PLUGIN.values() if p.changelog]}
+
+
 def sezioni_plugin():
     """I riquadri di Impostazioni > Integrazioni: uno per plugin, con interruttore e campi (stessa forma delle altre sezioni)."""
     out = []
@@ -8983,6 +9193,8 @@ def plugin_pubblico(app, h, p, q):
     voce = PLUGIN_ROTTE.get(p)
     plug = PLUGIN.get(voce[0]) if voce else None
     if not voce or not plug or not plug.avviato:
+        if _troppo_veloce("-", ip_client(h)):      # anche gli indirizzi sbagliati hanno un limite: niente tentativi a raffica
+            return h._json({"errore": "troppe richieste"}, 429)
         return h._invia(404, "Non trovato", "text/plain; charset=utf-8")
     _, funzione, metodi = voce
     if h.command not in metodi:

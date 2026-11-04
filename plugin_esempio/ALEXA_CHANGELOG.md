@@ -1,5 +1,12 @@
 # Plugin Alexa — changelog
 
+## 1.4.0 — 4 novembre 2026
+- **Due nuove domande «fuori»**, come quelle della casa con l'ordine invertito: `TemperaturaFuoriIntent` («Fuori ci sono 8,8 gradi e l'87 per cento di umidità.») e `UmidFuoriIntent` («Fuori c'è l'87 per cento di umidità e ci sono 8,8 gradi.»). La temperatura è quella della sonda della pompa, l'umidità viene dalla stazione meteo vicina (Impostazioni → Collegamenti).
+- Senza stazione, o con dato più vecchio di un'ora, dice solo i gradi (con «Non ho l'umidità della stazione» se la stazione è configurata). Se la sonda è ferma da più di 2 ore aggiunge l'avviso.
+- La risposta sulla pompa di calore ora dice anche l'umidità di fuori: «Fuori ci sono 8,4 gradi e l'87 per cento di umidità.»
+- «Aiuto» e l'apertura della skill nominano anche «com'è fuori».
+- **Da rifare nella console Amazon**: reimportare `alexa_modello_it.json` (frase nuova).
+
 ## 1.3.1 — 4 novembre 2026
 - Spariscono dalla console gli avvisi «CryptographyDeprecationWarning: Parsed a serial number…»: venivano da una radice vecchia nell’archivio di Windows e erano innocui. Se una versione futura della libreria la rifiutasse, la radice viene saltata e le altre restano valide.
 

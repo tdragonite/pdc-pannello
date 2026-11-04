@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.20"
+VERSIONE = "0.21.1"
 
 import argparse
 import base64
@@ -267,6 +267,11 @@ TEMPLATE = {
         "_nota": "Posizione per il meteo del giorno nella Dashboard (card Esterna), da Open-Meteo. Ora c'è Cirié. Per toglierlo svuota le due coordinate ('').",
         "latitudine": 45.23,
         "longitudine": 7.60,
+    },
+    "stazione": {
+        "_nota": "Facoltativo. Indirizzo dei DATI di una stazione meteo WeatherLink vicina (non quello della pagina: lo stampa 'python pdc_strumenti.py meteo-prova'). "
+                 "Il pannello ne legge l'umidita' esterna ogni 10 minuti e la mostra nella card Esterna. Vuoto = funzione spenta.",
+        "url": "",
     },
     "tariffa": {
         "_nota": "Prezzo dell'energia elettrica in euro per kWh (con le tasse, per esempio 0.28). 0 = non mostrare i costi.",
@@ -757,7 +762,7 @@ def estrai_st(status, mappa, ts):
             if not t or not hx:
                 continue
             rec.ciclo.append((tipo, t, hx))
-            layout, valori, problema = decodifica_ciclo(tipo, hx, mappa)
+            _, valori, problema = decodifica_ciclo(tipo, hx, mappa)
             if problema:
                 rec.problemi.append(problema)
             for nome, v in valori.items():

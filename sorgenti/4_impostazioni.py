@@ -113,6 +113,12 @@ def schema_impostazioni():
             _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
             _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
         ]},
+        {"id": "stazione", "titolo": "Stazione meteo vicina (umidità esterna)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
+         "stazione WeatherLink vicina (non quello della pagina: lo trovi con «python pdc_strumenti.py meteo-prova», che lo stampa pronto da incollare; "
+         "se la stazione cambia, rilancialo). Il pannello legge l'umidità ogni 10 minuti e la mostra nella card Esterna della Dashboard. "
+         "Vuoto = funzione spenta.", "campi": [
+            _c("stazione.url", "testo", "Indirizzo dei dati", "Deve iniziare con https:// e stare su weatherlink.com."),
+        ]},
         {"id": "accessoweb", "titolo": "Login del pannello", "campi": [
             _c("generale.sessione_giorni", "int", "Giorni prima di rifare il login", min=1, max=365),
         ]},
@@ -174,7 +180,7 @@ def schema_impostazioni():
     return sezioni, allarmi
 
 
-TAB_SEZIONI = {"telegram": "avvisi", "telegram_file": "avvisi", "telegram_limiti": "avvisi", "orari": "avvisi", "riepilogo": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti", "refresh": "collegamenti", "netatmo": "collegamenti", "accessoweb": "collegamenti",
+TAB_SEZIONI = {"telegram": "avvisi", "telegram_file": "avvisi", "telegram_limiti": "avvisi", "orari": "avvisi", "riepilogo": "avvisi", "testi": "avvisi", "umidita": "avvisi", "collegamenti": "collegamenti", "refresh": "collegamenti", "netatmo": "collegamenti", "stazione": "collegamenti", "accessoweb": "collegamenti",
                "dispositivi": "collegamenti", "tariffa": "dati", "bollitore": "dati", "backup": "dati", "storico": "dati"}
 
 
@@ -220,6 +226,17 @@ def info_database(app):
     return v
 
 
+def stato_stazione(app):
+    """Riga di stato della stazione meteo vicina per Impostazioni: testo breve (vuoto se la funzione è spenta)."""
+    i = stazione_info(app)
+    if i is None:
+        return ""
+    if i["umidita"] is None:
+        return "In attesa del primo dato…" if not i["errore"] else "Non riesco a leggere la stazione: " + i["errore"]
+    quando = datetime.fromtimestamp(i["ts"]).strftime("%H:%M") if i["ts"] else "?"
+    return f"Umidità esterna {num_it(i['umidita'])} % · ultimo dato della stazione alle {quando}" + (" · ultima lettura non riuscita" if i["errore"] else "")
+
+
 def stato_collegamenti(app, ora):
     cfg = app.cfg.leggi()
     srv = {s.sigla: s for s in app.servizi}
@@ -238,6 +255,7 @@ def stato_collegamenti(app, ora):
                     "configurato": bool(nt.get("client_id") and nt.get("refresh_token"))},
         "telegram": {"abilitato": bool(cfg["telegram"]["abilitato"]), "attivo": tg.attivo(), "problema": err,
                      "ultimo_ok": tg.stato["ultimo_ok"], "messaggio": tg.stato["messaggio"]},
+        "stazione": stato_stazione(app),
         "database": info_database(app),
         "eventi_aperti": sum(1 for e in app.db.eventi_recenti(50) if e[4] is None),
     }
@@ -301,6 +319,8 @@ def _valida(c, v):
             return None, "Le parentesi graffe non tornano: i segnaposto vanno scritti come {testo}"
         return s, None
     s = s.strip()
+    if c["chiave"] == "stazione.url" and s and not stazione_url_valido(s):
+        return None, "Scrivi un indirizzo https:// di weatherlink.com"
     if c["chiave"] in ("dispositivi.ip_pdc", "dispositivi.ip_smarther") and s:
         try:
             ipaddress.IPv4Address(s)

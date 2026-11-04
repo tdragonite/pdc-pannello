@@ -49,6 +49,35 @@
           ]
         },
         {
+          "name": "TemperaturaFuoriIntent",
+          "slots": [],
+          "samples": [
+            "temperatura fuori",
+            "la temperatura fuori",
+            "che temperatura c'è fuori",
+            "quanti gradi ci sono fuori",
+            "temperatura esterna",
+            "la temperatura esterna",
+            "quanti gradi ci sono all'esterno",
+            "com'è fuori",
+            "come è fuori",
+            "fuori"
+          ]
+        },
+        {
+          "name": "UmidFuoriIntent",
+          "slots": [],
+          "samples": [
+            "umidità fuori",
+            "l'umidità fuori",
+            "che umidità c'è fuori",
+            "quanta umidità c'è fuori",
+            "umidità esterna",
+            "l'umidità esterna",
+            "quanta umidità c'è all'esterno"
+          ]
+        },
+        {
           "name": "AccendiTermostatoIntent",
           "slots": [],
           "samples": [

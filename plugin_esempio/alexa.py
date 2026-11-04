@@ -25,11 +25,32 @@ from datetime import datetime, timezone
 
 INFO = {
     "titolo": "Alexa",
-    "versione": "1.3.1",
+    "versione": "1.4.0",
     "interfaccia": 1,
-    "descrizione": "Skill personale per Alexa: risponde su temperatura, umidità, pompa di calore, acqua calda, mandata e ripartenza, "
+    "descrizione": "Skill personale per Alexa: risponde su temperatura e umidità (in casa e fuori), pompa di calore, acqua calda, mandata e ripartenza, "
                    "e accende o spegne lo Smarther. Si usa con le Routine di Alexa, senza pronunciare il nome della skill.",
 }
+CHANGELOG = [
+    {"v": "1.4.0", "data": "2026-11-04T15:00", "titolo": "Temperatura e umidità di fuori", "righe": [
+        ["n", "Due domande «fuori»", "Temperatura e umidità di fuori, nei due ordini. L’umidità viene dalla stazione meteo vicina (Impostazioni → Collegamenti)."],
+        ["m", "Pompa di calore", "La risposta sulla pompa di calore dice anche l’umidità di fuori."],
+        ["m", "Aiuto", "«Aiuto» e l’apertura della skill nominano anche «com’è fuori»."],
+        ["m", "Da rifare in Amazon", "Reimporta il modello alexa_modello_it.json nella console (frasi nuove)."]]},
+    {"v": "1.3.1", "data": "2026-11-04T13:00", "titolo": "Console più pulita", "righe": [
+        ["s", "Avvisi in console", "Spariscono gli avvisi sul certificato vecchio dell’archivio di Windows: erano innocui."]]},
+    {"v": "1.3", "data": "2026-11-04T12:00", "titolo": "Firma più robusta", "righe": [
+        ["m", "Esito della firma", "Ora appartiene alla singola richiesta, anche con richieste ravvicinate."],
+        ["m", "Certificato Amazon", "Il download aspetta al massimo 3 secondi, per non consumare gli 8 concessi da Alexa."]]},
+    {"v": "1.2", "data": "2026-11-04T11:00", "titolo": "Certificato in background", "righe": [
+        ["m", "Certificato Amazon", "Si riscarica da solo ogni 50 minuti: nessuna richiesta di Alexa aspetta il download."]]},
+    {"v": "1.1", "data": "2026-11-04T10:00", "titolo": "Verifica della firma", "righe": [
+        ["n", "Verifica firma Amazon", "Campo Spenta / Solo avviso / Attiva: controlla che le richieste arrivino davvero da Amazon (serve la libreria cryptography)."],
+        ["m", "Nome di invocazione", "Il modello vocale usa «centrale termica»."]]},
+    {"v": "1.0", "data": "2026-11-04T09:00", "titolo": "Prima versione", "righe": [
+        ["n", "Skill personale", "Temperatura, umidità, riscaldamento acceso, ripartenza, pompa di calore, acqua calda, mandata e Smarther acceso/spento, con le Routine di Alexa."],
+        ["n", "Indirizzo protetto", "Segreto casuale, skill riconosciuta, richieste fresche e uniche, limite di richieste."]]},
+]
+
 CAMPI = [
     {"chiave": "segreto", "tipo": "segreto", "et": "Segreto dell’indirizzo",
      "aiuto": "Generato da solo al primo avvio. Per cambiarlo scrivine uno nuovo (da 24 a 64 caratteri tra lettere, numeri, trattino e "
@@ -99,6 +120,17 @@ def ora_parlata(ts):
     return f"{h}{m}{giorno}"
 
 
+def il_num(v):
+    """«il 52», ma «l'87», «l'8», «l'11», «l'18»: l'articolo giusto davanti a un numero parlato."""
+    k = int(round(float(v)))
+    return ("l'" if k in (8, 11, 18) or 80 <= k <= 89 else "il ") + str(k)
+
+
+def umidita_fuori(e):
+    """' e l'87 per cento di umidità' (con lo spazio davanti) se la stazione meteo vicina dà il dato, altrimenti ''."""
+    return f" e {il_num(e['umidita'])} per cento di umidità" if e.get("umidita") is not None else ""
+
+
 def vecchio(ts):
     if not ts:
         return ""
@@ -118,7 +150,7 @@ def risposte(ctx):
         if c["temp"] is None:
             return "Non ho la temperatura di casa."
         t = f"In casa ci sono {n(c['temp'])} gradi"
-        t += f" e il {n(c['umidita'], 0)} per cento di umidità." if c["umidita"] is not None else "."
+        t += f" e {il_num(c['umidita'])} per cento di umidità." if c["umidita"] is not None else "."
         if c.get("target") is not None:
             t += f" Lo Smarther è impostato a {n(c['target'])}."
         return t + vecchio(c.get("ts"))
@@ -127,7 +159,7 @@ def risposte(ctx):
         c = d()["casa"]
         if c["umidita"] is None:
             return "Non ho l'umidità di casa."
-        t = f"In casa c'è il {n(c['umidita'], 0)} per cento di umidità"
+        t = f"In casa c'è {il_num(c['umidita'])} per cento di umidità"
         t += f" e ci sono {n(c['temp'])} gradi." if c["temp"] is not None else "."
         return t + vecchio(c.get("ts"))
 
@@ -152,8 +184,32 @@ def risposte(ctx):
         if w is not None and w >= 50:
             t += f" Sta assorbendo {n(w, 0)} watt."
         if x["esterna"]["temp"] is not None:
-            t += f" Fuori ci sono {n(x['esterna']['temp'])} gradi."
+            t += f" Fuori ci sono {n(x['esterna']['temp'])} gradi{umidita_fuori(x['esterna'])}."
         return t
+
+    def vecchio_fuori(e):
+        if e.get("ts") and time.time() - e["ts"] > 7200:
+            return f" Attenzione: l'ultimo dato della temperatura risale a {int((time.time() - e['ts']) // 3600)} ore fa."
+        return ""
+
+    def temperatura_fuori():
+        e = d()["esterna"]
+        if e["temp"] is None:
+            return "Non ho la temperatura di fuori."
+        t = f"Fuori ci sono {n(e['temp'])} gradi{umidita_fuori(e)}."
+        if e.get("umidita") is None and e.get("umidita_attiva"):
+            t += " Non ho l'umidità della stazione."
+        return t + vecchio_fuori(e)
+
+    def umidita_fuori_f():
+        e = d()["esterna"]
+        if e.get("umidita") is None:
+            if e["temp"] is None:
+                return "Non ho né l'umidità né la temperatura di fuori."
+            return f"Non ho l'umidità di fuori. Ci sono {n(e['temp'])} gradi." + vecchio_fuori(e)
+        t = f"Fuori c'è {il_num(e['umidita'])} per cento di umidità"
+        t += f" e ci sono {n(e['temp'])} gradi." if e["temp"] is not None else "."
+        return t + vecchio_fuori(e)
 
     def acqua_calda():
         a = d()["acs"]
@@ -233,7 +289,7 @@ def risposte(ctx):
     return {
         "TemperaturaIntent": temperatura, "UmiditaIntent": umidita, "StatoPdcIntent": stato_pdc,
         "AcquaCaldaIntent": acqua_calda, "MandataIntent": mandata, "RiscaldamentoAccesoIntent": riscaldamento_acceso,
-        "RipartenzaIntent": ripartenza, "AccendiTermostatoIntent": termostato(True), "SpegniTermostatoIntent": termostato(False),
+        "RipartenzaIntent": ripartenza, "TemperaturaFuoriIntent": temperatura_fuori, "UmidFuoriIntent": umidita_fuori_f, "AccendiTermostatoIntent": termostato(True), "SpegniTermostatoIntent": termostato(False),
     }
 
 
@@ -477,7 +533,7 @@ def richiesta(rich):
     tipo = req.get("type")
     if tipo == "LaunchRequest":
         _stato("ultima richiesta: apertura della skill")
-        return _risposta("Dimmi pure: temperatura, umidità, pompa di calore, acqua calda, o accendi e spegni il termostato.",
+        return _risposta("Dimmi pure: temperatura, umidità, com'è fuori, pompa di calore, acqua calda, o accendi e spegni il termostato.",
                          False, "Cosa vuoi sapere?")
     if tipo == "SessionEndedRequest":
         return {"version": "1.0", "response": {}}
@@ -487,7 +543,7 @@ def richiesta(rich):
     if nome in ("AMAZON.StopIntent", "AMAZON.CancelIntent", "AMAZON.NavigateHomeIntent"):
         return _risposta("D'accordo.")
     if nome == "AMAZON.HelpIntent":
-        return _risposta("Puoi chiedermi la temperatura, l'umidità, cosa fa la pompa di calore, l'acqua calda, la mandata, "
+        return _risposta("Puoi chiedermi la temperatura, l'umidità, com'è fuori, cosa fa la pompa di calore, l'acqua calda, la mandata, "
                          "se il riscaldamento è acceso, quando riparte, oppure dirmi di accendere o spegnere il termostato.", False, "Cosa vuoi sapere?")
     f = risposte(ctx).get(nome)
     if not f:
