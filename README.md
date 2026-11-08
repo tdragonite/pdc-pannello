@@ -1,7 +1,7 @@
 # Pannello pompa di calore (Samsung EHS) – guida completa
 
 Un pannello web per la tua pompa di calore Samsung EHS e per lo Smarther 2, che gira sul tuo PC. **Legge e mostra** tutto (dati, storico, efficienza) e **comanda solo tre cose**: accendere/spegnere riscaldamento, acqua calda e Smarther (dietro un lucchetto, vedi «Accendere e spegnere dal pannello»). Non cambia nessuna impostazione della pompa.
-Ha le pagine **Dashboard**, **Analisi**, **Efficienza**, **Dispositivi** e **Impostazioni** (più il **Changelog**), funziona bene su iPhone, ti avvisa su Telegram se qualcosa non va e, se vuoi, lo raggiungi anche da fuori casa. Dalla 0.20 accetta anche **integrazioni a plugin**, come Alexa (capitoli 18 e 19).
+Ha le pagine **Dashboard**, **Analisi**, **Efficienza**, **Dispositivi** e **Impostazioni** (più il **Changelog**), funziona bene su iPhone, ti avvisa su Telegram se qualcosa non va e, se vuoi, lo raggiungi anche da fuori casa. Dalla 0.20 accetta anche **integrazioni a plugin**, come Alexa e il widget per iPhone (capitoli 18, 19 e 20).
 
 Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla oltre a Python. Dati, impostazioni e log stanno nelle sottocartelle della cartella dello script (vedi «Come è organizzata la cartella» nel capitolo 14).
 
@@ -217,7 +217,7 @@ Tutte le anomalie compaiono sempre anche nel pannello (banner in alto); qui deci
 | `acs_bassa` | acqua calda sotto 35 °C per 30 minuti |
 | `cop_basso` | COP stimato delle ultime 24 ore sotto 2 |
 | `sbrinamenti_frequenti` | 6 o più sbrinamenti in 3 ore |
-| `sbrinamento_inizio` / `sbrinamento_fine` | **avvisi informativi** (dalla 0.19): la pompa inizia / finisce uno sbrinamento (alla fine: durata e consumo). Arrivano **sempre in silenzio** (senza suono), non si ripetono e non hanno “rientro”. Si spengono o si riscrivono in *Impostazioni → Avvisi* (segnaposto `{esterna} {ora}` / `{durata} {consumo}`) |
+| `sbrinamento_inizio` / `sbrinamento_fine` | **avvisi informativi** (dalla 0.19): la pompa inizia / finisce uno sbrinamento (alla fine: durata e consumo). Arrivano **sempre in silenzio** (senza suono), non si ripetono e non hanno “rientro”. Hanno lo stile degli altri messaggi (emoji e «Pompa di calore» in grassetto sulla prima riga; dalla 0.21.2). Si spengono o si riscrivono in *Impostazioni → Avvisi* (segnaposto `{impianto} {esterna} {ora}` / `{impianto} {durata} {consumo}`); se avevi i testi originali, la 0.21.2 li aggiorna da sola, se li avevi personalizzati non li tocca |
 
 **Le soglie sono un punto di partenza, non verità**: dopo qualche settimana guardale con i tuoi dati e ritoccale.
 
@@ -289,6 +289,9 @@ Riscaldamento (mandata, ritorno, ΔT), acqua calda sanitaria, temperatura estern
 **Dati più freschi (opzione, dalla 0.18).** In *Impostazioni → Collegamenti* c'è «SmartThings: chiedi alla pompa di aggiornare i dati mentre lavora» (spenta di default). Se la accendi, **solo mentre la pompa lavora** (compressore in marcia, Smarther che chiede calore o acqua dell'impianto che si muove) il pannello manda ogni 60 secondi (si cambia in *Ogni quanti secondi mandare il refresh*, minimo 30) il comando «refresh» e rilegge subito dopo. Non cambia nessuna impostazione della pompa. Dalle prove (pdc a riposo e in marcia) i dati nuovi arrivano dopo circa 10 secondi in più della metà dei tentativi: a volte freschi (meno di 2 minuti), a volte arretrati, e a volte non arriva niente. Quindi **migliora, ma non elimina il ritardo**. Serve il permesso di comando del token SmartThings (`x:devices:*`, come per gli interruttori): se manca, il pannello lo scrive nella scheda *Compressore e circuito* e riprova dopo un'ora.
 Si aggiorna da sola mentre è aperta: il pallino in alto è verde se i dati sono freschi, giallo se il tempo reale non è collegato o i dati sono vecchi, rosso se c'è un problema.
 
+**Ripartenza prevista** (dalla 0.19, resa stabile nella 0.21.3)
+Nella card dello Smarther, quando il riscaldamento è fermo, compare in un riquadro viola «Riparte alle 22:45» (o «Riparte domani…»): è l'ora in cui la casa dovrebbe scendere alla soglia di ripartenza dello Smarther. La stima nasce dai tuoi dati: il pannello cerca nello storico le pause del riscaldamento (almeno 15 minuti acceso e poi un'ora di pausa) e misura quanto in fretta scende la temperatura in casa; ne servono almeno 5 valide, quindi nei primi giorni non compare. Non compare nemmeno se sta già scaldando, se la ripartenza è oltre 12 ore o se il dato dello Smarther è vecchio. L'orario è arrotondato al quarto d'ora ed è la stima «in situazione ideale» (finestre aperte o sole la sfalsano). Il sensore dello Smarther misura a passi di 0,1 °C e con una casa inerte un solo passo vale anche mezz'ora: per questo l'orario mostrato **resta fermo** finché la nuova stima non si sposta di oltre una soglia (fino a 30 minuti da lontano, sempre meno avvicinandosi). Lo stesso orario lo leggono il widget e Alexa. Se non compare e vuoi sapere perché: `python pdc_strumenti.py rip-diag` (mostra anche la stima grezza).
+
 **Analisi** (6h / 24h / personalizzato)
 I grafici nel dettaglio: temperature, casa (con una striscia rossa quando lo Smarther chiede calore), umidità, potenza, gas di scarico e un unico grafico **Compressore, portata e pompa** (frequenza e target in Hz, pompa in %, portata in L/min su un secondo asse a destra). Le fasce colorate dietro le linee dicono quando scaldava la casa (rosso) o l'acqua (blu). Il grafico mostra i dati di SmartThings così come arrivano, senza correzioni. I periodi in cui non c'è nessun dato (pannello spento, collegamento caduto) sono segnati con righe oblique, così non sembrano valori a zero.
 
@@ -298,6 +301,7 @@ Il riquadro **Sbrinamenti** (dalla 0.19) conta gli sbrinamenti del periodo; tocc
 Se in *Impostazioni → Costo dell'energia* scrivi il prezzo (€ per kWh, tasse comprese), compaiono anche il **costo stimato** del periodo e il costo medio di un ciclo di acqua calda. È una stima: kWh della pompa per il prezzo, senza quota fissa. In fondo alla pagina ci sono i link per **esportare in CSV** (riepilogo per giorno o dati grezzi degli ultimi 7 giorni), pensati per Excel italiano (punto e virgola, virgola decimale).
 
 Il pulsante **Confronta** (spento quando apri la pagina) affianca i numeri del periodo scelto a quelli del periodo precedente della stessa lunghezza, con la differenza in percentuale. Se per il periodo precedente mancano dati, lo dice.
+Con **Confronta** acceso, sulle barre dell'energia compare un trattino «tipico» (come si consuma di solito con quel freddo, cioè nei giorni con temperatura esterna entro ±2 °C) e un puntino se il giorno è oltre un quarto sopra il tipico; il COP ha una linea tratteggiata del suo valore tipico. Servono almeno 3 giorni simili: altrimenti non mostra niente, per non inventare valori.
 La scheda **Salute del bollitore** stima quanto calore perde l'acqua calda di notte (in °C all'ora e in watt) e quanto ci mette a salire di 10 °C quando la pompa la scalda. Servono almeno due notti e due cicli completi; i litri del bollitore (300 di partenza) sono in `config.json` → `bollitore`. Se la perdita aumenta nei mesi, può esserci un problema di isolamento o di ricircolo.
 
 > **Il COP è una stima.** Il calore prodotto lo ricavo da portata × salto di temperatura tra mandata e ritorno × 0,0698 kW per (L/min·°C); l'energia elettrica viene dalla potenza che la pdc dichiara. Il COP conta solo i momenti di lavoro (casa + acqua calda), non lo standby. Può differire da quello di altri servizi: usalo per **confrontare nel tempo**, non come numero assoluto. Se mancano dati, la pagina ti mostra un avviso.
@@ -372,7 +376,7 @@ python pdc_pannello.py esporta-diagnostica  crea un file di diagnosi da mandare 
 python pdc_pannello.py --versione
 ```
 
-Nella stessa cartella c'è anche `pdc_strumenti.py` (vedi `README_STRUMENTI.md`): oltre ai dump, `rip-diag` e `sbrinamenti [--giorni 7] [--salva]` (dalla 0.19: elenco degli sbrinamenti letti dal database). Dalla 0.20 anche `nt-webhook-prova` (prova dei webhook Netatmo, capitolo 6 di `README_STRUMENTI.md`).
+Nella stessa cartella c'è anche `pdc_strumenti.py` (vedi `README_STRUMENTI.md`): oltre ai dump, `rip-diag` e `sbrinamenti [--giorni 7] [--salva]` (dalla 0.19: elenco degli sbrinamenti letti dal database). Dalla 0.20 anche `nt-webhook-prova` (prova dei webhook Netatmo, capitolo 6 di `README_STRUMENTI.md`), `meteo-prova` (stazione meteo vicina, capitolo 8) e, dalla 0.21.3, **`analisi`**: crea in un colpo solo un file `diagnostica/analisi_….json` con tutti i dati del database (impostazioni, cicli, sbrinamenti, serie nel tempo, senza token né indirizzi), da mandare a chi ti aiuta (capitolo 9).
 
 Per pythonw usa gli stessi argomenti, ma non vedrai l'output: i comandi “da guardare” (`stato`, `telegram-prova`…) lanciali con `python`.
 
@@ -514,7 +518,7 @@ L'indirizzo, il segreto e l'ID della skill si vedono in *Impostazioni → Integr
 
 - A voce si possono solo **leggere i dati** e **accendere/spegnere lo Smarther**. Riscaldamento e acqua calda della pompa non si comandano da Alexa.
 - Le risposte usano gli stessi dati della Dashboard; se l'ultimo dato ha più di 30 minuti lo dice.
-- **Alexa+**: con Alexa+ attiva le richieste «apri / chiedi a…» possono essere intercettate dalla Casa intelligente e la skill non si apre. Finché Amazon non lo sistema, la skill funziona con l'Alexa classica («Alexa, esci da Alexa+»).
+- **Alexa+**: con Alexa+ attiva le richieste «apri / chiedi a…» possono essere intercettate dalla Casa intelligente o abbinate a un'altra skill, e a volte Alexa risponde «non ho trovato il sensore»: la skill risponde bene quando viene raggiunta, ma l'esito è instabile. Amazon garantisce le skill personalizzate solo sull'Alexa classica, quindi, finché non lo sistema, il consiglio è l'Alexa classica («Alexa, esci da Alexa+»).
 
 ### Sicurezza dell'indirizzo
 
@@ -540,3 +544,5 @@ Il pannello limita comunque dimensione e frequenza delle richieste (capitolo 16)
 Il plugin `widget.py` (versione 1.1.0) crea un indirizzo pubblico, di sola lettura, con i pochi dati che servono al widget: temperatura e umidità di casa, termostato (chiama / riparte / non chiama), stato della pompa di calore e acqua calda, temperatura e umidità di fuori. Lo script `widget_scriptable.js` li disegna come widget medio nell'app gratuita **Scriptable**. Si installa come gli altri plugin (Impostazioni → Integrazioni), si copia l'indirizzo in «Indirizzi pubblici» e si incolla nello script.
 
 **Sicurezza**: l'indirizzo contiene un segreto casuale; in più il campo **Token del widget** (da 24 a 64 caratteri) va scritto uguale anche nello script (costante `TOKEN`): senza il token l'indirizzo risponde 404, quindi aprirlo da un browser non mostra niente. Il widget può solo leggere. Per cambiare segreto o token basta scriverne uno nuovo, ricaricare i plugin e aggiornare lo script. La cronologia del plugin sta in `WIDGET_CHANGELOG.md`.
+
+**Aggiornamento del widget**: iOS decide da solo quando ridisegnarlo (lo script gli chiede 15 minuti, ma ritardi di 20-30 minuti sono normali, di più con il Risparmio energetico o l'app Scriptable senza «Aggiorna app in background»). Toccare il widget apre il pannello; per forzare l'aggiornamento c'è la riga in basso a destra con l'ora: apre un Comando rapido chiamato **Aggiorna widget** (app Comandi → nuovo comando con l'azione di Scriptable «Refresh All Widgets» e, come ultima, «Vai alla schermata Home»). Il nome si cambia nella costante `COMANDO_AGGIORNA` all'inizio dello script. Per un attimo si vedono Comandi e Scriptable, poi si torna alla Home.

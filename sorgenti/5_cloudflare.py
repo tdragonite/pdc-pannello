@@ -220,8 +220,6 @@ class TunnelCF:
         except OSError as e:
             logf.close()
             raise ErroreCF(f"Non riesco ad avviare cloudflared: {e}")
-        finally:
-            pass
         logf.close()
         self.partito_il = time.time()
         try:

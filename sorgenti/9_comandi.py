@@ -78,8 +78,8 @@ def cmd_imposta_password(app):
         p2 = getpass.getpass("Ripeti la password: ")
         if p1 != p2:
             print("Le due password non coincidono, riprova.")
-        elif len(p1) < 10:
-            print("Troppo corta: servono almeno 10 caratteri (il pannello potra' essere visibile da internet).")
+        elif len(p1) < PASSWORD_MIN:
+            print(f"Troppo corta: servono almeno {PASSWORD_MIN} caratteri (il pannello potra' essere visibile da internet).")
         else:
             break
     h = hash_password(p1)
@@ -139,19 +139,7 @@ def main(argv=None, base=AQUI):
               "Aprilo con il Blocco note, compila almeno la sezione smartthings (e netatmo), poi rilancia.")
         if not a.demo:
             return 0
-    avvisi_riordino = []
-    if not a.demo:
-        try:
-            rc, avvisi_riordino = riordina_cartelle(base, cfg)
-        except Exception as e:      # il riordino non deve mai impedire di partire per un imprevisto
-            rc, avvisi_riordino = 0, [f"Riordino cartelle saltato: {e}"]
-        if rc:
-            for r in avvisi_riordino:
-                print("ATTENZIONE:", r)
-            return 1
     imposta_log(base)
-    for r in avvisi_riordino:
-        log.info(r)
     if not a.demo:
         try:
             if cfg.completa():
@@ -221,6 +209,7 @@ def main(argv=None, base=AQUI):
         else:
             avvia_telegram_e_sentinella(app)
             avvia_manutenzione(app)
+            esterni_assicura(app)
             app.avvia()
         try:
             srv, _ = avvia_web(app, a.host, a.porta)
@@ -237,6 +226,10 @@ def main(argv=None, base=AQUI):
                 log.info("Plugin trovati: %d", n_plugin)
         except Exception:
             log.exception("caricamento dei plugin fallito (il pannello parte lo stesso)")
+        try:
+            boost_riprendi(app)
+        except Exception:
+            log.exception("boost: ripresa dopo il riavvio")
         porta = srv.server_address[1]
         log.info("Interfaccia web attiva sulla porta %s", porta)
         print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))

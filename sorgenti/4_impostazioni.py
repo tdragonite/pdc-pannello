@@ -16,7 +16,8 @@ ETICHETTE_ALLARME = {
     "minuti": ("Per quanti minuti di fila", "int", 1, 1440),
     "sotto_gradi": ("Avvisa sotto (°C)", "float", -30, 90),
     "sotto_lmin": ("Avvisa sotto (L/min)", "float", 0, 60),
-    "scarto_gradi": ("Scarto massimo dalla curva (°C)", "float", 1, 40),
+    "scarto_sopra_gradi": ("Scarto sopra la curva (°C)", "float", 1, 40),
+    "scarto_gradi": ("Scarto sotto la curva (°C)", "float", 1, 40),
     "durata_minima_min": ("Un ciclo è 'breve' se dura meno di (minuti)", "int", 1, 120),
     "quanti": ("Quanti eventi fanno scattare l'avviso", "int", 1, 100),
     "ore": ("Periodo controllato (ore)", "float", 0.5, 48),
@@ -33,7 +34,7 @@ DESCRIZIONI_ALLARME = {
     "umidita_molto_alta": "L'umidità in casa è molto alta (rosso nella Dashboard).",
     "cicli_brevi": "La pompa parte e si ferma troppo spesso.",
     "portata_bassa": "Poca acqua nel circuito (filtro, aria, valvole).",
-    "mandata_lontana": "La mandata è lontana da quella prevista dalla curva climatica.",
+    "mandata_lontana": "La mandata è lontana da quella prevista dalla curva climatica, con una soglia per sopra e una per sotto.",
     "acs_bassa": "L'acqua calda sanitaria è troppo fredda.",
     "cop_basso": "L'efficienza stimata (COP) è bassa.",
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
@@ -92,8 +93,8 @@ def schema_impostazioni():
             _c("telegram.messaggi.ripristino", "lungo", "Tutto risolto"),
             _c("telegram.messaggi.promemoria", "lungo", "Promemoria"),
             _c("telegram.messaggi.riepilogo", "lungo", "Riepilogo del mattino"),
-            _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {esterna} {ora}."),
-            _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {durata} {consumo}."),
+            _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {impianto} {esterna} {ora}."),
+            _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {impianto} {durata} {consumo}."),
         ]},
         {"id": "collegamenti", "titolo": "SmartThings (pompa di calore)", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
          "campi": [
@@ -231,6 +232,8 @@ def stato_stazione(app):
     i = stazione_info(app)
     if i is None:
         return ""
+    if i["umidita"] is None and i["ts"] and not i["errore"]:
+        return "La stazione non manda dati nuovi dalle " + datetime.fromtimestamp(i["ts"]).strftime("%H:%M")
     if i["umidita"] is None:
         return "In attesa del primo dato…" if not i["errore"] else "Non riesco a leggere la stazione: " + i["errore"]
     quando = datetime.fromtimestamp(i["ts"]).strftime("%H:%M") if i["ts"] else "?"
@@ -396,8 +399,8 @@ def cambia_password(app, corpo, h):
         time.sleep(1.0)
         return {"ok": False, "messaggio": "La password attuale non è corretta."}
     nuova = str(corpo.get("nuova", ""))
-    if len(nuova) < 10:
-        return {"ok": False, "messaggio": "La nuova password deve avere almeno 10 caratteri."}
+    if len(nuova) < PASSWORD_MIN:
+        return {"ok": False, "messaggio": f"La nuova password deve avere almeno {PASSWORD_MIN} caratteri."}
     nuovo_hash = hash_password(nuova)
     utente = str(corpo.get("utente", "")).strip() or acc.get("utente")
     app.cfg.aggiorna(lambda raw: raw.setdefault("accesso", {}).update(password_hash=nuovo_hash, utente=utente, password=""))
@@ -459,8 +462,7 @@ def api_registro(app, q):
             return 0
     dbp = str(app.db.path)
     cfg_b = app.cfg.leggi().get("backup") or {}
-    cart = Path(cfg_b.get("cartella") or "dati/backup")
-    cart = cart if cart.is_absolute() else base / cart
+    cart = cartella_backup(app)
     copie = sorted(cart.glob("pdc-*.db")) if cart.is_dir() else []
     return {
         "righe": leggi_coda_log(base / "log" / "pdc_pannello.log", n),
@@ -487,8 +489,7 @@ def reset_database(app, corpo, h):
         app.limite.fallito(ip)
         time.sleep(1.0)
         return {"ok": False, "messaggio": "La password non è corretta: non ho cancellato niente."}
-    cart = Path((app.cfg.leggi().get("backup") or {}).get("cartella") or "dati/backup")
-    cart = cart if cart.is_absolute() else app.base / cart
+    cart = cartella_backup(app)
     copia = cart / f"prima-del-reset-{time.strftime('%Y%m%d-%H%M%S')}.db"
     try:
         cart.mkdir(parents=True, exist_ok=True)
@@ -501,9 +502,9 @@ def reset_database(app, corpo, h):
         log.error("Reset database annullato: copia non riuscita (%s)", e)
         return {"ok": False, "messaggio": f"Non sono riuscito a fare la copia di sicurezza ({e}): non ho cancellato niente."}
     with app.db.lock, closing(app.db._c()) as c, c:
-        for tab in ("misure", "stati", "ultimo", "ciclo", "eventi"):
+        for tab in ("misure", "stati", "ultimo", "ciclo", "eventi", "finestre"):
             c.execute(f"DELETE FROM {tab}")
-        c.execute("DELETE FROM meta WHERE k IN ('ciclo_ultimo_ts', 'tg_notificati')")
+        c.execute("DELETE FROM meta WHERE k IN ('ciclo_ultimo_ts', 'tg_notificati', 'fin_soglie')")
     try:
         vacuum(app.db)
     except Exception:

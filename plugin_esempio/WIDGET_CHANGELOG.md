@@ -1,5 +1,8 @@
 # Plugin Widget iPhone — changelog
 
+## Script Scriptable (senza cambio di versione del plugin) — 4 novembre 2026
+- Toccando la riga in basso a destra (l'ora di aggiornamento) parte il Comando rapido **Aggiorna widget** (costante `COMANDO_AGGIORNA`: nell'app Comandi, azione Scriptable «Refresh All Widgets» + «Vai alla schermata Home»); il resto del widget continua ad aprire il pannello. iOS decide da solo quando aggiornare davvero (la richiesta dello script è ogni 15 minuti).
+
 ## 1.1.0 — 4 novembre 2026
 - **Token del widget** (campo nuovo in Impostazioni → Integrazioni): se è impostato, chi non manda l'intestazione `X-Widget-Token` riceve lo stesso 404 di un indirizzo sbagliato, quindi aprire l'indirizzo da un browser non mostra niente. Campo vuoto = controllo spento, come nella 1.0.
 - Lo script di Scriptable ha la costante `TOKEN` (si ricorda nel Portachiavi, come l'indirizzo) e manda l'intestazione.

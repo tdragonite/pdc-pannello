@@ -3,12 +3,12 @@
 """
 Pannello locale per pompa di calore Samsung EHS (SmartThings) + Smarther (Netatmo).
 
-PEZZI FATTI: 1 nucleo, 2 web con Dashboard, 3 Analisi ed Efficienza, 4 Telegram, 5 Impostazioni modificabili, 6 tunnel Cloudflare, 7 storico compatto e README:
+Cosa fa:
+  - legge a intervalli SmartThings (pompa) e Netatmo (Smarther) e salva tutto in SQLite (dati/pdc.db)
+  - decodifica i dati "ehsCycleData" (mandata, ritorno, esterna, portata, Hz, pompa)
+  - serve il pannello web (Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni, Changelog)
+  - avvisi Telegram, tunnel Cloudflare, plugin (Alexa, widget), backup e compattazione notturni
   - configurazione in config.json (stesso file di pdc_strumenti.py)
-  - lettura periodica di SmartThings (pdc) e Netatmo (Smarther)
-  - decodifica dei dati "ehsCycleData" (mandata, ritorno, esterna, portata, Hz, pompa)
-  - database SQLite nella stessa cartella dello script
-  - gestione errori/anomalie con eventi (a cui Telegram si agganciera' nel pezzo 4)
 
 Solo libreria standard di Python (3.9 o piu' recente). Tutto vive nella cartella dello script.
 
@@ -24,7 +24,8 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.21.1"
+VERSIONE = "0.25.1"
+PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
 import base64
@@ -102,7 +103,7 @@ _OUTDOOR = {
 MAPPA_CICLO_DEFAULT = {
     "_nota": "valore = (byte + offset) * scala. Fonte: guida di decodifica Dwellsee. Per disattivare "
              "un campo metti \"attivo\": false. Dopo ogni modifica: python pdc_pannello.py ridecodifica",
-    "outdoor_28": dict(_OUTDOOR, aspirazione=_t(7)),
+    "outdoor_28": dict(_OUTDOOR, aspirazione=_t(7), scarico=_t(4, -20, 150)),     # su questa pdc lo scarico e' nel byte 4 (il 5 e' sempre 255)
     "outdoor_18": dict(_OUTDOOR),
     "indoor_31": {
         "ritorno": _t(2),
@@ -323,6 +324,13 @@ def unisci(base, extra):
     return out
 
 
+# Testi predefiniti che una versione ha cambiato: (percorso nel config.json, testo della versione precedente). Vedi Config.completa().
+TESTI_PREDEFINITI_VECCHI = [
+    (("telegram", "messaggi", "sbrinamento_inizio"), "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}."),
+    (("telegram", "messaggi", "sbrinamento_fine"), "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}."),
+]
+
+
 class Config:
     def __init__(self, path):
         self.path = Path(path)
@@ -357,9 +365,23 @@ class Config:
                 elif isinstance(v, dict) and isinstance(raw[k], dict):
                     mod = rec(raw[k], v) or mod
             return mod
+        def rinnova(raw):
+            """Un testo predefinito cambiato in una versione nuova: si aggiorna SOLO se nel file c'e' ancora identico quello vecchio
+            (se l'hai personalizzato non si tocca)."""
+            mod = False
+            for percorso, vecchio in TESTI_PREDEFINITI_VECCHI:
+                dove, nuovo = raw, TEMPLATE
+                for k in percorso[:-1]:
+                    dove, nuovo = dove.get(k) if isinstance(dove, dict) else None, nuovo.get(k) if isinstance(nuovo, dict) else None
+                if isinstance(dove, dict) and isinstance(nuovo, dict) and dove.get(percorso[-1]) == vecchio and nuovo.get(percorso[-1]) not in (None, vecchio):
+                    dove[percorso[-1]] = nuovo[percorso[-1]]
+                    mod = True
+            return mod
         with self.lock:
             raw = self._raw()
-            if rec(raw, TEMPLATE):
+            mod = rec(raw, TEMPLATE)
+            mod = rinnova(raw) or mod
+            if mod:
                 self._scrivi(raw)
                 return True
         return False
@@ -403,6 +425,8 @@ CREATE TABLE IF NOT EXISTS ciclo(tipo TEXT NOT NULL, ts INTEGER NOT NULL, hex TE
 CREATE TABLE IF NOT EXISTS eventi(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
     codice TEXT NOT NULL, livello TEXT NOT NULL, testo TEXT NOT NULL, chiuso_ts INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS finestre(da INTEGER PRIMARY KEY, a INTEGER NOT NULL, calo REAL, ah REAL,
+    stato TEXT NOT NULL, manuale INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sessioni(h TEXT PRIMARY KEY, scade INTEGER NOT NULL);
 """
 
@@ -415,6 +439,12 @@ class Rec:
         self.stati = {}    # serie -> testo
         self.ciclo = []    # (tipo, ts, hex)
         self.problemi = []  # problemi di decodifica
+
+    def agg_num(self, serie, ts, val, lento=False):
+        """Aggiunge un valore numerico (se lo e': i dati mancanti o strani si saltano)."""
+        val = _num(val)
+        if val is not None:
+            self.num.append((serie, ts, val, lento))
 
 
 class ErroreDB(ErroreConfig):
@@ -471,6 +501,10 @@ class DB:
     def ultimi(self):
         with closing(self._c()) as c:
             return c.execute("SELECT serie, ts, num, txt FROM ultimo ORDER BY serie").fetchall()
+
+    def ultimi_dict(self):
+        """{serie: (serie, ts, num, txt)}: l'ultimo valore di ogni serie."""
+        return {r[0]: r for r in self.ultimi()}
 
     def ridecodifica(self, mappa):
         with self.lock, closing(self._c()) as c, c:
@@ -560,20 +594,57 @@ class Eventi:
 # TOKEN
 # ==========================================================================
 
+def _ore_locali(lt, giorni=0, ore=0):
+    """Epoch dell'ora locale `ore` del giorno di `lt` (un time.struct_time locale), spostato di `giorni` giorni: con l'ora legale si
+    lascia fare a mktime (giorni=-1, ore=23 vale «ieri alle 23»)."""
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + giorni, ore, 0, 0, 0, 0, -1)))
+
+
 def _basic(cid, secret):
     return "Basic " + base64.b64encode(f"{cid}:{secret}".encode()).decode()
 
 
-class TokenST:
-    """Token SmartThings: OAuth (si rinnova da solo) oppure PAT (24 ore, incollato a mano)."""
+class _TokenOAuth:
+    """Parte comune dei token: un rinnovo OAuth con refresh token. Il refresh token e' MONOUSO: la risposta si salva SUBITO
+    in config.json, altrimenti se si perde bisogna rifare l'autorizzazione."""
 
-    def __init__(self, cfg, db):
-        self.cfg, self.db = cfg, db
+    def __init__(self, cfg):
+        self.cfg = cfg
         self.lock = threading.Lock()
         self.forza = False
 
     def invalida(self):
         self.forza = True
+
+    def _rinnova_oauth(self, nome, url, intestazioni, corpo, rifiuto, scadenza_def, percorso):
+        """POST al servizio, poi salva access/refresh token e scadenza nella sezione `percorso` di config.json."""
+        code, js = http_json("POST", url, intestazioni, corpo)
+        if code != 200 or "access_token" not in js:
+            e = classifica(nome, code, js)
+            if e.tipo in ("richiesta", "auth"):
+                raise ErroreAPI("auth", code, rifiuto)
+            raise e
+        scad = int(time.time()) + int(js.get("expires_in", scadenza_def))
+
+        def salva(raw):
+            o = raw
+            for k in percorso:
+                o = o.setdefault(k, {})
+            o["access_token"] = js["access_token"]
+            if js.get("refresh_token"):
+                o["refresh_token"] = js["refresh_token"]
+            o["expires_at"] = scad
+        self.cfg.aggiorna(salva)
+        self.forza = False
+        return js["access_token"]
+
+
+class TokenST(_TokenOAuth):
+    """Token SmartThings: OAuth (si rinnova da solo) oppure PAT (24 ore, incollato a mano)."""
+
+    def __init__(self, cfg, db):
+        super().__init__(cfg)
+        self.db = db
 
     def usa_pat(self):
         oa = self.cfg.leggi()["smartthings"]["oauth"]
@@ -603,41 +674,16 @@ class TokenST:
         return (time.time() - float(t)) / 3600 if t else None
 
     def _rinnova(self, oa):
-        code, js = http_json(
-            "POST", ST_BASE + "/oauth/token",
+        return self._rinnova_oauth(
+            "SmartThings", ST_BASE + "/oauth/token",
             {"Authorization": _basic(oa["client_id"], oa["client_secret"]),
              "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-            {"grant_type": "refresh_token", "client_id": oa["client_id"],
-             "refresh_token": oa["refresh_token"]})
-        if code != 200 or "access_token" not in js:
-            e = classifica("SmartThings", code, js)
-            if e.tipo in ("richiesta", "auth"):
-                raise ErroreAPI("auth", code, "SmartThings: il rinnovo del token OAuth e' stato rifiutato. "
-                                              "Il refresh token e' scaduto o gia' usato: rifai "
-                                              "'python pdc_strumenti.py st-oauth'.")
-            raise e
-        scad = int(time.time()) + int(js.get("expires_in", 86400))
-
-        def salva(raw):  # SUBITO: il refresh token e' monouso, se si perde si ricomincia
-            o = raw.setdefault("smartthings", {}).setdefault("oauth", {})
-            o["access_token"] = js["access_token"]
-            if js.get("refresh_token"):
-                o["refresh_token"] = js["refresh_token"]
-            o["expires_at"] = scad
-        self.cfg.aggiorna(salva)
-        self.forza = False
-        return js["access_token"]
+            {"grant_type": "refresh_token", "client_id": oa["client_id"], "refresh_token": oa["refresh_token"]},
+            "SmartThings: il rinnovo del token OAuth e' stato rifiutato. Il refresh token e' scaduto o gia' usato: "
+            "rifai 'python pdc_strumenti.py st-oauth'.", 86400, ("smartthings", "oauth"))
 
 
-class TokenNT:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.lock = threading.Lock()
-        self.forza = False
-
-    def invalida(self):
-        self.forza = True
-
+class TokenNT(_TokenOAuth):
     def get(self):
         with self.lock:
             n = self.cfg.leggi()["netatmo"]
@@ -647,28 +693,13 @@ class TokenNT:
             if (not self.forza and n.get("access_token")
                     and time.time() < float(n.get("expires_at") or 0) - 120):
                 return n["access_token"]
-            code, js = http_json(
-                "POST", NT_BASE + "/oauth2/token",
+            return self._rinnova_oauth(
+                "Netatmo", NT_BASE + "/oauth2/token",
                 {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
                 {"grant_type": "refresh_token", "refresh_token": n["refresh_token"],
-                 "client_id": n["client_id"], "client_secret": n["client_secret"]})
-            if code != 200 or "access_token" not in js:
-                e = classifica("Netatmo", code, js)
-                if e.tipo in ("richiesta", "auth"):
-                    raise ErroreAPI("auth", code, "Netatmo: il rinnovo del token e' stato rifiutato. Se hai "
-                                                  "rigenerato i token dal portale, copia in config.json quelli NUOVI.")
-                raise e
-            scad = int(time.time()) + int(js.get("expires_in", 10800))
-
-            def salva(raw):
-                o = raw.setdefault("netatmo", {})
-                o["access_token"] = js["access_token"]
-                if js.get("refresh_token"):
-                    o["refresh_token"] = js["refresh_token"]
-                o["expires_at"] = scad
-            self.cfg.aggiorna(salva)
-            self.forza = False
-            return js["access_token"]
+                 "client_id": n["client_id"], "client_secret": n["client_secret"]},
+                "Netatmo: il rinnovo del token e' stato rifiutato. Se hai rigenerato i token dal portale, "
+                "copia in config.json quelli NUOVI.", 10800, ("netatmo",))
 
 
 # ==========================================================================
@@ -691,9 +722,7 @@ def estrai_st(status, mappa, ts):
     rec = Rec()
 
     def n(serie, val, lento=False, t=None):
-        val = _num(val)
-        if val is not None:
-            rec.num.append((serie, t or ts, val, lento))
+        rec.agg_num(serie, t or ts, val, lento)
 
     def s(serie, val):
         if val is not None and val != "":
@@ -778,9 +807,7 @@ def estrai_netatmo(js, room_id, ts):
     modulo = next((m for m in moduli if m.get("type") == "BNS"), moduli[0] if moduli else None)
 
     def n(serie, val, lento=False):
-        val = _num(val)
-        if val is not None:
-            rec.num.append((serie, ts, val, lento))
+        rec.agg_num(serie, ts, val, lento)
 
     if stanza:
         n("casa.temperatura", stanza.get("therm_measured_temperature"))
@@ -1172,12 +1199,6 @@ class ServizioNT(Raccoglitore):
         return self.app.db.salva(rec, ts)
 
 
-def cartelle_loghi(base):
-    """Dove cercare i loghi: dati/loghi (nuova) e, per abitudine, anche la vecchia 'loghi' accanto allo script."""
-    base = Path(base)
-    return [base / "dati" / "loghi", base / "loghi"]
-
-
 def cartella_log(base):
     p = Path(base) / "log"
     try:
@@ -1185,124 +1206,6 @@ def cartella_log(base):
     except OSError:
         pass
     return p
-
-
-def _sposta(src, dst):
-    """Sposta un file o una cartella senza mai sovrascrivere nulla. Una cartella gia' presente nella destinazione
-    non si cancella: ci si aggiungono solo i file che mancano. -> True se qualcosa e' stato spostato."""
-    src, dst = Path(src), Path(dst)
-    if not src.exists():
-        return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_dir() and dst.is_dir():
-        fatto = False
-        for f in list(src.iterdir()):
-            if not (dst / f.name).exists():
-                os.replace(f, dst / f.name)
-                fatto = True
-        try:
-            src.rmdir()
-        except OSError:
-            pass
-        return fatto
-    if dst.exists():
-        return False
-    os.replace(src, dst)
-    return True
-
-
-def riordina_cartelle(base, cfg):
-    """Dalla vecchia disposizione (tutto accanto allo script) alle sottocartelle dati/, log/, cloudflared/.
-    Sposta e basta (stesso disco: un rinomina, non una copia), mai sovrascrive; il database si sposta con i suoi -wal/-shm
-    tutto insieme o per niente. Si fa solo con il pannello fermo.
-    -> (codice, righe): codice 0 = si puo' proseguire, altrimenti il programma deve fermarsi (con le righe da mostrare)."""
-    base = Path(base)
-    righe = []
-    try:
-        g = cfg.leggi()
-    except ErroreConfig:
-        return 0, []                       # il config rotto lo segnala chi lo usa dopo
-    gen, bk = g.get("generale", {}), g.get("backup") or {}
-    db_vecchio = str(gen.get("database", "")) == "pdc.db"
-    bk_vecchio = str(bk.get("cartella", "")) == "backup"
-    lavori = []                            # (descrizione, src, dst)
-    db_files = [(base / n, base / "dati" / n) for n in ("pdc.db", "pdc.db-wal", "pdc.db-shm")] if db_vecchio else []
-    if db_vecchio and (base / "pdc.db").exists() and (base / "dati" / "pdc.db").exists():
-        return 1, ["Trovo due database: pdc.db (vecchio) e dati/pdc.db (nuovo). Non decido io quale sia quello giusto.",
-                   "Tieni quello con i dati e sposta l'altro altrove (per esempio rinominandolo), poi rilancia."]
-    for s, d in db_files:
-        if s.exists():
-            lavori.append(("database", s, d))
-    if bk_vecchio and (base / "backup").exists():
-        lavori.append(("backup", base / "backup", base / "dati" / "backup"))
-    if (base / "loghi").is_dir():
-        lavori.append(("loghi", base / "loghi", base / "dati" / "loghi"))
-    for nome in ("pdc_pannello.log", "pdc_pannello.log.1", "pdc_pannello.log.2", "pdc_pannello.log.3"):
-        if (base / nome).exists() and not (base / "log" / nome).exists():
-            lavori.append(("log", base / nome, base / "log" / nome))
-    for f in sorted(base.glob("dump_*.json")):          # i file di diagnosi (strumenti e esporta-diagnostica) hanno una cartella a parte
-        if not (base / "diagnostica" / f.name).exists():
-            lavori.append(("diagnostica", f, base / "diagnostica" / f.name))
-    if (base / "dati" / "diagnostica.json").exists() and not (base / "diagnostica" / "diagnostica.json").exists():
-        lavori.append(("diagnostica", base / "dati" / "diagnostica.json", base / "diagnostica" / "diagnostica.json"))
-    if (base / "cloudflared.log").exists() and not (base / "log" / "cloudflared.log").exists():
-        lavori.append(("log", base / "cloudflared.log", base / "log" / "cloudflared.log"))
-    if (base / "cloudflared.pid").exists() and not (base / "cloudflared" / "cloudflared.pid").exists():
-        lavori.append(("tunnel", base / "cloudflared.pid", base / "cloudflared" / "cloudflared.pid"))
-    if not lavori and not db_vecchio and not bk_vecchio:
-        return 0, []
-    if lavori:
-        # sposto file che potrebbero essere in uso: serve la certezza che il pannello non sia acceso
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind(("127.0.0.1", int(gen.get("porta_lock", 7099))))
-        except OSError:
-            return 1, ["Un'altra copia del pannello e' accesa: prima di aggiornare le cartelle chiudila, poi rilancia."]
-        finally:
-            s.close()
-    fatti = []
-    try:
-        # il database va spostato intero, o per niente
-        for desc, s, d in lavori:
-            if desc != "database":
-                continue
-            d.parent.mkdir(parents=True, exist_ok=True)
-            if d.exists():
-                raise OSError(f"{d.name} esiste gia' in dati/")
-            os.replace(s, d)
-            fatti.append((s, d))
-    except OSError as e:
-        for s, d in reversed(fatti):
-            try:
-                os.replace(d, s)
-            except OSError:
-                pass
-        return 1, [f"Non riesco a spostare il database in dati/ ({e}). Non ho toccato nulla: e' aperto in un altro programma?"]
-    if fatti:
-        righe.append("database spostato in dati/")
-    for desc, s, d in lavori:
-        if desc == "database":
-            continue
-        try:
-            if _sposta(s, d):
-                righe.append(f"{s.name} -> {d.parent.relative_to(base)}/")
-        except OSError as e:
-            righe.append(f"{s.name} lasciato dov'era ({e})")
-    try:
-        def agg(raw):
-            if db_vecchio:
-                raw.setdefault("generale", {})["database"] = "dati/pdc.db"
-            if bk_vecchio and isinstance(raw.get("backup"), dict):
-                raw["backup"]["cartella"] = "dati/backup"
-        cfg.aggiorna(agg)
-    except (ErroreConfig, OSError) as e:
-        for s, d in reversed(fatti):
-            try:
-                os.replace(d, s)
-            except OSError:
-                pass
-        return 1, [f"Non riesco ad aggiornare config.json ({e}): ho rimesso il database dov'era."]
-    return 0, ([("Cartelle riordinate: " + "; ".join(righe))] if righe else [])
 
 
 class App:
@@ -1333,7 +1236,6 @@ class App:
         self.token_st = TokenST(self.cfg, self.db)
         self.token_nt = TokenNT(self.cfg)
         self.servizi = [] if demo else [ServizioST(self), ServizioNT(self)]
-        self._lock_sock = None
 
     def intervallo_pdc(self):
         if self.demo:

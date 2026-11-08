@@ -61,11 +61,16 @@ def compatta_storico(db, giorni, minuti, ora=None, elimina_blob=True, blocco_gio
     return {"prima": prima, "tolti": dopo_cancellati, "blob": blob, "limite": limite}
 
 
+def cartella_backup(app):
+    """La cartella dei backup (config backup.cartella, di solito dati/backup), come percorso assoluto."""
+    cart = Path((app.cfg.leggi().get("backup") or BACKUP_DEFAULT).get("cartella") or "dati/backup")
+    return cart if cart.is_absolute() else app.base / cart
+
+
 def fai_backup(app):
     """Copia coerente del database (anche mentre il pannello lavora) + config.json. -> (cartella, [file creati])."""
     c = app.cfg.leggi().get("backup") or BACKUP_DEFAULT
-    cart = Path(c.get("cartella") or "dati/backup")
-    cart = cart if cart.is_absolute() else app.base / cart
+    cart = cartella_backup(app)
     cart.mkdir(parents=True, exist_ok=True)
     giorno = time.strftime("%Y-%m-%d")
     creati = []
@@ -181,9 +186,7 @@ def cmd_ripristina(app, leggi=input):
         print("Il pannello e' acceso (o c'e' un'altra copia in esecuzione): fermalo, poi rilancia questo comando.")
         return 1
     try:
-        c = app.cfg.leggi().get("backup") or BACKUP_DEFAULT
-        cart = Path(c.get("cartella") or "dati/backup")
-        cart = cart if cart.is_absolute() else app.base / cart
+        cart = cartella_backup(app)
         copie = (sorted(list(cart.glob("pdc-*.db")) + list(cart.glob("prima-del-reset-*.db")),
                         key=lambda f: f.stat().st_mtime, reverse=True) if cart.is_dir() else [])
         if not copie:

@@ -48,6 +48,11 @@ def _impronte_correnti():
 PARTI_CARICATE = _impronte_correnti()    # com'era il file quando e' partito il pannello
 
 
+def _parti_cambiate(parti):
+    """Nomi delle parti del file su disco diverse da quelle caricate all'avvio."""
+    return [n for n, (s, _) in parti.items() if _impronta(n, s) != PARTI_CARICATE.get(n)]
+
+
 def stato_aggiornamento():
     """{'stato': aggiornato|applicabile|riavvio|errore, 'parti': [...], 'versione_disco', 'versione'}"""
     out = {"versione": VERSIONE, "versione_disco": VERSIONE, "parti": [], "stato": "aggiornato"}
@@ -59,7 +64,7 @@ def stato_aggiornamento():
     out["versione_disco"] = m.group(1) if m else VERSIONE
     if not PARTI_CARICATE or "nucleo" not in parti:
         return dict(out, stato="riavvio", parti=[], messaggio="Non riesco a confrontare il file con quello in uso: riavvia il pannello.")
-    cambiate = [n for n, (s, _) in parti.items() if _impronta(n, s) != PARTI_CARICATE.get(n)]
+    cambiate = _parti_cambiate(parti)
     out["parti"] = [{"nome": n, "titolo": NOMI_PARTI.get(n, n), "a_caldo": n in RICARICABILI} for n in cambiate]
     if any(n not in RICARICABILI for n in cambiate):
         out["stato"] = "riavvio"
@@ -80,7 +85,7 @@ def applica_aggiornamento(app):
             return {"ok": False, "messaggio": f"Non riesco a leggere il file del pannello ({e})."}
         if not PARTI_CARICATE or "nucleo" not in parti:
             return {"ok": False, "messaggio": "Non riesco a confrontare il file con quello in uso: serve il riavvio completo."}
-        cambiate = [n for n, (s, _) in parti.items() if _impronta(n, s) != PARTI_CARICATE.get(n)]
+        cambiate = _parti_cambiate(parti)
         fissi = [n for n in cambiate if n not in RICARICABILI]
         if fissi:
             return {"ok": False, "riavvio": True, "messaggio": "Per questa versione serve il riavvio completo (cambiato: "
@@ -114,7 +119,7 @@ def applica_aggiornamento(app):
             return {"ok": False, "messaggio": f"Il codice nuovo si e' fermato per un errore ({type(e).__name__}: {e}). "
                     "Ho rimesso quello di prima."}
         # l'impronta delle pagine (la stessa formula della parte web) dipende anche dal numero di versione
-        g["BUILD"] = hashlib.sha256((g["VERSIONE"] + "".join(g["WEB_ASSETS"][k] for k in sorted(g["WEB_ASSETS"]))).encode("utf-8")).hexdigest()[:8]
+        g["BUILD"] = g["_calcola_build"](g["VERSIONE"], g["WEB_ASSETS"])
         for n in cambiate:
             PARTI_CARICATE[n] = _impronta(n, parti[n][0])
         if "plugin" in cambiate and "plugin_ricarica" in g:      # il caricatore e' nuovo: rilegge la cartella plugin

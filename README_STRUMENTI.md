@@ -1,6 +1,6 @@
 # Strumenti di appoggio (pdc_strumenti.py)
 
-Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`) vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6), **provare a leggere una stazione meteo vicina** (`meteo-prova`, capitolo 8) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
+Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`), vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6), capire perché la **ripartenza prevista** c'è o non c'è (`rip-diag`, capitolo 7), **provare a leggere una stazione meteo vicina** (`meteo-prova`, capitolo 8), **raccogliere tutti i dati in un solo file per l'analisi** (`analisi`, capitolo 9) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
 
 Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
 
@@ -36,7 +36,7 @@ Serve a sapere **esattamente come si chiamano** i valori della tua pdc (mandata,
    - `dump_smartthings_device.json`
 4. **Allegali a chi ti aiuta.** Sono già ripuliti dai dati personali (id del proprietario e del luogo).
 
-Il token personale (PAT) dura 24 ore, ma per il dump basta.
+Il token personale (PAT) dura 24 ore, ma per il dump basta. Se usi già OAuth (capitolo 2) non serve il PAT: lo script usa i token di `config.json` e li rinnova da solo (con il pannello **fermo**, perché il refresh token è monouso).
 
 ---
 
@@ -88,8 +88,6 @@ Se tutto va bene scrive i token in `config.json` e hai finito.
 
 ## 4. Cosa mandare a chi ti aiuta
 
-| File | Obbligatorio |
-|---|---|
 Tutti i file stanno nella cartella `diagnostica` accanto allo script.
 
 | File | Quando |
@@ -97,6 +95,9 @@ Tutti i file stanno nella cartella `diagnostica` accanto allo script.
 | `dump_smartthings_status.json` e `dump_smartthings_device.json` | per capire cosa espone la pompa |
 | `dump_netatmo_homesdata.json` e `dump_netatmo_homestatus_1.json` | per lo Smarther |
 | `diagnostica.json` (lo crea il pannello con `python pdc_pannello.py esporta-diagnostica`) | per problemi sui dati o sull'indicatore |
+| `analisi_AAAAMMGG_HHMM.json` | per far analizzare le impostazioni e i cicli (`analisi`, capitolo 9) |
+| `rip_diag.json` · `sbrinamenti.json` | con `--salva`, per la ripartenza prevista / gli sbrinamenti |
+| `webhook_eventi.json` · `meteo_prova.json` | dopo `nt-webhook-prova` / `meteo-prova` |
 | `prova_refresh.json` | dopo `st-prova-refresh` |
 | `config.json` | **MAI** |
 
@@ -163,6 +164,8 @@ python pdc_strumenti.py rip-diag --salva         scrive anche diagnostica/rip_di
 
 Legge `dati/pdc.db` (come `sbrinamenti`, anche a pannello acceso; serve `pdc_pannello.py` nella stessa cartella) e usa le stesse funzioni del pannello. Stampa i dati dello Smarther che ci sono nel database, poi le pause del riscaldamento trovate nello storico, una per riga: «OK» con la velocita' di discesa della temperatura (`k`) oppure «scartata» con il motivo (pausa troppo corta, la temperatura non scende, la pausa non e' finita, buchi nei dati). Servono almeno 5 pause valide per una stima. Con `--salva` scrive il rapporto in `diagnostica/rip_diag.json`: mandalo a chi ti aiuta.
 
+L'«orario di adesso» che stampa in fondo è la stima **grezza**; dalla 0.21.3 l'orario mostrato nel pannello è la stessa stima resa stabile (cambia solo se si sposta di oltre una soglia), perché il sensore dello Smarther va a passi di 0,1 °C e con una casa inerte un passo vale anche mezz'ora.
+
 ## 8. Stazione meteo vicina (meteo-prova, novembre 2026)
 
 Prova a leggere umidità (e temperatura) da una pagina **WeatherLink** pubblica di una stazione meteo vicina, senza chiavi. Serve per capire se i dati della pagina sono leggibili da un programma, prima di aggiungere l'«umidità esterna» al pannello.
@@ -172,6 +175,21 @@ python pdc_strumenti.py meteo-prova "https://www.weatherlink.com/embeddablePage/
 ```
 
 Non usa `config.json` e non tocca il pannello. Fa tre cose: legge la pagina (titolo e script), cerca al suo interno gli indirizzi da cui prende i dati, poi prova gli indirizzi trovati (compreso quello classico `.../embeddablePage/getData/<codice>`). Se uno risponde con un JSON, stampa i campi che sembrano temperatura, umidità e orario. Se trova i dati, stampa in fondo l'**indirizzo dei dati** (quello grezzo, non quello della pagina) con l'ora dell'ultimo dato ricevuto dalla stazione: è quello da incollare nelle impostazioni del pannello; se la stazione cambia, rilancia il comando e incolla il nuovo. Alla fine scrive `diagnostica/meteo_prova.json`: mandalo a chi ti aiuta (non contiene password né token, solo dati pubblici della stazione).
+
+## 9. Analisi completa (analisi, dalla 0.21.3)
+
+Un solo file con tutto quello che il database sa, da mandare a Claude per farlo analizzare. Legge il database in sola lettura (il pannello puo' restare acceso) e non contiene token, password, indirizzi o identificativi.
+
+```
+python pdc_strumenti.py analisi                      ultimi 45 giorni, 1 giorno di misure grezze
+python pdc_strumenti.py analisi --giorni 14          meno storico (file piu' piccolo)
+python pdc_strumenti.py analisi --grezzi 3           3 giorni di misure non mediate
+```
+
+Crea `diagnostica/analisi_AAAAMMGG_HHMM.json`. Dentro: impostazioni (FSV, dispositivi), qualita' dei dati e buchi, riepilogo per giorno, giornata tipica per ora, ogni ciclo dello Smarther (durata, quanto la casa sale oltre il target, isteresi vera), ogni avvio del compressore, profilo della PdC per temperatura esterna, curva climatica contro mandata misurata, efficienza, bollitore, sbrinamenti, ripartenza prevista, cambi di stato, allarmi, e tutte le serie mediate nel tempo (5 minuti gli ultimi 14 giorni, 30 minuti prima).
+
+Come si usa: lancialo da PowerShell nella cartella del pannello (anche con il pannello acceso), poi allega in chat il file nuovo di `diagnostica`. Se il file è troppo grande per la chat: `--giorni 14`. Il valore dell'isteresi impostato nello Smarther **non** c'è nel database: scrivilo tu insieme al file. Serve `pdc_pannello.py` nella stessa cartella (per i calcoli di efficienza, sbrinamenti e ripartenza; senza, le altre sezioni ci sono lo stesso).
+
 
 ## Esperimento: il comando "refresh" anticipa i dati del ciclo?
 

@@ -7,12 +7,15 @@ Fa queste cose, tutte con la sola libreria standard di Python:
 
   st-devices   elenca i dispositivi SmartThings e trova la pompa di calore
   st-oauth     procedura guidata per ottenere un token OAuth (con rinnovo automatico)
+  st-osserva   guarda la pdc per N minuti e annota cosa cambia (per scoprire Boost/programmi; solo lettura)
   st-dump      salva lo stato COMPLETO della pdc in file JSON (da mandare a Claude)
+  st-capacita  salva i comandi che SmartThings espone per la pdc (da mandare a Claude; non cambia nulla)
   nt-dump      salva i dati dello Smarther letti dalle API Netatmo (idem)
   st-prova-refresh  esperimento: il comando 'refresh' anticipa i dati del ciclo? (pannello fermo)
   rip-diag     diagnostica della «ripartenza prevista» dello Smarther: perche' c'e' o non c'e', quali pause usa
   nt-webhook-prova  prova i webhook Netatmo: registra un indirizzo temporaneo, ascolta gli eventi dello Smarther e li confronta con homestatus (pannello anche acceso)
   sbrinamenti  elenca gli sbrinamenti trovati nel database, uno per uno, con i cambi di stato grezzi (per controllare il conteggio)
+  analisi      UN file con tutti i dati (impostazioni, cicli, sbrinamenti, serie nel tempo) per farli analizzare a Claude
   meteo-prova  prova a leggere umidita' e temperatura da una pagina WeatherLink "embeddable" (stazione meteo vicina), senza chiavi
 
 Usa un unico config.json nella stessa cartella dello script (lo stesso che
@@ -23,6 +26,7 @@ Esempi:
     python pdc_strumenti.py st-dump
     python pdc_strumenti.py nt-dump
     python pdc_strumenti.py rip-diag
+    python pdc_strumenti.py analisi
     python pdc_strumenti.py nt-webhook-prova --minuti 30
     python pdc_strumenti.py nt-webhook-prova --metodo nuovo --minuti 15
     python pdc_strumenti.py sbrinamenti --giorni 28
@@ -264,6 +268,89 @@ def cmd_st_dump(cfg, args):
         say(f"  componente '{comp}': {len(caps)} capability, {n} valori")
     say("\nFatto. Allega a Claude questi due file (NON config.json):")
     say("  dump_smartthings_status.json\n  dump_smartthings_device.json")
+
+
+def cmd_st_capacita(cfg, args):
+    """Chiede a SmartThings la definizione di ogni funzione della pdc (comandi e argomenti): serve a capire COME si
+    comandano cose come i programmi dell'acqua calda, il boost o gli FSV. Non cambia niente sulla pompa."""
+    device_id = args.device or cfg["smartthings"].get("device_id")
+    if not device_id:
+        _, ehs = find_ehs(cfg)
+        if len(ehs) != 1:
+            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
+        device_id = ehs[0]["deviceId"]
+    say(f"\nLeggo l'elenco delle funzioni del dispositivo {device_id} ...")
+    device = st_get(cfg, f"/devices/{device_id}")
+    trovate = {}
+    for comp in device.get("components", []):
+        for c in comp.get("capabilities", []):
+            trovate.setdefault((c.get("id"), c.get("version", 1)), []).append(comp.get("id"))
+    out = {}
+    for (cid, ver), comps in sorted(trovate.items()):
+        try:
+            d = st_get(cfg, f"/capabilities/{cid}/{ver}")
+        except SystemExit:
+            raise
+        except Exception as e:  # una funzione che non si lascia leggere non ferma le altre
+            out[cid] = {"componenti": comps, "errore": str(e)[:200]}
+            continue
+        out[cid] = {"versione": ver, "componenti": comps,
+                    "attributi": sorted((d.get("attributes") or {}).keys()),
+                    "comandi": {n: [{"nome": a.get("name"), "schema": a.get("schema")} for a in (c.get("arguments") or [])]
+                                for n, c in (d.get("commands") or {}).items()}}
+        say(f"  {cid}: {len(out[cid]['comandi'])} comandi")
+    say("")
+    write_dump("dump_smartthings_capacita.json", out)
+    say("\nFatto. Allega a Claude questo file (NON config.json):\n  dump_smartthings_capacita.json")
+
+
+def cmd_st_osserva(cfg, args):
+    """Guarda lo stato della pdc ogni pochi secondi e annota ogni attributo che CAMBIA, con l'ora: serve a scoprire
+    cosa succede quando da Dwellsee / app Samsung si preme Boost o si crea un programma. Legge soltanto."""
+    device_id = args.device or cfg["smartthings"].get("device_id")
+    if not device_id:
+        _, ehs = find_ehs(cfg)
+        if len(ehs) != 1:
+            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
+        device_id = ehs[0]["deviceId"]
+    rumore = () if args.tutto else ("samsungce.ehsCycleData", "powerConsumptionReport", "temperatureMeasurement")
+    fine = time.time() + args.minuti * 60
+    say(f"\nOsservo la pdc per {args.minuti} minuti (una lettura ogni {args.ogni} s). Ctrl+C per fermarmi prima.")
+    say("Adesso fai le prove (Boost, programma...) e SEGNATI l'ora di ogni cosa che premi.\n")
+    prima, cambi, errori = None, [], 0
+    try:
+        while time.time() < fine:
+            try:
+                st = st_get(cfg, f"/devices/{device_id}/status")
+                errori = 0
+            except SystemExit:
+                errori += 1
+                if errori >= 5:
+                    say("Troppi errori di fila, mi fermo e salvo quello che ho.")
+                    break
+                time.sleep(args.ogni)
+                continue
+            ora = _appiattisci(st)
+            adesso = datetime.now().strftime("%H:%M:%S")
+            if prima is None:
+                say(f"{adesso}  prima lettura: {len(ora)} attributi")
+                iniziale = {k: v[0] for k, v in ora.items()}
+            else:
+                for k, (val, ts) in ora.items():
+                    if any(r in k for r in rumore):
+                        continue
+                    vecchio = prima.get(k)
+                    if vecchio is None or vecchio[0] != val:
+                        cambi.append({"letto_alle": adesso, "attributo": k, "prima": vecchio[0] if vecchio else None,
+                                      "dopo": val, "ts_pompa": ts})
+                        say(f"{adesso}  {k}\n           {(vecchio[0] if vecchio else '-')[:120]}  ->  {val[:300]}")
+            prima = ora
+            time.sleep(args.ogni)
+    except KeyboardInterrupt:
+        say("\nFermato.")
+    say(f"\n{len(cambi)} cambi annotati.")
+    write_dump("dump_smartthings_osserva.json", {"device": device_id, "iniziale": locals().get("iniziale", {}), "cambi": cambi})
+    say("\nFatto. Allega a Claude questo file (NON config.json):\n  dump_smartthings_osserva.json")
 
 
 def _appiattisci(status):
@@ -1234,6 +1321,582 @@ def cmd_meteo_prova(cfg, args):
 
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Analisi completa: tutto quello che il database sa, in UN file (legge il database, non scrive niente nel pannello)
+# --------------------------------------------------------------------------
+
+ANALISI_VERSIONE = 2
+# Dati dell'impianto che NON vanno nel file (identificativi, nomi, posti): servono solo a riconoscere i dispositivi.
+ANALISI_ESCLUDI = ("info.pdc.id_ocf", "info.pdc.vid", "info.pdc.registrata", "info.pdc.nome", "info.pdc.descrizione",
+                   "info.nt.id", "info.nt.casa", "info.nt.nome", "info.nt.stanza")
+ANALISI_CONFIG_OK = {"intervallo_pdc_secondi", "intervallo_netatmo_secondi", "litri", "prezzo_kwh", "prezzo", "isteresi"}
+
+
+def _arr(x, n=3):
+    return None if x is None else round(x, n)
+
+
+def _stat(vals):
+    """Riassunto di una lista di numeri: quanti, minimo, percentili, massimo, media."""
+    vs = sorted(v for v in vals if v is not None)
+    n = len(vs)
+    if not n:
+        return None
+    q = lambda p: vs[min(n - 1, int(p * (n - 1) + 0.5))]            # noqa: E731
+    return {"n": n, "min": _arr(vs[0]), "p5": _arr(q(.05)), "p25": _arr(q(.25)), "mediana": _arr(q(.5)), "p75": _arr(q(.75)),
+            "p95": _arr(q(.95)), "max": _arr(vs[-1]), "media": _arr(sum(vs) / n)}
+
+
+def _giorno(ts):
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _ore(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _val_a(serie, ts, tempo_max=None):
+    """Valore (ts, v) di una serie ordinata [(ts, v)] nell'ultimo istante <= ts (None se piu' vecchio di tempo_max secondi)."""
+    import bisect
+    i = bisect.bisect_right(serie, (ts, float("inf"))) - 1
+    if i < 0:
+        return None
+    if tempo_max is not None and ts - serie[i][0] > tempo_max:
+        return None
+    return serie[i][1]
+
+
+def _fra(serie, t0, t1):
+    """I valori di una serie ordinata tra t0 e t1 (estremi compresi)."""
+    import bisect
+    i, j = bisect.bisect_left(serie, (t0, float("-inf"))), bisect.bisect_right(serie, (t1, float("inf")))
+    return [v for _, v in serie[i:j]]
+
+
+def _sezione(out, nome, fn):
+    """Una sezione che sbaglia non rovina le altre: l'errore finisce nel file e il resto va avanti."""
+    try:
+        out[nome] = fn()
+    except Exception as e:                                       # noqa: BLE001
+        out.setdefault("errori", {})[nome] = f"{type(e).__name__}: {e}"
+        say(f"   (sezione «{nome}» non riuscita: {e})")
+
+
+def _buchi(serie):
+    """Intervallo tipico fra due misure e i buchi nei dati (piu' di 5 volte l'intervallo tipico, minimo 10 minuti)."""
+    if len(serie) < 2:
+        return {"intervallo_s": None, "buchi": 0, "minuti_senza_dati": 0, "buchi_maggiori": []}
+    d = [b[0] - a[0] for a, b in zip(serie, serie[1:])]
+    med = sorted(d)[len(d) // 2]
+    lim = max(5 * med, 600)
+    br = [(b[0] - a[0], a[0]) for a, b in zip(serie, serie[1:]) if b[0] - a[0] > lim]
+    br.sort(reverse=True)
+    return {"intervallo_s": med, "buchi": len(br), "minuti_senza_dati": round(sum(x for x, _ in br) / 60),
+            "buchi_maggiori": [{"da": _ore(t), "minuti": round(x / 60)} for x, t in br[:10]]}
+
+
+def _segmenti_on(serie, soglia=0.5, vuoto_max=900):
+    """[(inizio, fine)] dei tratti in cui la serie e' >= soglia. Un buco nei dati piu' lungo di vuoto_max chiude il tratto."""
+    seg, ini, ult = [], None, None
+    for ts, v in serie:
+        if ini is not None and ts - ult > vuoto_max:
+            seg.append((ini, ult))
+            ini = None
+        if v >= soglia:
+            if ini is None:
+                ini = ts
+        elif ini is not None:
+            seg.append((ini, ts))
+            ini = None
+        ult = ts
+    if ini is not None:
+        seg.append((ini, ult))
+    return seg
+
+
+def _classe_esterna(t):
+    if t is None:
+        return "?"
+    for lim, nome in ((-5, "< -5"), (0, "-5 .. 0"), (5, "0 .. 5"), (10, "5 .. 10"), (15, "10 .. 15"), (20, "15 .. 20")):
+        if t < lim:
+            return nome + " °C"
+    return ">= 20 °C"
+
+
+CLASSI_ORDINE = ["< -5 °C", "-5 .. 0 °C", "0 .. 5 °C", "5 .. 10 °C", "10 .. 15 °C", "15 .. 20 °C", ">= 20 °C", "?"]
+
+
+def _cicli_smarther(S, ora):
+    """Ogni periodo di richiesta calore dello Smarther con quello che e' successo in casa: da qui si vede l'isteresi vera."""
+    ric, casa, est, setp = S.get("casa.richiesta_calore", []), S.get("casa.temperatura", []), S.get("ciclo.esterna", []), S.get("casa.setpoint", [])
+    seg = _segmenti_on(ric)
+    cicli = []
+    for k, (t0, t1) in enumerate(seg):
+        prossimo = seg[k + 1][0] if k + 1 < len(seg) else None
+        chiuso = t1 < (ric[-1][0] - 60) if ric else False
+        sp = _val_a(setp, t0, 7200)
+        c0, c1 = _val_a(casa, t0, 900), _val_a(casa, t1, 900)
+        finestra = _fra(casa, t1, min(t1 + 5400, prossimo if prossimo else t1 + 5400))
+        picco = max(finestra) if finestra else None
+        off_val = _fra(casa, t1, prossimo) if prossimo else []
+        minimo = min(off_val) if off_val else None
+        e = _fra(est, t0, prossimo or t1)
+        cicli.append({"inizio": _ore(t0), "ts": t0, "on_min": round((t1 - t0) / 60, 1),
+                      "off_min": round((prossimo - t1) / 60, 1) if prossimo else None,
+                      "setpoint": sp, "casa_inizio": c0, "casa_fine_on": c1, "casa_picco_dopo": picco, "casa_minimo_off": minimo,
+                      "sopra_setpoint": _arr(picco - sp, 2) if picco is not None and sp is not None else None,
+                      "sotto_setpoint_alla_partenza": _arr(c0 - sp, 2) if c0 is not None and sp is not None else None,
+                      "escursione": _arr(picco - minimo, 2) if picco is not None and minimo is not None else None,
+                      "esterna_media": _arr(sum(e) / len(e), 1) if e else None, "chiuso": bool(prossimo) or chiuso})
+    complet = [c for c in cicli if c["off_min"] is not None]
+    giorni = {}
+    for c in cicli:
+        giorni.setdefault(_giorno(c["ts"]), []).append(c)
+    classi = {}
+    for c in complet:
+        classi.setdefault(_classe_esterna(c["esterna_media"]), []).append(c)
+    riassunto = {
+        "n_periodi": len(cicli), "n_completi": len(complet),
+        "durata_on_min": _stat([c["on_min"] for c in complet]), "pausa_min": _stat([c["off_min"] for c in complet]),
+        "periodo_totale_min": _stat([c["on_min"] + c["off_min"] for c in complet]),
+        "sopra_setpoint_dopo_lo_spegnimento": _stat([c["sopra_setpoint"] for c in complet]),
+        "sotto_setpoint_alla_ripartenza": _stat([c["sotto_setpoint_alla_partenza"] for c in complet]),
+        "escursione_casa": _stat([c["escursione"] for c in complet]),
+        "per_giorno": {g: {"cicli": len(v), "on_min_totale": round(sum(c["on_min"] for c in v)), "on_min_mediano": _stat([c["on_min"] for c in v])["mediana"]}
+                       for g, v in sorted(giorni.items())},
+        "per_temperatura_esterna": {k: {"cicli": len(classi[k]), "on_min_mediano": _stat([c["on_min"] for c in classi[k]])["mediana"],
+                                        "pausa_min_mediana": _stat([c["off_min"] for c in classi[k]])["mediana"],
+                                        "sopra_setpoint_mediano": (_stat([c["sopra_setpoint"] for c in classi[k]]) or {}).get("mediana")}
+                                    for k in CLASSI_ORDINE if k in classi},
+    }
+    return {"nota": "Un 'periodo' = lo Smarther chiede calore (casa.richiesta_calore). sopra_setpoint = quanto la casa sale oltre il target dopo che lo "
+                    "Smarther smette (entro 90 min); sotto_setpoint_alla_partenza = quanto era scesa sotto il target quando ha richiesto di nuovo "
+                    "(e' l'isteresi che si vede davvero). Il sensore dello Smarther va a passi di 0,1 °C.",
+            "riassunto": riassunto, "cicli": cicli[-600:]}
+
+
+def _cicli_compressore(S, ora):
+    freq, est, man = S.get("ciclo.freq_compressore", []), S.get("ciclo.esterna", []), S.get("ciclo.mandata", [])
+    seg = _segmenti_on(freq, 1, 600)
+    cicli = []
+    for k, (t0, t1) in enumerate(seg):
+        prossimo = seg[k + 1][0] if k + 1 < len(seg) else None
+        f = _fra(freq, t0, t1)
+        e, m = _fra(est, t0, t1), _fra(man, t0, t1)
+        cicli.append({"inizio": _ore(t0), "ts": t0, "on_min": round((t1 - t0) / 60, 1),
+                      "off_min": round((prossimo - t1) / 60, 1) if prossimo else None,
+                      "freq_media": _arr(sum(f) / len(f), 1) if f else None, "freq_max": max(f) if f else None,
+                      "esterna_media": _arr(sum(e) / len(e), 1) if e else None, "mandata_media": _arr(sum(m) / len(m), 1) if m else None})
+    giorni = {}
+    for c in cicli:
+        giorni.setdefault(_giorno(c["ts"]), []).append(c)
+    completi = [c for c in cicli if c["off_min"] is not None]
+    return {"nota": "Un 'avvio' = il compressore passa da 0 Hz a piu' di 0. Molti avvii corti (sotto i 10 minuti) = la PdC fa 'short cycling'.",
+            "riassunto": {"avvii": len(cicli), "avvii_sotto_10_min": sum(1 for c in cicli if c["on_min"] < 10),
+                          "durata_on_min": _stat([c["on_min"] for c in completi]), "pausa_min": _stat([c["off_min"] for c in completi]),
+                          "per_giorno": {g: {"avvii": len(v), "on_min_totale": round(sum(c["on_min"] for c in v))} for g, v in sorted(giorni.items())}},
+            "cicli": cicli[-600:]}
+
+
+def _profilo_per_esterna(S, modo_a):
+    """Per ogni fascia di temperatura esterna: com'e' la PdC mentre scalda la casa (solo i campioni del compressore acceso)."""
+    freq, est, man, rit, por, pot, pom = (S.get(s, []) for s in ("ciclo.freq_compressore", "ciclo.esterna", "ciclo.mandata", "ciclo.ritorno",
+                                                                   "ciclo.portata", "pot.watt", "ciclo.vel_pompa"))
+    acc = {}
+    for ts, f in freq:
+        e = _val_a(est, ts, 300)
+        k = _classe_esterna(e)
+        d = acc.setdefault(k, {"tot": 0, "on": 0, "freq": [], "man": [], "rit": [], "dt": [], "por": [], "pot": [], "pom": [], "es": []})
+        d["tot"] += 1
+        if f > 0 and modo_a(ts) in (None, "casa"):
+            d["on"] += 1
+            d["freq"].append(f)
+            d["es"].append(e)
+            mm, rr = _val_a(man, ts, 300), _val_a(rit, ts, 300)
+            if mm is not None:
+                d["man"].append(mm)
+            if rr is not None:
+                d["rit"].append(rr)
+            if mm is not None and rr is not None:
+                d["dt"].append(mm - rr)
+            for lista, serie in ((d["por"], por), (d["pot"], pot), (d["pom"], pom)):
+                v = _val_a(serie, ts, 300)
+                if v is not None:
+                    lista.append(v)
+    out = {}
+    for k in CLASSI_ORDINE:
+        d = acc.get(k)
+        if not d:
+            continue
+        out[k] = {"campioni": d["tot"], "compressore_acceso_pct": round(100 * d["on"] / d["tot"], 1) if d["tot"] else None,
+                  "freq_hz": _stat(d["freq"]), "mandata": _stat(d["man"]), "ritorno": _stat(d["rit"]), "salto_mandata_ritorno": _stat(d["dt"]),
+                  "portata": _stat(d["por"]), "potenza_w": _stat(d["pot"]), "vel_pompa": _stat(d["pom"])}
+    return {"nota": "Solo i campioni a compressore acceso in riscaldamento casa (valvola 'room'), divisi per temperatura esterna.", "fasce": out}
+
+
+def _profilo_orario(S):
+    """Media per ora del giorno (0-23): com'e' una giornata tipica."""
+    out = {}
+    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("potenza_w", "pot.watt"),
+                        ("richiesta_calore_pct", "casa.richiesta_calore"), ("compressore_hz", "ciclo.freq_compressore"), ("mandata", "ciclo.mandata"),
+                        ("acqua_calda", "acs.temperatura")):
+        acc = {h: [] for h in range(24)}
+        for ts, v in S.get(serie, []):
+            acc[time.localtime(ts).tm_hour].append(100 * v if nome == "richiesta_calore_pct" else v)
+        out[nome] = [_arr(sum(acc[h]) / len(acc[h]), 2) if acc[h] else None for h in range(24)]
+    return {"nota": "Lista di 24 valori: ora 0, 1, ... 23 (ora locale).", **out}
+
+
+def _giornaliero(S, kwh_giorno):
+    giorni = {}
+    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("setpoint", "casa.setpoint"),
+                        ("mandata", "ciclo.mandata"), ("ritorno", "ciclo.ritorno"), ("acqua_calda", "acs.temperatura"), ("potenza_w", "pot.watt"),
+                        ("freq_hz", "ciclo.freq_compressore")):
+        for ts, v in S.get(serie, []):
+            giorni.setdefault(_giorno(ts), {}).setdefault(nome, []).append(v)
+    out = {}
+    for g in sorted(giorni):
+        d = {}
+        for nome, vals in giorni[g].items():
+            if nome == "freq_hz":
+                att = [v for v in vals if v > 0]
+                d["compressore_acceso_pct"] = round(100 * len(att) / len(vals), 1)
+                d["freq_media_acceso"] = _arr(sum(att) / len(att), 1) if att else None
+            else:
+                d[nome] = {"min": _arr(min(vals), 1), "media": _arr(sum(vals) / len(vals), 2), "max": _arr(max(vals), 1)}
+        d["energia_kwh_contatore"] = kwh_giorno.get(g)
+        d["campioni"] = sum(len(v) for v in giorni[g].values())
+        out[g] = d
+    return out
+
+
+def _griglia(S, t_fine, giorni, passo_fine=300, passo_lungo=1800, giorni_fine=14):
+    """Tutte le serie ridotte a medie: passo 5 min negli ultimi 14 giorni, 30 min prima (come liste di numeri, null = nessun dato)."""
+    out = {}
+    for serie, dati in S.items():
+        if not dati:
+            continue
+        pezzi = []
+        limite = t_fine - giorni_fine * 86400
+        for nome, passo, a, b in (("lungo", passo_lungo, t_fine - giorni * 86400, limite), ("fine", passo_fine, limite, t_fine)):
+            if b <= a:
+                continue
+            a0 = a - a % passo
+            n = (b - a0) // passo + 1
+            somma, cont = [0.0] * n, [0] * n
+            for ts, v in dati:
+                if a0 <= ts < a0 + n * passo:
+                    i = (ts - a0) // passo
+                    somma[i] += v
+                    cont[i] += 1
+            pezzi.append({"passo_s": passo, "da": a0, "da_testo": _ore(a0), "valori": [round(somma[i] / cont[i], 2) if cont[i] else None for i in range(n)]})
+        out[serie] = pezzi
+    return out
+
+
+def _grezzi(S, t_fine, giorni):
+    out = {}
+    da = t_fine - giorni * 86400
+    for serie, dati in S.items():
+        r = [(t, v) for t, v in dati if t >= da]
+        if r:
+            out[serie] = {"t0": r[0][0], "dt": [0] + [y[0] - x[0] for x, y in zip(r, r[1:])], "v": [round(v, 3) for _, v in r]}
+    return {"nota": "Misure vere, non mediate: t0 = istante della prima misura (secondi Unix); dt[i] = secondi trascorsi dalla misura precedente (dt[0] = 0); "
+                    "v[i] = valore. Il tempo della misura i e' t0 + somma(dt[0..i]).", "serie": out}
+
+
+def _finestre_ricircolo(testo, dal_ts, ora):
+    """[(inizio, fine)] delle finestre a ricircolo spento ('13:30-17:00,21:30-08:00'), giorno per giorno, da dal_ts a ora. Fine < inizio = passa la mezzanotte."""
+    fasce = []
+    for pezzo in str(testo).split(","):
+        a, b = pezzo.strip().split("-")
+        fasce.append(([int(x) for x in a.split(":")], [int(x) for x in b.split(":")]))
+    lt = time.localtime(dal_ts)
+    out = []
+    for k in range(-1, int((ora - dal_ts) // 86400) + 2):
+        for (h0, m0), (h1, m1) in fasce:
+            w0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + k, h0, m0, 0, 0, 0, -1)))
+            w1 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + k, h1, m1, 0, 0, 0, -1)))
+            if w1 <= w0:
+                w1 += 86400
+            if w1 > dal_ts and w0 < ora:                         # se il timer e' stato impostato a meta' finestra, si parte da li'
+                out.append((max(w0, dal_ts), w1))
+    return sorted(set(out))
+
+
+def _raffreddamento_acs(S, stati, ora, finestre_testo, dal_ts):
+    """Quanto scende la temperatura dell'acqua calda a ricircolo spento, finestra per finestra, e dopo quanto riparte la PdC."""
+    temp = S.get("acs.temperatura", [])
+    if len(temp) < 10:
+        return None
+    val = sorted((t, v) for sr, t, v in stati if sr == "pdc.valvola")
+    cicli, ini = [], None
+    for t, v in val:                                             # tratti in cui la valvola e' sul bollitore = ciclo acqua calda
+        if v == "tank" and ini is None:
+            ini = t
+        elif v != "tank" and ini is not None:
+            cicli.append((ini, t))
+            ini = None
+    if ini is not None:
+        cicli.append((ini, ora))
+    tts = [t for t, _ in temp]
+    import bisect
+
+    def t_at(t, tol=1800):
+        i = bisect.bisect_right(tts, t) - 1
+        return temp[i][1] if i >= 0 and t - tts[i] <= tol else None
+    righe = []
+    for w0, w1 in _finestre_ricircolo(finestre_testo, dal_ts, ora):
+        w1c = min(w1, ora)
+        g0 = w0
+        for i, f in cicli:                                       # se un ciclo acqua calda finisce dentro la finestra: i primi 20 minuti l'acqua si rimescola
+            if i <= w0 < f + 1200:
+                g0 = max(g0, f + 1200)
+        rip = next((i for i, f in cicli if g0 < i < w1c), None)  # prima ripartenza della PdC per l'acqua calda
+        g1 = rip if rip else w1c
+        riga = {"finestra": f"{_ore(w0)} -> {_ore(w1)}", "completa": w1 <= ora}
+        if g1 - g0 < 1800:
+            riga["nota"] = "troppo corta per misurare"
+            righe.append(riga)
+            continue
+        v0, v1 = t_at(g0), t_at(g1)
+        dentro = [(t, v) for t, v in temp if g0 <= t <= g1]
+        if v0 is None or v1 is None or not dentro:
+            riga["nota"] = "mancano i dati"
+            righe.append(riga)
+            continue
+        ore = (g1 - g0) / 3600
+        sale = max(v for _, v in dentro) - v0
+        salti = sum(1 for (ta, va), (tb, vb) in zip(dentro, dentro[1:]) if va - vb >= 1.5 and tb - ta <= 900)
+        riga.update({"da": _ore(g0), "a": _ore(g1), "ore_misurate": round(ore, 2), "temp_inizio": v0, "temp_fine": v1,
+                     "gradi_persi": round(v0 - v1, 1), "gradi_ora": round((v0 - v1) / ore, 2),
+                     "la_pdc_e_ripartita": bool(rip), "ore_prima_della_ripartenza": round((rip - w0) / 3600, 2) if rip else None,
+                     "prelievo_probabile": salti > 0 or sale > 0.5,
+                     "andamento_ogni_30_min": [[_ore(t)[-5:], t_at(t)] for t in range(g0, g1 + 1, 1800)]})
+        righe.append(riga)
+    buone = [r["gradi_ora"] for r in righe if "gradi_ora" in r and not r["prelievo_probabile"] and r["ore_misurate"] >= 1]
+    lunghe = [r["gradi_ora"] for r in righe if "gradi_ora" in r and not r["prelievo_probabile"] and r["ore_misurate"] >= 5]
+    return {"nota": "Finestre a ricircolo spento (timer Theben). Si misura dall'inizio della finestra fino a quando la PdC riparte per l'acqua calda (valvola sul bollitore) "
+                    "o fino alla fine della finestra. 'prelievo_probabile' = salita della temperatura o crolli improvvisi (acqua fredda che entra): in quel caso il valore non e' pulito.",
+            "finestre_usate": finestre_testo, "timer_attivo_dal": _ore(dal_ts),
+            "mediana_gradi_ora_finestre_pulite": _arr(_stat(buone)["mediana"], 2) if buone else None,
+            "mediana_gradi_ora_finestre_pulite_oltre_5_ore": _arr(_stat(lunghe)["mediana"], 2) if lunghe else None,
+            "finestre": righe}
+
+
+def cmd_analisi(cfg, args):
+    """Un solo file con tutto quello che il database sa: impostazioni, statistiche, cicli, sbrinamenti, serie nel tempo. Per l'analisi di Claude."""
+    import platform
+    sys.path.insert(0, str(HERE))
+    try:
+        import pdc_pannello as pp
+    except Exception:                                            # noqa: BLE001
+        pp = None
+        say("  (pdc_pannello.py non trovato accanto a questo script: salto le sezioni che usano i suoi calcoli)")
+    db_path = _trova_db(args.db)
+    db, tmp = _db_leggibile(db_path)
+    ora = int(time.time())
+    giorni = max(1, min(120, int(args.giorni)))
+    da = ora - giorni * 86400
+    say(f"Analisi completa - {datetime.fromtimestamp(ora):%d/%m/%Y %H:%M}")
+    say(f"Database: {db_path}  ({db_path.stat().st_size // (1024 * 1024)} MB), ultimi {giorni} giorni")
+
+    with db._c() as c:
+        nomi = [r[0] for r in c.execute("SELECT DISTINCT serie FROM misure").fetchall()]
+        S = {n: c.execute("SELECT ts, valore FROM misure WHERE serie=? AND ts BETWEEN ? AND ? ORDER BY ts", (n, da, ora)).fetchall() for n in nomi}
+        primo_ts = c.execute("SELECT MIN(ts) FROM misure").fetchone()[0]
+        ultimo = [r for r in c.execute("SELECT serie, ts, num, txt FROM ultimo ORDER BY serie").fetchall()]
+        stati = c.execute("SELECT serie, ts, valore FROM stati WHERE ts>=? ORDER BY serie, ts", (da - 86400,)).fetchall()
+        try:
+            eventi = c.execute("SELECT ts, codice, livello, testo, chiuso_ts FROM eventi WHERE ts>=? ORDER BY ts", (da,)).fetchall()
+        except Exception:                                        # noqa: BLE001
+            eventi = []
+        try:
+            ciclo_raw = c.execute("SELECT tipo, ts, hex FROM ciclo WHERE ts>=? ORDER BY ts", (ora - int(args.ciclo) * 86400,)).fetchall() if int(args.ciclo) > 0 else []
+        except Exception:                                        # noqa: BLE001
+            ciclo_raw = []
+    S = {k: v for k, v in S.items() if v}
+    if not S:
+        die("Nel database non ci sono misure in questo periodo.")
+    say(f"  {sum(len(v) for v in S.values())} misure in {len(S)} serie, dal {_ore(min(v[0][0] for v in S.values()))}")
+
+    out = {}
+    out["file"] = {"formato": "pdc-analisi", "versione_formato": ANALISI_VERSIONE, "creato": _ore(ora), "creato_ts": ora,
+                   "fuso_orario_utc_offset_ore": time.localtime(ora).tm_gmtoff / 3600, "periodo_giorni": giorni,
+                   "primo_dato_nel_database": _ore(primo_ts) if primo_ts else None,
+                   "versione_pannello": getattr(pp, "VERSIONE", None) if pp else None, "python": platform.python_version(),
+                   "come_leggerlo": "Tutte le ore sono locali (ore:minuti, giorno-mese-anno ISO). Temperature in °C, potenze in W, energia in kWh, "
+                                    "frequenza compressore in Hz, portata in l/min. 'ts' = secondi Unix. Il calore prodotto e il COP sono STIME "
+                                    "(portata x salto termico); l'energia elettrica viene dal contatore della PdC (a scatti). Nessun token, password, "
+                                    "indirizzo o identificativo e' incluso."}
+    mod = None
+    if pp is not None:
+        try:
+            mod = pp.calcola_modi(db, da, ora, max(150, 45), ora)["segmenti"]
+        except Exception as e:                                   # noqa: BLE001
+            out.setdefault("errori", {})["calcola_modi"] = str(e)
+    import bisect
+    ini_mod = [s[0] for s in mod] if mod else []
+
+    def modo_a(ts):
+        if not mod:
+            return "casa" if _val_a(S.get("ciclo.freq_compressore", []), ts, 600) else None
+        i = bisect.bisect_right(ini_mod, ts) - 1
+        return mod[i][2] if i >= 0 and mod[i][0] <= ts < mod[i][1] else None
+
+    # --- impostazioni e stato attuale
+    ult = {}
+    fsv = {}
+    for serie, ts, n, t in ultimo:
+        if serie in ANALISI_ESCLUDI:
+            continue
+        if serie.startswith("fsv."):
+            fsv[serie[4:]] = t if t is not None else n
+        else:
+            ult[serie] = {"ts": _ore(ts), "num": n, "txt": t}
+    out["impianto"] = {"nota": "FSV = parametri installatore della PdC (letti da SmartThings). info.* = dati del dispositivo.", "fsv": fsv, "ultimo_valore_per_serie": ult}
+
+    def configurazione():
+        try:
+            j = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return None
+        trovati = {}
+
+        def giu(o, p=""):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k in ANALISI_CONFIG_OK and not isinstance(v, (dict, list)):
+                        trovati[p + k] = v
+                    else:
+                        giu(v, p + k + ".")
+            elif isinstance(o, list):
+                pass
+        giu(j)
+        return trovati
+    _sezione(out, "configurazione_pannello", configurazione)
+
+    # --- qualita' dei dati
+    _sezione(out, "qualita_dati", lambda: {"nota": "Per ogni serie: quante misure, e i buchi (periodi senza dati piu' lunghi di 5 volte l'intervallo tipico, minimo 10 min).",
+                                           "serie": {n: {"misure": len(v), "prima": _ore(v[0][0]), "ultima": _ore(v[-1][0]), "statistiche": _stat([x for _, x in v]), **_buchi(v)}
+                                                     for n, v in sorted(S.items())}})
+    # --- giornaliero
+    en = S.get("en.totale_wh", [])
+    kwh_g = {}
+    for ts, v in en:
+        d = kwh_g.setdefault(_giorno(ts), [v, v])
+        d[0], d[1] = min(d[0], v), max(d[1], v)
+    kwh_giorno = {g: round((b - a) / 1000, 3) for g, (a, b) in kwh_g.items()}
+    _sezione(out, "giornaliero", lambda: {"nota": "Per ogni giorno locale: minimo/media/massimo delle misure principali, energia dal contatore, % di tempo con compressore acceso.",
+                                          "giorni": _giornaliero(S, kwh_giorno)})
+    _sezione(out, "profilo_orario", lambda: _profilo_orario(S))
+    _sezione(out, "smarther_cicli", lambda: _cicli_smarther(S, ora))
+    _sezione(out, "compressore_cicli", lambda: _cicli_compressore(S, ora))
+    _sezione(out, "profilo_per_temperatura_esterna", lambda: _profilo_per_esterna(S, modo_a))
+
+    def distribuzioni():
+        casa = [v for _, v in S.get("casa.temperatura", [])]
+        isto = {}
+        for v in casa:
+            k = f"{round(v, 1):.1f}"
+            isto[k] = isto.get(k, 0) + 1
+        fr = {}
+        for _, v in S.get("ciclo.freq_compressore", []):
+            k = int(v // 10 * 10)
+            fr[str(k)] = fr.get(str(k), 0) + 1
+        return {"temperatura_casa_campioni_per_valore": dict(sorted(isto.items())),
+                "setpoint_smarther_valori": sorted({v for _, v in S.get("casa.setpoint", [])}),
+                "freq_compressore_campioni_per_fascia_10hz": dict(sorted(fr.items(), key=lambda x: int(x[0])))}
+    _sezione(out, "distribuzioni", distribuzioni)
+
+    def curva():
+        t1, t2, m1, m2 = (float(fsv[c]) for c in ("2011", "2012", "2021", "2022"))
+        punti = []
+        valv = [(t, v) for sr, t, v in stati if sr == "pdc.valvola"]
+        valv_ts = [t for t, _ in valv]
+        for ts, m in S.get("ciclo.mandata", []):
+            e = _val_a(S.get("ciclo.esterna", []), ts, 300)
+            f = _val_a(S.get("ciclo.freq_compressore", []), ts, 300)
+            i = bisect.bisect_right(valv_ts, ts) - 1
+            if i < 0 or valv[i][1] != "room" or ts - valv[i][0] < 600:        # solo riscaldamento casa, non subito dopo l'acqua calda
+                continue
+            if e is not None and f and f > 0:
+                punti.append((e, m))
+        if pp is not None:
+            teor = [pp.mandata_calcolata((t1, m1, t2, m2), e) for e, _ in punti]
+        else:
+            teor = [m1 if e <= t1 else m2 if e >= t2 else m1 + (m2 - m1) * (e - t1) / (t2 - t1) for e, _ in punti]
+        diff = [m - t for (e, m), t in zip(punti, teor)]
+        return {"nota": "Mandata misurata (compressore acceso, valvola sul riscaldamento casa, da almeno 10 minuti) meno la mandata che la curva climatica prevede per quella temperatura esterna.",
+                "curva": {"esterna_bassa": t1, "mandata_bassa": m1, "esterna_alta": t2, "mandata_alta": m2},
+                "differenza_misurata_meno_curva": _stat(diff)}
+    _sezione(out, "curva_climatica", curva)
+
+    # --- parti calcolate dal pannello
+    if pp is not None:
+        tol = 150
+
+        def efficienza():
+            r = pp.calcola_efficienza(db, da, ora, tol, ora)
+            return json.loads(json.dumps(r, default=str))
+        _sezione(out, "efficienza_pannello", efficienza)
+        _sezione(out, "bollitore_pannello", lambda: pp.calcola_bollitore(db, da, ora, ora, 300))
+        _sezione(out, "raffreddamento_acs", lambda: _raffreddamento_acs(
+            S, stati, ora, args.ricircolo_off, int(time.mktime(time.strptime(args.ricircolo_dal, "%Y-%m-%d %H:%M")))))
+        _sezione(out, "sbrinamenti", lambda: json.loads(json.dumps(pp.elenco_sbrinamenti(db, da, ora, ora), default=str)))
+
+        def ripartenza():
+            num = lambda s: next((r[2] for r in ultimo if r[0] == s), None)         # noqa: E731
+            tsx = lambda s: next((r[1] for r in ultimo if r[0] == s), None)         # noqa: E731
+            diag = {}
+            eta = pp.stima_ripartenza(type("A", (), {"db": db})(), ora, num("casa.temperatura"), tsx("casa.temperatura"),
+                                      num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint"), diag=diag)
+            return json.loads(json.dumps({"stima": _ore(eta) if eta else None, "diag": diag}, default=str))
+        _sezione(out, "ripartenza_prevista", ripartenza)
+
+    # --- cambi di stato, eventi
+    def cambi():
+        per = {}
+        for serie, ts, v in stati:
+            if serie.startswith(("fsv.", "info.")):
+                continue
+            per.setdefault(serie, []).append([_ore(ts), v])
+        return {"nota": "Ogni cambio di stato (stati testuali: modo, valvola, sbrinamento, acceso/spento...). Le ultime 400 righe per serie.",
+                "serie": {k: v[-400:] for k, v in sorted(per.items())}}
+    _sezione(out, "cambi_di_stato", cambi)
+    _sezione(out, "eventi_e_allarmi", lambda: {"nota": "Allarmi/avvisi del pannello nel periodo (ultimi 300).",
+                                               "per_codice": {k: sum(1 for e in eventi if e[1] == k) for k in sorted({e[1] for e in eventi})},
+                                               "elenco": [{"quando": _ore(e[0]), "codice": e[1], "livello": e[2], "testo": e[3],
+                                                           "chiuso": _ore(e[4]) if e[4] else None} for e in eventi[-300:]]})
+    # --- serie nel tempo
+    _sezione(out, "serie_mediate", lambda: {"nota": "Medie a passo fisso. Ogni serie e' una lista di pezzi {passo_s, da, valori[]}: il valore i e' la media tra da+i*passo_s e da+(i+1)*passo_s.",
+                                             "serie": _griglia(S, ora, giorni)})
+    if int(args.grezzi) > 0:
+        _sezione(out, "misure_grezze", lambda: _grezzi(S, ora, int(args.grezzi)))
+    if ciclo_raw:
+        _sezione(out, "ciclo_grezzo", lambda: {
+            "nota": "I campioni grezzi del ciclo (SmartThings ehsCycleData), uno ogni 5 minuti per tipo: tipo 'outdoor' (28 byte) e 'indoor' (31 byte), "
+                    "ogni byte in esadecimale (2 caratteri). Servono per cercare byte non ancora decodificati (per esempio il target di mandata).",
+            "campioni": [{"tipo": t, "ts": ts, "ora": _ore(ts), "hex": h} for t, ts, h in ciclo_raw]})
+    out["sezioni"] = [k for k in out if k not in ("file", "errori")]
+
+    nome = f"analisi_{datetime.fromtimestamp(ora):%Y%m%d_%H%M}.json"
+    cart = HERE / "diagnostica"
+    cart.mkdir(exist_ok=True)
+    path = cart / nome
+    testo = json.dumps(sanitize(out), ensure_ascii=False, separators=(",", ":"), default=str)
+    path.write_text(testo, encoding="utf-8")
+    kb = path.stat().st_size // 1024 + 1
+    say(f"\nFatto. File salvato: diagnostica/{nome}  ({kb} KB)")
+    if out.get("errori"):
+        say("  Alcune sezioni non sono riuscite (l'errore e' scritto nel file): mandalo comunque.")
+    if kb > 8000:
+        say("  Il file e' grande: se la chat non lo accetta, rilancia con meno giorni, per esempio:  python pdc_strumenti.py analisi --giorni 14 --grezzi 0")
+    if tmp:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     for s in (sys.stdout, sys.stderr):
         try:
@@ -1244,6 +1907,13 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("st-devices", help="elenca i dispositivi SmartThings e trova la pdc")
     sub.add_parser("st-oauth", help="procedura guidata per il token OAuth")
+    d = sub.add_parser("st-capacita", help="salva i comandi che SmartThings espone per la pdc (non cambia nulla)")
+    d.add_argument("--device", help="id del dispositivo (se non e' in config.json)")
+    d = sub.add_parser("st-osserva", help="osserva i cambi di stato mentre premi Boost/programmi (solo lettura)")
+    d.add_argument("--device", help="id del dispositivo (se non e' in config.json)")
+    d.add_argument("--minuti", type=int, default=15, help="durata (default 15)")
+    d.add_argument("--ogni", type=int, default=10, help="secondi tra una lettura e l'altra (default 10)")
+    d.add_argument("--tutto", action="store_true", help="annota anche i dati che cambiano di continuo (ciclo, consumi, temperature)")
     d = sub.add_parser("st-dump", help="salva lo stato completo della pdc")
     d.add_argument("--device", help="device id (altrimenti da config.json o auto)")
     sub.add_parser("nt-dump", help="salva i dati Netatmo/Smarther")
@@ -1270,6 +1940,13 @@ def main():
     b.add_argument("--db", help="percorso del database (di solito lo trova da solo)")
     b.add_argument("--giorni", type=int, default=7, help="quanti giorni guardare (default 7)")
     b.add_argument("--salva", action="store_true", help="salva anche il rapporto in diagnostica/sbrinamenti.json")
+    an = sub.add_parser("analisi", help="UN file con tutti i dati per l'analisi (legge il database, pannello anche acceso)")
+    an.add_argument("--db", help="percorso del database (di solito lo trova da solo)")
+    an.add_argument("--giorni", type=int, default=45, help="quanti giorni di storico includere (default 45, massimo 120)")
+    an.add_argument("--ciclo", type=int, default=7, help="quanti giorni di campioni GREZZI del ciclo (byte del compressore) includere (default 7, 0 = nessuno)")
+    an.add_argument("--grezzi", type=int, default=1, help="quanti giorni di misure GREZZE (non mediate) includere, gli ultimi (default 1, 0 = nessuna)")
+    an.add_argument("--ricircolo-off", default="13:30-17:00,21:30-08:00", help="fasce a ricircolo SPENTO, tipo 13:30-17:00,21:30-08:00 (default quelle del timer attuale)")
+    an.add_argument("--ricircolo-dal", default="2026-11-05 14:30", help="da quando vale il timer attuale, 'AAAA-MM-GG HH:MM' (default 2026-11-05 14:30)")
     mp = sub.add_parser("meteo-prova", help="prova a leggere umidita' e temperatura da una pagina WeatherLink 'embeddable' (nessuna chiave, config.json non serve)")
     mp.add_argument("url", help="indirizzo della pagina, tipo https://www.weatherlink.com/embeddablePage/show/<codice>/summary")
     mp.add_argument("--salva", action="store_true", help="(sempre attivo, il rapporto va in diagnostica/meteo_prova.json)")
@@ -1277,8 +1954,8 @@ def main():
     if not args.cmd:
         ap.print_help()
         return
-    if args.cmd in ("rip-diag", "sbrinamenti", "meteo-prova"):        # non serve config.json e non ne crea
-        {"rip-diag": cmd_rip_diag, "sbrinamenti": cmd_sbrinamenti, "meteo-prova": cmd_meteo_prova}[args.cmd](None, args)
+    if args.cmd in ("rip-diag", "sbrinamenti", "meteo-prova", "analisi"):        # non serve config.json e non ne crea
+        {"rip-diag": cmd_rip_diag, "sbrinamenti": cmd_sbrinamenti, "meteo-prova": cmd_meteo_prova, "analisi": cmd_analisi}[args.cmd](None, args)
         return
     cfg = load_cfg()
     if args.cmd == "nt-webhook-prova" and args.elimina:
@@ -1292,7 +1969,7 @@ def main():
         say(f"webhook rimasti: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
         return
     {"st-devices": cmd_st_devices, "st-oauth": cmd_st_oauth,
-     "st-dump": cmd_st_dump, "nt-dump": cmd_nt_dump,
+     "st-dump": cmd_st_dump, "st-capacita": cmd_st_capacita, "st-osserva": cmd_st_osserva, "nt-dump": cmd_nt_dump,
      "st-prova-refresh": cmd_st_prova_refresh, "nt-webhook-prova": cmd_nt_webhook_prova}[args.cmd](cfg, args)
 
 
