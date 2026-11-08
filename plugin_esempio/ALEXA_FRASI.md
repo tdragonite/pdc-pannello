@@ -57,5 +57,5 @@ Frase che dici (il «Quando» della Routine) → azione Personalizzata `chiedi a
 | 10 | Accendi il termostato | accendi il termostato |
 | 11 | spegni il termostato | spegni il termostato |
 
-Con Alexa+ (prova del 04/11): la skill risponde bene ma Alexa+ a volte sceglie un'altra skill (riuscito al 5° tentativo); «apri centrale termica» non parte, «apri la skill centrale termica» si; il saluto «Benvenuto in <nome pubblico della skill>» lo dice Alexa. Frasi-variante da aggiungere: vedi PIANO.md.
+Con Alexa+ (prova del 04/11): la skill risponde bene ma Alexa+ a volte sceglie un'altra skill (riuscito al 5° tentativo); «apri centrale termica» non parte, «apri la skill centrale termica» si; il saluto «Benvenuto in <nome pubblico della skill>» lo dice Alexa. Frasi-variante da aggiungere: vedi docs/PIANO.md.
 
