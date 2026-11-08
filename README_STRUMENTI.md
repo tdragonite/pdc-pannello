@@ -1,6 +1,6 @@
 # Strumenti di appoggio (pdc_strumenti.py)
 
-Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`), vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6), capire perché la **ripartenza prevista** c'è o non c'è (`rip-diag`, capitolo 7), **provare a leggere una stazione meteo vicina** (`meteo-prova`, capitolo 8), **raccogliere tutti i dati in un solo file per l'analisi** (`analisi`, capitolo 9) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
+Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`), vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6), capire perché la **ripartenza prevista** c'è o non c'è (`rip-diag`, capitolo 7), **provare a leggere una stazione meteo vicina** (`meteo-prova`, capitolo 8), **raccogliere tutti i dati in un solo file per l'analisi** (`analisi`, capitolo 9), **vedere i comandi che la pompa espone** e **osservare cosa cambia mentre premi Boost o un programma** (`st-capacita` e `st-osserva`, capitolo 10) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in `README.md`.
 
 Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
 
@@ -96,6 +96,7 @@ Tutti i file stanno nella cartella `diagnostica` accanto allo script.
 | `dump_netatmo_homesdata.json` e `dump_netatmo_homestatus_1.json` | per lo Smarther |
 | `diagnostica.json` (lo crea il pannello con `python pdc_pannello.py esporta-diagnostica`) | per problemi sui dati o sull'indicatore |
 | `analisi_AAAAMMGG_HHMM.json` | per far analizzare le impostazioni e i cicli (`analisi`, capitolo 9) |
+| `dump_smartthings_capacita.json` · `dump_smartthings_osserva.json` | dopo `st-capacita` / `st-osserva` (capitolo 10) |
 | `rip_diag.json` · `sbrinamenti.json` | con `--salva`, per la ripartenza prevista / gli sbrinamenti |
 | `webhook_eventi.json` · `meteo_prova.json` | dopo `nt-webhook-prova` / `meteo-prova` |
 | `prova_refresh.json` | dopo `st-prova-refresh` |
@@ -131,7 +132,7 @@ Legge `dati/pdc.db` (serve `pdc_pannello.py` nella stessa cartella) e stampa dat
 
 Netatmo ridurra' i limiti del polling dal 1 marzo 2027 e propone i webhook (il servizio ti avvisa quando cambia qualcosa). Prima di cambiare il pannello, questo comando guarda cosa arriva davvero dallo Smarther.
 
-**Il pannello puo' restare acceso**: il comando non lo tocca. Apre un ricevitore sul tuo PC (su una porta libera scelta da solo), lo rende raggiungibile con un tunnel temporaneo di Cloudflare (indirizzo casuale `*.trycloudflare.com`, senza account, il tuo `pdc.cosedafare.me` non c'entra), registra quell'indirizzo come webhook su Netatmo e, alla fine, **lo rimuove**.
+**Il pannello puo' restare acceso**: il comando non lo tocca. Apre un ricevitore sul tuo PC (su una porta libera scelta da solo), lo rende raggiungibile con un tunnel temporaneo di Cloudflare (indirizzo casuale `*.trycloudflare.com`, senza account, il tuo indirizzo Cloudflare non c'entra), registra quell'indirizzo come webhook su Netatmo e, alla fine, **lo rimuove**.
 
 ```
 python pdc_strumenti.py nt-webhook-prova
@@ -184,12 +185,26 @@ Un solo file con tutto quello che il database sa, da mandare a Claude per farlo 
 python pdc_strumenti.py analisi                      ultimi 45 giorni, 1 giorno di misure grezze
 python pdc_strumenti.py analisi --giorni 14          meno storico (file piu' piccolo)
 python pdc_strumenti.py analisi --grezzi 3           3 giorni di misure non mediate
+python pdc_strumenti.py analisi --ciclo 0            senza i campioni grezzi del ciclo (file piu' piccolo)
 ```
 
-Crea `diagnostica/analisi_AAAAMMGG_HHMM.json`. Dentro: impostazioni (FSV, dispositivi), qualita' dei dati e buchi, riepilogo per giorno, giornata tipica per ora, ogni ciclo dello Smarther (durata, quanto la casa sale oltre il target, isteresi vera), ogni avvio del compressore, profilo della PdC per temperatura esterna, curva climatica contro mandata misurata, efficienza, bollitore, sbrinamenti, ripartenza prevista, cambi di stato, allarmi, e tutte le serie mediate nel tempo (5 minuti gli ultimi 14 giorni, 30 minuti prima).
+Crea `diagnostica/analisi_AAAAMMGG_HHMM.json`. Dentro: impostazioni (FSV, dispositivi), qualita' dei dati e buchi, riepilogo per giorno, giornata tipica per ora, ogni ciclo dello Smarther (durata, quanto la casa sale oltre il target, isteresi vera), ogni avvio del compressore, profilo della PdC per temperatura esterna, curva climatica contro mandata misurata, efficienza, bollitore, sbrinamenti, ripartenza prevista, cambi di stato, allarmi, e tutte le serie mediate nel tempo (5 minuti gli ultimi 14 giorni, 30 minuti prima), più i byte grezzi del ciclo del compressore degli ultimi 7 giorni (`--ciclo`), che servono a cercare valori non ancora decodificati.
 
 Come si usa: lancialo da PowerShell nella cartella del pannello (anche con il pannello acceso), poi allega in chat il file nuovo di `diagnostica`. Se il file è troppo grande per la chat: `--giorni 14`. Il valore dell'isteresi impostato nello Smarther **non** c'è nel database: scrivilo tu insieme al file. Serve `pdc_pannello.py` nella stessa cartella (per i calcoli di efficienza, sbrinamenti e ripartenza; senza, le altre sezioni ci sono lo stesso).
 
+
+## 10. Comandi della pompa e osservazione (st-capacita, st-osserva)
+
+Due strumenti di **sola lettura** per capire come si comanda la pompa, usati per costruire Boost, programmi e FSV.
+
+```
+python pdc_strumenti.py st-capacita                  salva i comandi che SmartThings espone per la pompa
+python pdc_strumenti.py st-osserva                   guarda la pompa per 15 minuti e annota cosa cambia
+python pdc_strumenti.py st-osserva --minuti 30 --ogni 5
+```
+
+- **`st-capacita`**: chiede a SmartThings la definizione di ogni funzione della pompa (nomi dei comandi e dei loro argomenti) e scrive `diagnostica/dump_smartthings_capacita.json`. Non cambia niente sulla pompa. Se non sa quale sia, usa `--device <id>` (o lancia prima `st-devices`).
+- **`st-osserva`**: legge lo stato della pompa ogni 10 secondi (`--ogni`) per 15 minuti (`--minuti`) e annota, con l'ora, ogni valore che cambia. Mentre gira premi Boost o crei un programma dall'app e **segnati l'ora di ogni cosa che fai**: il risultato è `diagnostica/dump_smartthings_osserva.json`. Se usi OAuth, come per `st-dump` lancialo a pannello **fermo**: il refresh token è monouso e in due insieme si pestano i piedi (capitolo 1).
 
 ## Esperimento: il comando "refresh" anticipa i dati del ciclo?
 
@@ -209,3 +224,9 @@ Opzioni: `--giri 16` (piu' giri = risultato piu' affidabile, sempre un numero pa
 Non modifica nessuna impostazione della pdc: manda solo `refresh`, come il pulsante di aggiornamento dell'app.
 
 **Risultato del 3/11/2026** (24 giri complessivi, ordine casuale): con il refresh dati nuovi in 7 giri su 12, quasi sempre dopo 10 secondi; senza refresh in 1 su 12. Dati freschi (meno di 3 minuti) solo con il refresh, ma in circa metà dei tentativi non arriva niente. Il pannello 0.18 ha l'opzione per usarlo (Impostazioni → Collegamenti).
+
+---
+
+## Crediti
+
+Idea, requisiti e prove sul campo: Alessandro; scritto insieme a Claude (Anthropic). Ispirazione e decodifica dei dati del compressore: [Dwellsee](https://www.dwellsee.com) («Cycle Data Decoding Guide»). Script di partenza: [pookey/samsung-heatpump-smartthings](https://github.com/pookey/samsung-heatpump-smartthings). Meteo: [Open-Meteo](https://open-meteo.com) (CC BY 4.0). I nomi e i marchi (Samsung, SmartThings, Netatmo, BTicino, Cloudflare, Amazon) appartengono ai rispettivi proprietari; il progetto non è affiliato a nessuno di loro.
