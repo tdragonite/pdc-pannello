@@ -63,6 +63,7 @@ function costruisci() {
         <label>A<input type="datetime-local" id="c-a"></label>
         <button id="c-ok" type="button">Applica</button>
       </div>
+      <div class="custom" id="indietro" hidden><span id="i-t"></span><button id="c-adesso" type="button">↺ Adesso</button></div>
       <div id="avvisi"></div>
       <section id="pagina"></section>
     </main>
@@ -71,13 +72,14 @@ function costruisci() {
     if (e.target.dataset.conf) { S.confronto = !S.confronto; chips(); carica(); return; }  // non si ricorda: a ogni apertura e' spento
     const r = e.target.dataset.r; if (!r) return;
     if (S.pagina === 'efficienza') { S.rangeEff = r; ls.set('rangeEff', r); chips(); carica(); return; }
-    S.range = r; S.zoom = null; ls.set('range', r); chips();
+    S.range = r; S.zoom = null; S.fine = null; ls.set('range', r); ricordaFinestra(); chips();
     if (r === 'custom') apriCustom(); else { $('#custom').hidden = true; carica(); }
   });
+  $('#c-adesso').addEventListener('click', () => { S.fine = null; S.zoom = null; chips(); carica(); });
   $('#c-ok').addEventListener('click', () => {
     const da = new Date($('#c-da').value).getTime() / 1000, a = new Date($('#c-a').value).getTime() / 1000;
     if (!isFinite(da) || !isFinite(a) || a <= da) { alert('Controlla le date: "A" deve venire dopo "Da".'); return; }
-    S.custom = {da: Math.floor(da), a: Math.floor(a)}; S.zoom = null; ls.set('custom', S.custom); carica();
+    S.custom = {da: Math.floor(da), a: Math.floor(a)}; S.zoom = null; S.fine = null; ls.set('custom', S.custom); carica();
   });
 }
 
@@ -87,14 +89,17 @@ function apriCustom() {
   $('#c-da').value = loc(c.da); $('#c-a').value = loc(c.a); $('#custom').hidden = false;
   if (!S.custom) { S.custom = c; ls.set('custom', c); carica(); }
 }
-const RANGE_EFF = {'3g': 3, '7g': 7, '28g': 28};
+const RANGE_EFF = {'1g': 1, '3g': 3, '7g': 7, '28g': 28};
 function chips() {
   const el = $('#chips');
   el.hidden = S.pagina === 'impostazioni' || S.pagina === 'dispositivi' || S.pagina === 'changelog';
   const eff = S.pagina === 'efficienza';
-  const lista = eff ? [['3g', '3 giorni'], ['7g', '7 giorni'], ['28g', '28 giorni']]
+  const lista = eff ? [['1g', '1 giorno'], ['3g', '3 giorni'], ['7g', '7 giorni'], ['28g', '28 giorni']]
                     : [['6h', '6h'], ['24h', '24h'], ['custom', 'Personalizzato']];
   const sel = eff ? S.rangeEff : S.range;
+  const ind = $('#indietro'), dietro = !!S.fine && S.pagina === 'analisi';   // finestra spostata indietro: riga con l'intervallo e il tasto per tornare in diretta
+  ind.hidden = !dietro;
+  if (dietro) $('#i-t').innerHTML = `Stai guardando <b>${dm(S.fine - (S.range === '6h' ? 6 : 24) * 3600)} → ${dm(S.fine)}</b>`;
   el.innerHTML = lista.map(([r, t]) => `<button data-r="${r}" class="${sel === r ? 'on' : ''}">${t}</button>`).join('')
     + (eff ? `<button data-conf="1" class="conf-btn ${S.confronto ? 'on' : ''}" aria-pressed="${!!S.confronto}" title="Confronta con un periodo della stessa durata subito prima">Confronta</button>` : '');
 }
@@ -102,7 +107,7 @@ function chips() {
 function mostraPagina() {
   $('#titolo').textContent = TITOLI[S.pagina];
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.p === S.pagina));
-  chips(); S.dati = null; S.dpag = null; S.zoom = null;
+  S.fine = null; chips(); S.dati = null; S.dpag = null; S.zoom = null;
   { const st = document.querySelector('.stato'); if (st) st.hidden = S.pagina === 'changelog'; }
   $('#custom').hidden = !(S.pagina !== 'efficienza' && S.pagina !== 'impostazioni' && S.pagina !== 'dispositivi' && S.pagina !== 'changelog' && S.range === 'custom');
   S.sporco = false; S.mod = {};
@@ -143,7 +148,7 @@ function scheletro() {
       <article class="card"><div class="ch"><h2>Stato del sistema</h2><span id="cmd-lock"></span></div><div class="righe" id="sistema"></div></article>
       <article class="card"><div class="ch"><h2>Compressore e circuito</h2><span class="et" id="prest-et"></span></div><div class="tiles" id="prest"></div><p class="nota-sez" id="prest-rit"></p></article>
     </div>
-    <article class="card curva"><div class="ch"><h2>Curva climatica</h2><span class="et">Zona 1</span></div><div id="curva"></div></article>
+    <article class="card curva"><div class="ch"><h2>Curva climatica</h2><span class="et" id="curva-zona">Zona 1</span></div><div id="curva"></div></article>
   </div>`;
 }
 
@@ -197,7 +202,7 @@ function disegna() {
     : e.umidita != null ? `<span class="um-n" title="Umidità dell'aria esterna (stazione meteo vicina)">Umidità <b>${num(e.umidita, 0)}%</b></span>` : '');   // l'avviso, quando c'è, prende il posto dell'umidità
 
   set('w-t', num(w.kwh, w.kwh != null && w.kwh < 10 ? 2 : 1)); set('w-per', periodo(d)); set('w-pw', w.potenza_w == null ? '—' : num(w.potenza_w, 0) + ' W');
-  { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); } }
+  { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); const dt = w.dettaglio; e.title = dt ? `Riscaldamento ${euro(dt.casa)} · Acqua calda ${euro(dt.acs)} · Standby ${euro(dt.riposo)}` : ''; } }
   badge('w-b', 'Consumo', 'tema', 'Energia elettrica consumata dalla pompa nel periodo scelto');
   html('w-sp', spark(w.spark));
 
@@ -347,6 +352,7 @@ function prestazioni(d) {
 function nice(a, b, step) { const o = []; for (let v = Math.ceil(a / step) * step; v <= b + 1e-9; v += step) o.push(v); return o; }
 function curva(c) {
   if (!c) { html('curva', '<div class="vuoto">Le impostazioni della curva non sono ancora state lette dalla PdC.</div>'); return; }
+  const zn = $('#curva-zona'); if (zn) { zn.textContent = c.zona === 2 ? 'Zona 2' : 'Zona 1 · pavimento'; zn.title = c.zona_fonte ? 'Zona dedotta da: ' + c.zona_fonte : ''; }
   const W = 480, H = 300, L = 46, R = 0, T = 16, B = 44;   // R = 0: la fine del grafico sta sul bordo dei riquadri sotto (l'ultimo numero dell'asse finisce sul bordo)
   const xs = [-10, 25, c.basso.esterna - 3, c.alto.esterna + 3, ...c.punti.map(p => p[0])];
   const ys = [20, 60, c.alto.mandata - 4, c.basso.mandata + 6, ...c.punti.map(p => p[1])];
@@ -404,7 +410,7 @@ function stato() {
 }
 
 // ---------- grafici (Analisi) ----------
-const COLS = {casa: '#ff6b57', acs: '#4da3ff', est: '#34d3b0', en: '#ffb547', amb: '#a78bfa', ritorno: '#f59ac7', umid: '#7dd3fc'};
+const COLS = {casa: COL.casa, acs: COL.acs, fin: '#3ddc97', est: '#34d3b0', en: '#ffb547', amb: '#a78bfa', ritorno: '#f59ac7', umid: '#7dd3fc'};
 const tz = () => -new Date().getTimezoneOffset() * 60;
 
 function scalaNice(lo, hi, nmax = 4) {
@@ -450,11 +456,34 @@ function fasceRichiesta(r, da, a, X, y0, h, op = .13) {
   return iv.map(([t0, t1]) => `<rect x="${X(Math.max(t0, da)).toFixed(1)}" y="${y0}" width="${Math.max(1.5, X(Math.min(t1, a)) - X(Math.max(t0, da))).toFixed(1)}" height="${h}" fill="${COLS.casa}" opacity="${op}"${op > .5 ? ' rx="2"' : ''}/>`).join('');
 }
 
+// finestre aperte: fascia dietro le linee (come le altre fasce) e iconcina in alto per toccarla; indice = posizione in d.finestre
+function fasceFinestre(fin, da, a, X, y0, h) {
+  return fin.filter(f => f.a > da && f.da < a).map(f => {      // confermata: piena; da confermare: tenue con i bordi tratteggiati
+    const x0 = X(Math.max(f.da, da)), x1 = X(Math.min(f.a, a)), ok = f.stato === 'si';
+    return `<rect x="${x0.toFixed(1)}" y="${y0}" width="${Math.max(2, x1 - x0).toFixed(1)}" height="${h}" fill="${COLS.fin}" opacity="${ok ? .2 : .08}"/>`
+      + (ok ? '' : [[f.da, x0], [f.a, x1]].filter(([t]) => t > da + 1 && t < a - 1).map(([, x]) => `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${y0}" y2="${y0 + h}" class="bordo-vuoto fin"/>`).join(''));
+  }).join('');
+}
+function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
+  if (S.tel || a - da > 7 * 86400) return '';      // su telefono solo le fasce (si guarda e basta); su periodi lunghi le icone si accavallano: restano le fasce
+  return fin.map((f, i) => {
+    if (f.a <= da || f.da >= a) return '';
+    const x = Math.min(Math.max(X((Math.max(f.da, da) + Math.min(f.a, a)) / 2), xmin), xmax), ok = f.stato === 'si';
+    return `<g data-fin="${i}" role="button" tabindex="0" aria-label="${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}" transform="translate(${x.toFixed(1)} ${y})"><circle r="13" fill="transparent"/><circle r="12" fill="${ok ? COLS.fin : 'var(--card)'}" stroke="${COLS.fin}" stroke-width="1.2"/><g transform="scale(1.2)" fill="none" stroke="${ok ? '#06101d' : COLS.fin}" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M-3.2 -4.7H3.2V4.7H-3.2zM-3.2 -4.7L-7.2 -5.8V5.8L-3.2 4.7M-7.2 0H-3.2M3.2 -4.7L7.2 -5.8V5.8L3.2 4.7M7.2 0H3.2"/></g></g>`;
+  }).join('');
+}
+
 function scheletroAnalisi() {
   return `<div class="card"><div class="ch"><h2>Modo di funzionamento</h2><div class="riep" id="tl-riep"></div></div>
     <div class="tlw" id="tlw"><div id="tl"></div><div class="tip" id="tip" hidden></div></div><div class="assi" id="assi"></div></div>
+    <div class="custom" id="fin-man" hidden>
+      <label>Da<input type="datetime-local" id="fin-da"></label>
+      <label>A<input type="datetime-local" id="fin-a"></label>
+      <button id="fin-ok" type="button">Segnala finestra</button>
+    </div>
     <div id="grafici"></div>
     <ul class="nota-cv lun"><li><i class="in"></i><span>Le zone colorate dietro le linee indicano quando la PdC scalda la casa (rosso) o l'acqua (blu); le righe oblique grigie, i periodi senza dati.</span></li>
+      <li><i class="in"></i><span>Fascia verde nel grafico della temperatura ambiente: una finestra aperta. Piena = confermata da te; tenue con i bordi tratteggiati = da confermare (da computer, toccando l’iconcina).</span></li>
       <li><i class="in"></i><span>Tocca o passa il mouse su un grafico per leggere i valori: i grafici sono sincronizzati.</span></li>
       <li class="tt"><i class="in"></i><span>Su telefono: pizzica con due dita per ingrandire il tempo, trascina con un dito per spostarti, doppio tocco per tornare alla vista intera.</span></li></ul>`;
 }
@@ -475,10 +504,11 @@ function disegnaAnalisi(p) {
   box.dataset.f = firma;
   const y0 = window.scrollY;
   const W = Math.max(280, box.clientWidth || 600), H = 168, tel = W < 480, Ws = tel ? W - 11 : W - 32;   // telefono: il grafico esce dal padding della card
+  S.tel = tel;
   box.innerHTML = d.grafici.filter(g => g.linee.length).map(g => `
     <article class="card gr" data-g="${g.id}">
       <div class="ch"><h2>${g.titolo}</h2><div class="legg" data-l="${g.id}"></div></div>
-      <div class="grw"${tel ? ' style="margin:0 -6px 0 -9px"' : ''}>${graficoLineare(g, d, Ws, H)}</div>
+      <div class="grw"${tel ? ' style="margin:0 -6px 0 -9px"' : ''}>${graficoLineare(g, d, Ws, H)}</div>${g.id === 'casa' && !tel ? '<div class="azioni"><button type="button" class="sec piccolo" id="fin-add" title="Segna a mano una finestra aperta">Segnala finestra</button></div>' : ''}
     </article>`).join('') || '<div class="card vuoto">Nessun dato in questo periodo.</div>';
   S.grafici = d.grafici; S.gW = Ws;
   d.grafici.forEach(g => legenda(g, null));
@@ -522,6 +552,9 @@ function largTesto(t) {   // larghezza vera di un testo dei grafici (11 px, stes
 }
 // colonna dei numeri dell'asse verticale, larga quanto serve. Telefono: stima (2 cifre ≈ 21 px); PC: misura vera col font della pagina,
 // cosi' la prima cifra cade sulla prima lettera del titolo
+// asse Y dei grafici di Efficienza: larghezza della colonna dei numeri e righe orizzontali con i valori (solo da zero in su)
+const larghezzaNumeriY = (sc, tel) => colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel);
+const grigliaY = (sc, Y, L, W, R) => sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
 function colonnaNumeri(et, tel) {
   return tel ? Math.ceil(Math.max(...et.map(t => t.length)) * 6.5) + 8 : Math.ceil(Math.max(...et.map(largTesto))) + 4;
 }
@@ -565,6 +598,7 @@ function graficoLineare(g, d, W, H) {
   s += `<defs><pattern id="tr-${g.id}" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#8793a8" stroke-opacity=".22" stroke-width="1"/></pattern></defs>`;
   s += vuoti.map(([s0, s1]) => `<rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="rgba(135,147,168,.05)"/><rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('')).join('');
   s += g.id === 'casa' ? fasceRichiesta(d.richiesta || [], d.da, d.a, X, T, ph) : fasce(d.modi.segmenti, d.da, d.a, X, T, ph);
+  if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph);
   if (g.id === 'casa') s += fasceRichiesta(d.richiesta || [], d.da, d.a, X, T + ph - 7, 7, .9);   // striscia piena in basso: quando lo Smarther chiede caldo
   s += sc.tick.map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, sc.passo < 1 ? 1 : 0)}</text>`).join('');
   if (doppio) s += sc1.tick.map(v => `<text x="${W - R + 4}" y="${(Y1(v) + 4).toFixed(1)}" text-anchor="start" fill="${colAsse1}">${num(v, sc1.passo < 1 ? 1 : 0)}</text>`).join('');
@@ -583,7 +617,7 @@ function graficoLineare(g, d, W, H) {
   s += g.linee.map((l, i) => `<circle class="cur-d" data-i="${i}" data-a="${l.asse || 0}" r="4.5" cx="0" cy="0" fill="${COLS[l.col]}" stroke="var(--card)" stroke-width="2" visibility="hidden"/>`).join('');
   s += `<line class="cur" x1="0" x2="0" y1="${T}" y2="${T + ph}" visibility="hidden"/>
     <g class="cur-t" visibility="hidden"><rect class="cur-bg" rx="6" height="19"/><text class="cur-tx"></text></g>
-    <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/></svg>`;
+    <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/>${g.id === 'casa' ? iconeFinestre(d.finestre || [], d.da, d.a, X, L + 13, W - R - 13, T + 14) : ''}</svg>`;
   return s;
 }
 
@@ -726,6 +760,34 @@ function muoviCursore(e) {
 }
 
 
+// ---------- spostarsi indietro nel tempo col mouse (6h / 24h): si trascina un grafico, al rilascio si caricano le ore di quel periodo ----------
+let sposta = null;
+function spostaGiu(e) {
+  if (e.pointerType !== 'mouse' || e.button !== 0 || S.pagina !== 'analisi' || !S.dati || S.range === 'custom' || S.zoom) return;
+  const el = e.target.closest && e.target.closest('#grafici, #tlw'); if (!el) return;
+  const svg = document.querySelector('#grafici svg'), pw = el.id === 'tlw' || !svg ? el.getBoundingClientRect().width : +svg.dataset.pw;
+  sposta = {x0: e.clientX, dx: 0, on: false, sec: (S.dati.a - S.dati.da) / Math.max(1, pw)};
+}
+function spostaMuovi(e) {
+  if (!sposta) return false;
+  if (!(e.buttons & 1)) { spostaSu(); return false; }   // tasto rilasciato fuori dalla finestra: si chiude qui
+  const dx = e.clientX - sposta.x0;
+  if (!sposta.on && Math.abs(dx) < 6) return false;
+  if (!sposta.on) { sposta.on = true; togliCursore(); const t = $('#tip'); if (t) t.hidden = true; document.body.style.userSelect = 'none'; }
+  sposta.dx = dx; document.querySelectorAll('#grafici svg, #tlw').forEach(x => { x.style.transform = `translateX(${dx}px)`; x.style.opacity = '.55'; });
+  return true;
+}
+function spostaSu() {
+  if (!sposta) return;
+  const s = sposta; sposta = null;
+  document.querySelectorAll('#grafici svg, #tlw').forEach(x => { x.style.transform = x.style.opacity = ''; }); document.body.style.userSelect = '';
+  if (!s.on) return;
+  // trascinare verso destra = andare indietro nel tempo
+  const adesso = ora(), fine = Math.min(adesso, Math.round((S.fine || adesso) - s.dx * s.sec));
+  S.fine = fine > adesso - 60 ? null : fine; S.zoom = null;
+  chips(); carica();
+}
+
 // ---------- zoom con due dita sui grafici di Analisi (telefono); doppio tocco = vista intera ----------
 const dita = new Map();
 let pizzico = null, tocco = null, mossoPizzico = false, trascina = null;
@@ -805,8 +867,7 @@ S.solo = S.solo || false;
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
   try {
-    const r = await fetch('/api/registro?righe=150', {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson('/api/registro?righe=150'); if (!r) return;
     S.reg = await r.json(); disegnaRegistro();
   } catch { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
 }
@@ -843,10 +904,12 @@ setInterval(() => { if (S.pagina === 'impostazioni' && S.sub === 'registro' && !
 
 // ---------- Meteo (riga nella scheda Esterna) ----------
 // Icone a tratto, 32x32, nello stesso stile del resto dell'app. Ogni colore e' una variabile CSS (vedi .mt-*).
+const NUV = 'd="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>';   // il contorno della nuvola, uguale in tutte le icone
+const NUV_PIOGGIA = '<path class="mt-n" transform="translate(5 1) scale(.8)" ' + NUV + '<path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>';
 const MT = {
-  nuvola: '<path class="mt-n" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
-  nuvolaP: '<path class="mt-n" transform="translate(6.5 7.5) scale(.72)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
-  nuvolaAlta: '<path class="mt-n" transform="translate(0 -3)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
+  nuvola: '<path class="mt-n" ' + NUV,
+  nuvolaP: '<path class="mt-n" transform="translate(6.5 7.5) scale(.72)" ' + NUV,
+  nuvolaAlta: '<path class="mt-n" transform="translate(0 -3)" ' + NUV,
   sole: (cx, cy, r, ray) => `<circle class="mt-s" cx="${cx}" cy="${cy}" r="${r}"/>` + [0, 45, 90, 135, 180, 225, 270, 315].map(a => {
     const t = a * Math.PI / 180, c = Math.cos(t), n = Math.sin(t);
     return `<path class="mt-s" d="M${(cx + c * (r + 2.6)).toFixed(1)} ${(cy + n * (r + 2.6)).toFixed(1)}L${(cx + c * (r + 2.6 + ray)).toFixed(1)} ${(cy + n * (r + 2.6 + ray)).toFixed(1)}"/>`;
@@ -862,20 +925,19 @@ const ICONE_METEO = {
   'luna-nuvola': MT.luna('transform="translate(-2.6 -2.5) scale(.74)"') + MT.nuvolaP,
   nuvola: MT.nuvola,
   pioggia: MT.nuvolaAlta + MT.gocce,
-  'sole-pioggia': MT.sole(10, 9.5, 3.2, 2) + '<path class="mt-n" transform="translate(5 1) scale(.8)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/><path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>',
-  'luna-pioggia': MT.luna('transform="translate(-2 -3) scale(.68)"') + '<path class="mt-n" transform="translate(5 1) scale(.8)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/><path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>',
+  'sole-pioggia': MT.sole(10, 9.5, 3.2, 2) + NUV_PIOGGIA,
+  'luna-pioggia': MT.luna('transform="translate(-2 -3) scale(.68)"') + NUV_PIOGGIA,
   temporale: MT.nuvolaAlta + MT.fulmine,
   neve: MT.nuvolaAlta + '<path class="mt-v" d="M12 26.5v.01M16.5 28.5v.01M21 26.5v.01"/>',
   nebbia: '<path class="mt-n" d="M7 11h14M5 16h20M9 21h16M7 26h10"/>',
 };
 const iconaMeteo = (nome, px) => `<svg class="mt-i" viewBox="0 0 32 32" width="${px}" height="${px}" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONE_METEO[nome] || ICONE_METEO.nuvola}</svg>`;
 
-// Versione corta della frase per la scheda (nel pannello c'e' quella completa)
+// Versione corta della frase per la scheda (nel pannello c'e' quella completa): niente «pioggia» (c'e' l'icona) e niente «possibile»
+// (lo dice il colore: arancio = possibile, azzurro = certa)
 function meteoBreve(m) {
   if (m.livello !== 'certa' && m.livello !== 'possibile') return '';
-  const r = (m.testo || '').replace(/^(possibile )?pioggia\s*/, '').replace('per il resto della giornata', 'tutto il giorno');
-  if (m.livello === 'possibile') return 'possibile ' + r;
-  return /^(fino|tutto)/.test(r) ? r : 'pioggia ' + r;
+  return (m.testo || '').replace(/^(possibile )?pioggia\s*/, '').replace('per il resto della giornata', 'tutto il giorno').replace(/^(\d+)–(\d+)$/, 'dalle $1 alle $2');
 }
 function meteoRiga(m) {
   const el = document.getElementById('e-mt');
@@ -884,6 +946,7 @@ function meteoRiga(m) {
   const gradi = v => v == null ? '—' : Math.round(v) + '°';
   el.hidden = false;
   const breve = meteoBreve(m).replace(/(\d)–(\d)/g, '$1⁠–⁠$2');
+  el.title = m.testo ? m.testo.charAt(0).toUpperCase() + m.testo.slice(1) : '';
   html('e-mt', iconaMeteo(m.icona, 26) + `<b class="mt-g">${gradi(m.tmin)}–${gradi(m.tmax)}</b>` +
     (breve ? `<span class="mt-pi ${m.livello}">${esc(breve)}</span>` : ''));
   if (S.meteoAperto) disegnaPannelloMeteo(m);
@@ -923,25 +986,125 @@ document.addEventListener('click', ev => {
 document.addEventListener('keydown', ev => { if (ev.key === 'Escape') chiudiMeteo(); });
 window.addEventListener('scroll', () => { if (S.meteoAperto) chiudiMeteo(); }, {passive: true});
 
+// finestre aperte: tocco sull'icona -> pannellino per confermare; «＋ Finestra» per segnarne una a mano
+function finRidisegna() { const b = $('#grafici'); if (b) b.dataset.f = ''; carica(); }
+async function finInvia(url, corpo) {
+  const r = await inviaPost(url, corpo);
+  if (!r.ok) { toast(r.errore || 'Non sono riuscito a salvare.', true); return false; }
+  return true;
+}
+function finPannello(ic) {
+  const f = ((S.dati || {}).finestre || [])[+ic.dataset.fin]; if (!f) return;
+  const inf = (S.dati || {}).finestre_info || {}, ora2 = t => new Date(t * 1000).toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'});
+  const ok = f.stato === 'si', righe = (e, v) => `<div class="riga"><span>${e}</span><b>${v}</b></div>`;
+  const p = document.createElement('div'); p.id = 'fin-pan'; p.className = 'mt-pan';
+  p.innerHTML = `<div class="eti">${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}</div>
+    ${righe('Orario', `${ora2(f.da)}–${ora2(f.a)}`)}
+    ${f.calo != null ? righe('Calo di temperatura', `−${num(f.calo, 1)} °C`) : ''}
+    ${f.ah != null ? righe('Umidità assoluta', `${f.ah > 0 ? '+' : '−'}${num(Math.abs(f.ah), 1)} g/m³`) : ''}
+    <div class="sub">${ok ? (f.manuale ? 'Segnata da te.' : 'Confermata da te.') : 'Era una finestra aperta?'}</div>
+    <div class="azioni-t" id="fin-az">${ok ? `<button type="button" class="sec" data-az="annulla">${f.manuale ? 'Elimina' : 'Togli la conferma'}</button>`
+      : '<button type="button" class="sec" data-az="si">Sì</button><button type="button" class="sec" data-az="no">No</button>'}</div>
+    <div class="mt-fo">${inf.tarato ? `Soglie tarate su ${inf.n} risposte.` : `Risposte date: ${inf.risposte || 0} su 10 per tarare.`}</div>`;
+  document.body.appendChild(p);
+  const r = ic.getBoundingClientRect(), w = Math.min(280, window.innerWidth - 20); p.style.width = w + 'px';
+  p.style.left = Math.max(10, Math.min(window.innerWidth - w - 10, r.left + r.width / 2 - w / 2)) + 'px';
+  const h = p.offsetHeight, sotto = window.innerHeight - 70;      // 70: la barra in basso del telefono
+  p.style.top = Math.max(10, r.bottom + 8 + h > sotto ? r.top - h - 8 : r.bottom + 8) + 'px';
+  p.addEventListener('click', async ev => {
+    const az = ev.target.dataset && ev.target.dataset.az; if (!az) return;
+    const via = az === 'annulla' ? await finInvia('/api/finestre/annulla', {da: f.da})
+      : await finInvia('/api/finestre/giudica', {da: f.da, a: f.a, calo: f.calo, ah: f.ah, stato: az});
+    p.remove();
+    if (via) { finRidisegna(); toast(az === 'si' ? 'Segnata come finestra aperta.' : az === 'no' ? 'Ok, non era una finestra.' : 'Fatto.'); }
+  });
+}
+document.addEventListener('click', ev => {
+  const t = ev.target, vecchio = document.getElementById('fin-pan'), ic = t.closest && t.closest('[data-fin]');
+  if (t.id === 'fin-add') {
+    const b = $('#fin-man'), a = ora();
+    $('#fin-da').value = loc(a - 3600); $('#fin-a').value = loc(a); b.hidden = !b.hidden; if (!b.hidden) b.scrollIntoView({block: 'center', behavior: 'smooth'}); return;
+  }
+  if (t.id === 'fin-ok') {
+    const da = new Date($('#fin-da').value).getTime() / 1000, a = new Date($('#fin-a').value).getTime() / 1000;
+    if (!isFinite(da) || !isFinite(a) || a <= da || a - da > 86400) { toast('Controlla le date: "A" deve venire dopo "Da" (al massimo 24 ore).', true); return; }
+    finInvia('/api/finestre/manuale', {da: Math.floor(da), a: Math.floor(a)}).then(v => { if (v) { $('#fin-man').hidden = true; finRidisegna(); toast('Finestra segnata.'); } });
+    return;
+  }
+  if (vecchio && !(t.closest && t.closest('#fin-pan')) && !ic) vecchio.remove();
+  if (ic) { if (vecchio) vecchio.remove(); finPannello(ic); }
+});
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') { const v = document.getElementById('fin-pan'); if (v) v.remove(); } });
+window.addEventListener('scroll', () => { const v = document.getElementById('fin-pan'); if (v) v.remove(); }, {passive: true});
+
 // ---------- Changelog ----------
 // Una voce per ogni versione, la piu' recente in alto; le sotto-versioni stanno nella versione madre.
-// Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola: i dettagli tecnici stanno in PIANO.md.
+// Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
-  ['plugin', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», si accendono e si ricaricano senza riavviare.'],
-  ['alexa', 'Alexa', 'Il primo plugin: chiedi temperatura, umidità, PdC e acqua calda, o accendi e spegni lo Smarther, con le Routine di Alexa.'],
-  ['live', 'Stato in diretta', 'Stato e richieste dei plugin si aggiornano da soli, senza ricaricare la pagina.'],
+  ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
+  ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo da casa, con lucchetto e conferma.'],
+  ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
+  ['indietro', 'Grafici indietro nel tempo', 'Analisi, da computer: trascina un grafico verso destra per guardare le ore (o il giorno) prima; «Torna ad adesso» rimette la diretta.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', alexa: '🔊', live: '↻'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.1', quando: '8 novembre 2026', titolo: 'Avvisi finti e dati esterni', righe: [
+    ['s', 'Browser che si stacca', 'Se il browser chiudeva la connessione a metà risposta (ricaricando la pagina, per esempio), il registro mostrava un errore con tutta la traccia anche se non c’era niente da correggere: ora viene ignorato, come già succedeva per gli altri distacchi.'],
+    ['s', 'Meteo e stazione sempre aggiornati', 'La previsione e l’umidità della stazione vicina si leggono ora anche con la Dashboard chiusa, da un solo lavoro di fondo: niente buco alla riapertura (nemmeno per Alexa e il widget) e niente avvisi finti di «dato vecchio».'],
+    ['s', 'Lampo bianco all’apertura', 'Aprendo dall’icona nella Home non compare più il lampo bianco: subito lo sfondo scuro con il simbolo. Per vederlo togli l’icona dalla Home e rimettila.'],
+    ['m', 'Avviso «mandata lontana» più giusto', 'Ora ha due soglie: 12 °C sopra la curva, dove la PdC sta spesso, e 8 °C sotto, che di solito è un problema vero. Le cambi in Impostazioni → Avvisi, nel riquadro «Mandata lontana dalla curva».'],
+    ['m', 'MAC dei dispositivi', 'Un MAC trovato si ricorda per una settimana, invece di 10 minuti; se non c’è (dispositivo spento) si riprova dopo 2 minuti.'],
+    ['m', 'Apertura più veloce', 'I file restano nel browser senza ricontrolli e la Dashboard arriva già dentro la pagina: due richieste in meno all’apertura, soprattutto da fuori casa.'],
+  ]},
+  {v: '0.25', quando: '7 novembre 2026', titolo: 'Finestre aperte', righe: [
+    ['n', 'Finestre aperte sul grafico', 'In Analisi, nel grafico della temperatura ambiente, il pannello cerca i cali più rapidi di quelli naturali, guardando anche l’umidità assoluta, che con la finestra aperta scende. Li segna con una fascia verde, anche sui giorni già registrati.'],
+    ['n', 'Confermate e da confermare', 'La fascia piena è una finestra confermata da te; quella tenue, con i bordi tratteggiati, è ancora da confermare. Su computer c’è anche una iconcina (piena o vuota): toccala e rispondi Sì o No. I «No» spariscono, i «Sì» si possono togliere.'],
+    ['n', 'Segnala finestra', 'Il tasto sotto il grafico, da computer, segna a mano una finestra scegliendo da quando a quando. Da telefono le finestre si vedono soltanto, senza icone.'],
+    ['n', 'Impara dalle risposte', 'Dopo 10 risposte il pannello sceglie da solo le soglie (calo minimo e umidità) che sbagliano meno rispetto a quello che gli hai detto. Per ora le finestre le mostra soltanto: le statistiche non le escludono ancora.'],
+  ]},
+  {v: '0.24', quando: '5 novembre 2026', titolo: 'Grafici indietro nel tempo e «1 giorno»', righe: [
+    ['n', 'Costo diviso', 'In Efficienza, toccando «Costo stimato» compare il costo di riscaldamento, acqua calda e standby; nella scheda del mese lo stesso con «Dettaglio». In Dashboard, il mouse su «Costo» (card Energia) mostra lo stesso. La somma fa sempre il totale.'],
+    ['n', '«1 giorno» in Efficienza', 'Accanto a 3, 7 e 28 giorni c’è «1 giorno»: la giornata di oggi.'],
+    ['n', 'Trascina per tornare indietro', 'Analisi, da computer, con 6h o 24h: tieni premuto il mouse su un grafico (o sulla barra dei modi) e trascinalo verso destra per vedere le ore prima, verso sinistra per tornare avanti. Quando rilasci il pannello carica quel periodo; finché sei indietro non si aggiorna da solo, e «Torna ad adesso» in alto rimette la diretta. Da telefono resta lo zoom.'],
+  ]},
+  {v: '0.23', quando: '5 novembre 2026', titolo: 'Bollitore anche di giorno', righe: [
+    ['n', 'Perdita a riposo di giorno', 'Nella «Salute del bollitore» accanto alla perdita di notte c’è quella di giorno (dalle 6 alle 23): si guardano solo i tratti tranquilli di almeno un’ora, senza riscaldo dell’acqua e senza prelievi. Utile per confrontare le ore con e senza ricircolo.'],
+    ['m', 'Codice più snello', 'Tolti pezzi di codice e di stile duplicati o mai usati: a vista non cambia niente, ma il file è più corto e più facile da correggere.'],
+  ]},
+  {v: '0.22.2', quando: '5 novembre 2026', titolo: 'Gas di scarico', righe: [
+    ['m', 'Gas di scarico finalmente letto', 'La temperatura del gas di scarico del compressore stava in un byte diverso da quello che il pannello leggeva (sempre vuoto): ora viene letta e compare nella scheda Ciclo. Per averla anche nei giorni passati: python pdc_pannello.py ridecodifica.'],
+  ]},
+  {v: '0.22.1', quando: '5 novembre 2026', titolo: 'Limite del codice 4013', righe: [
+    ['m', 'FSV 4013 fino a 45 °C', 'La temperatura esterna oltre la quale il riscaldamento si ferma può arrivare a 45 °C: prima oltre 35 °C compariva «fuori limiti», anche se la pompa li accetta.'],
+  ]},
+  {v: '0.22', quando: '5 novembre 2026', titolo: 'Modifica delle impostazioni installatore', righe: [
+    ['n', 'Modifiche solo da casa', 'Tutte le modifiche della scheda Regolazioni (FSV, temperatura e modo dell’acqua calda, Boost, modo della pompa) si fanno solo dalla rete di casa: da fuori (tunnel Cloudflare) non compare nemmeno «Sblocca modifiche» e il pannello rifiuta la richiesta.'],
+    ['m', 'Testi degli FSV rivisti', 'Nomi e scelte dei codici FSV riscritti in modo più chiaro e controllati sul manuale Samsung: «mandata» per l’acqua dell’impianto, «Fuori casa» per le impostazioni di assenza, «Miscelatrice» davanti ai codici della valvola. Premendo la matita compare una spiegazione breve del codice.'],
+    ['m', 'Box chiusi centrati', 'Nei box chiusi del pannello Regolazioni il testo ora è centrato in verticale, e i valori stanno sempre a destra accanto alla matita.'],
+    ['n', 'Boost acqua calda', 'Nella scheda Regolazioni → Acqua calda: ⚡ avvia un boost come Dwellsee (setpoint all’obiettivo scelto, poi modo «Forzato»). Finisce quando l’acqua arriva all’obiettivo o dopo 2 ore, e rimette modo e setpoint di prima; se il pannello si riavvia, il ripristino riparte da solo. ■ lo ferma a mano.'],
+    ['n', 'Modifica degli FSV dal pannello', 'In Dispositivi → Installatore: «Sblocca modifiche» (30 secondi, come i comandi), la matita sulla riga, il nuovo valore e una conferma. Si accettano solo i codici e i limiti del manuale, e un valore alla volta.'],
+    ['n', 'Scheda «Regolazioni»', 'La scheda Installatore si chiama ora Regolazioni: in alto temperatura e modo dell’acqua calda e modo della pompa (Riscaldamento, Raffrescamento, Automatico), con lo stesso lucchetto e le stesse conferme; sotto, gli FSV.'],
+    ['n', 'Cronologia delle modifiche', 'In fondo alla scheda: ogni cambio visto, con il valore di prima e quello di dopo, e se l’ha fatto il pannello o è stato letto dalla pompa.'],
+    ['m', 'Zona della curva climatica', 'La scheda «Curva climatica» dice se è la zona 1 (pavimento) o la 2: la prende dal codice 2041 se SmartThings lo comunica, altrimenti assume la zona 1.'],
+    ['m', 'Rilettura con calma', 'Dopo una modifica la riga dice «in attesa» finché la pompa non conferma il valore nuovo: SmartThings può metterci un po’ ad aggiornarlo.'],
+    ['s', 'Prudenza', 'Il comando per scrivere un FSV lo chiede il pannello a SmartThings: se non lo capisce non scrive niente e mostra cosa ha trovato.'],
+  ]},
+  {v: '0.21.3', quando: '4 novembre 2026', titolo: 'Ripartenza più stabile', righe: [
+    ['m', 'Ripartenza prevista ferma', 'L’orario non salta più avanti e indietro a ogni decimo di grado del sensore: cambia solo se la stima si sposta davvero (oltre 30 minuti da lontano, sempre meno man mano che la ripartenza si avvicina).'],
+  ]},
+  {v: '0.21.2', quando: '4 novembre 2026', titolo: 'Ritocchi', righe: [
+    ['m', 'Icona della scheda', 'Nel browser (Safari, Chrome) l’icona è solo il simbolo, più grande e senza il quadrato scuro; quella della Home dell’iPhone non cambia.'],
+    ['m', 'Messaggi Telegram di sbrinamento', 'Anche gli avvisi di inizio e fine sbrinamento hanno la riga «Pompa di calore» in grassetto, come tutti gli altri messaggi.'],
+  ]},
   {v: '0.21.1', quando: '4 novembre 2026', titolo: 'Changelog dei plugin', righe: [
     ['n', 'Tab «Plugin» nel Changelog', 'Il Changelog ha due tab: Pannello (come prima) e Plugin, con la cronologia di ogni plugin, tutti insieme in ordine di data o uno alla volta con il filtro. La versione che hai installata è segnata «Installato».'],
     ['m', 'Pannello più veloce da fuori', 'Le pagine (app.js e app.css) si scaricano una volta sola e, se non cambiano, il browser riceve soltanto «invariato»: meno dati sul tunnel e caricamento più rapido, soprattutto da telefono.'],
-    ['m', 'Indirizzi dei plugin più protetti', 'Anche i tentativi su indirizzi sbagliati hanno un limite al minuto, come quelli giusti.'],
+    ['m', 'Indirizzi dei plugin più protetti', 'Anche gli indirizzi sbagliati hanno un limite di tentativi al minuto, come quelli giusti.'],
     ['m', 'Plugin nuovi senza lavoro in più', 'Ogni plugin porta la sua cronologia nel proprio file (lista CHANGELOG): un plugin nuovo compare da solo nella tab.'],
   ]},
   {v: '0.21', quando: '4 novembre 2026', titolo: 'Umidità esterna', righe: [
-    ['n', 'Umidità esterna', 'Nella card Esterna, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink). Sta nella riga degli avvisi: se appare «Dato delle… (PdC ferma)» prende il suo posto. Le dimensioni della Dashboard non cambiano. Si accende incollando l’indirizzo dei dati in Impostazioni → Collegamenti; senza indirizzo o senza dato non compare niente.'],
+    ['n', 'Umidità esterna', 'Nella card Esterna, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink). Sta nella riga degli avvisi: se appare «Dato delle… (PdC ferma)» prende il suo posto. Le dimensioni della Dashboard non cambiano. Si accende incollando l’indirizzo dei dati in Impostazioni → Collegamenti; senza indirizzo o senza dato la riga non compare.'],
   ]},
   {v: '0.20', quando: '4 novembre 2026', titolo: 'Integrazioni e Alexa', righe: [
     ['n', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», con interruttore, campi e stato. Un plugin nuovo parte spento, si ricarica con un tasto e, se si rompe, non ferma mai il pannello.'],
@@ -952,18 +1115,18 @@ const CHANGELOG = [
   ]},
   {v: '0.19', quando: '3 novembre 2026', titolo: 'Ripartenza prevista e giorni tipici', righe: [
     ['n', 'Ripartenza prevista', 'Nella card Smarther: l’ora in cui il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
-    ['n', 'Giorni tipici', 'Efficienza → Confronta: sui grafici dei giorni compare il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
+    ['n', 'Giorni tipici', 'Efficienza → Confronta: nei grafici dei giorni compaiono consumo e COP normali per quel freddo, e un puntino sui giorni peggiori del normale.'],
     ['n', 'Avviso se il pannello non si apre da fuori', 'Telegram ti scrive se da internet il pannello non risponde per qualche minuto; quando torna tutto a posto lo chiude da solo.'],
-    ['n', 'Programma dello Smarther', 'In Dispositivi: il programma orario letto dal termostato, a fasce o fisso.'],
+    ['n', 'Programma dello Smarther', 'In Dispositivi: il programma orario che il termostato ha in memoria, a fasce oppure sempre fisso.'],
     ['n', 'Zoom sui grafici', 'Analisi, da telefono: pizzica con due dita per ingrandire il tempo (tutti i grafici insieme), trascina con un dito per spostarti, doppio tocco per tornare alla vista intera. In più i grafici sono più larghi, con i numeri degli assi in una colonna stretta.'],
     ['n', 'Elenco degli sbrinamenti', 'In Efficienza → Cicli di funzionamento: il riquadro «Sbrinamenti» dice anche quanta energia hanno usato; toccalo per l’elenco a scomparsa con ora, durata, consumo approssimato e temperatura esterna.'],
     ['n', 'Cursore nei grafici di Efficienza', 'Passando il mouse o toccando un grafico di Efficienza compare, come in Analisi, la linea con i puntini e l’etichetta in alto; i valori di quel giorno (o di quella fascia di temperatura) si leggono nella legenda.'],
     ['n', 'Avvisi Telegram di sbrinamento', 'Un messaggio senza suoneria quando la PdC entra in sbrinamento e uno quando finisce (durata e consumo). Si accendono e si spengono a parte in Impostazioni → Avvisi, e i testi si possono cambiare.'],
     ['m', 'Avvisi di Efficienza in alto', 'Dati incompleti e l’avviso di Confronta ora stanno subito sotto «Aggiornato», così li vedi appena premi il tasto.'],
     ['m', 'Note e legende più ordinate', 'In Analisi le note sono un elenco con icona e la legenda di «Modo di funzionamento» sta su una riga; l’icona «i» è la stessa dappertutto.'],
-    ['m', 'Riquadri di Impostazioni', 'Aperti, hanno meno spazio vuoto e tutti uguali, sopra e sotto.'],
+    ['m', 'Riquadri di Impostazioni', 'Quando sono aperti hanno meno spazio vuoto, uguale sopra e sotto.'],
     ['m', 'Avvisi nelle card', '«Smarther non collegato» in rosso, «Ultimo dato delle…» in giallo, nello stesso box della ripartenza (anche per la PdC ferma nella card Esterna).'],
-    ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra sempre 3 righe da 3 ore a partire da adesso, con la scritta «Oggi»: mai «Domani», nemmeno a sera tarda.'],
+    ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra 3 righe da 3 ore a partire da adesso, sempre con «Oggi», mai «Domani».'],
     ['m', 'Card Smarther stabile', 'Su PC la card ha sempre la stessa altezza, con o senza la riga della ripartenza: niente più saltelli.'],
     ['s', 'Password chiesta a ogni apertura', 'Su iPhone, se l’icona della Home era stata salvata mentre eri sulla pagina di accesso, ogni apertura mostrava il modulo di login anche con la sessione ancora valida (30 giorni). Ora, se sei già dentro, «/login» ti porta subito alla dashboard. Il login, i tentativi massimi e la sicurezza dei cookie non sono cambiati.'],
   ]},
@@ -977,7 +1140,7 @@ const CHANGELOG = [
     ['m', 'Ritocchi ai testi', 'Più coerenti in tutto il pannello e nei messaggi Telegram.'],
     ['m', 'Impostazioni rifatte', 'Campi corti in linea, aiuto sotto ogni campo, riquadri chiusi su due colonne che si ricordano come li hai lasciati.'],
     ['m', 'Più leggero e leggibile', 'Pagine e dati compressi (da 124 a circa 40 KB); nei grafici i periodi senza dati hanno le righe oblique.'],
-    ['s', 'Stato più pronto', '«A riposo» e «Riscaldamento» si aggiornano in 1–2 minuti. Tolto l’avviso «Resistenza elettrica»: l’impianto non ce l’ha.'],
+    ['s', 'Stato più pronto', '«A riposo» e «Riscaldamento» si aggiornano in 1–2 minuti. Tolto l’avviso «Resistenza elettrica»: non c’è nell’impianto.'],
   ]},
   {v: '0.17', quando: '3 novembre 2026', titolo: 'Aggiornare senza fermare i dati', righe: [
     ['n', 'Applica aggiornamento', 'Impostazioni → Stato: le parti di interfaccia entrano a caldo e la lettura dei dati non si ferma mai.'],
@@ -992,26 +1155,26 @@ const CHANGELOG = [
   {v: '0.15', quando: '3 novembre 2026', titolo: 'Un solo grafico per compressore, portata e pompa', righe: [
     ['n', 'Grafico unico', 'Analisi: compressore, pompa e portata insieme, a gradini come arrivano i dati, con i valori al passaggio del mouse.'],
     ['n', 'Richiesta di caldo', 'Una striscia rossa sotto il grafico dello Smarther, con «sì/no» all’ora scelta.'],
-    ['m', 'Compressore da fermo', 'Dashboard: stato «Fermo» e tre riquadri sull’ultimo ciclo (per cosa, durata, energia).'],
+    ['m', 'Compressore da fermo', 'Dashboard: stato «Fermo» e tre riquadri sull’ultimo ciclo: per cosa, quanto dura, quanta energia.'],
     ['m', 'Nota sul ritardo', 'Su una riga ordinata, senza «min» rimasto a capo.'],
     ['s', 'Gas di scarico', 'Compare solo se la pompa lo manda davvero.'],
   ]},
   {v: '0.14', quando: '3 novembre 2026', titolo: 'Umidità in casa: soglie e avvisi', righe: [
     ['n', 'Avvisi sull’umidità', 'Telegram avvisa sopra il 60 % e il 70 %; soglie e attese si cambiano in Impostazioni → Avvisi.'],
-    ['n', 'Riepilogo con la notte', 'Il riepilogo del mattino racconta anche la notte, ma solo se è successo qualcosa.'],
+    ['n', 'Riepilogo con la notte', 'Il riepilogo del mattino racconta anche la notte, ma solo se è successo qualcosa di nuovo.'],
     ['m', 'Colori e soglie', 'L’umidità diventa gialla e rossa in Dashboard, e due linee tratteggiate la accompagnano nel grafico.'],
-    ['m', 'Grafici', 'La potenza è una linea continua a gradini, e al passaggio del mouse ogni linea ha il suo puntino.'],
+    ['m', 'Grafici', 'La potenza è una linea a gradini, e passando il mouse ogni linea ha il suo puntino.'],
   ]},
   {v: '0.13', quando: '3 novembre 2026', titolo: 'Impostazioni in tab', righe: [
-    ['n', 'Sei tab', 'Stato, Collegamenti, Avvisi, Accesso, Dati e Registro; i riquadri si ricordano come li hai lasciati.'],
+    ['n', 'Sei tab', 'Stato, Collegamenti, Avvisi, Accesso, Dati e Registro; i riquadri restano aperti o chiusi come li lasci.'],
     ['n', 'Nuovi riquadri', 'In Dati: litri del bollitore e backup. In Cloudflare: «Invia il link su Telegram».'],
-    ['m', 'Errori chiari', 'Un valore non valido apre il riquadro giusto e si segna in rosso.'],
+    ['m', 'Errori chiari', 'Un valore non valido apre il riquadro giusto, segnato in rosso.'],
     ['m', 'Telefono', 'Dispositivi più ordinato; grafici Smarther rinominati «Temperatura ambiente» e «Umidità»; «acceso da 2 minuti».'],
   ]},
   {v: '0.12', quando: '3 novembre 2026', titolo: 'Confronto, bollitore, registro e ripristino', righe: [
-    ['n', 'Confronta', 'Efficienza: il periodo accanto al precedente di pari durata (COP, energia, calore, cicli).'],
+    ['n', 'Confronta', 'Efficienza: il periodo accanto al precedente, di pari durata: COP, energia, calore e cicli di funzionamento.'],
     ['n', 'Salute del bollitore', 'Quanto calore perde di notte e quanto ci mette a scaldarsi.'],
-    ['n', 'Registro e ripristino', 'Impostazioni → Registro, e il comando «ripristina» per rimettere un backup.'],
+    ['n', 'Registro e ripristino', 'Impostazioni → Registro, e il comando «ripristina» per rimettere un backup salvato.'],
     ['s', 'Più robusto', 'Disco pieno o database non scrivibile non fermano più la raccolta: riprova da sola e lo scrive nel registro.'],
     ['s', 'Più sicuro', 'config.json leggibile solo dal proprietario, login che rifiuta richieste da altri siti, tempo reale di Safari che si ricollega.'],
   ]},
@@ -1027,14 +1190,14 @@ const CHANGELOG = [
   {v: '0.9', titolo: 'Pagina Dispositivi', righe: [
     ['n', 'Pompa e Smarther', 'Modello, versioni, identificativi con «Copia», IP e MAC, stato, storico delle firmware e loghi tuoi.'],
     ['m', 'Si aggiorna da sola', 'Dopo un aggiornamento le pagine rimaste aperte si ricaricano da sole.'],
-    ['s', 'Stato corretto', '«A riposo» non compare più a pompa in marcia per il ritardo dei dati.'],
+    ['s', 'Stato corretto', '«A riposo» non compare più a pompa in marcia, nemmeno per il ritardo dei dati.'],
   ]},
   {v: '0.8', titolo: 'Colori e dettagli', antico: true, righe: [
     ['m', 'Badge di stato', 'A colori pieni, sempre sotto il titolo delle schede.'],
     ['s', 'Acqua calda', 'Non va più in «Standby» durante un ciclo.'],
   ]},
   {v: '≤ 0.7', titolo: 'Come è nato', antico: true, righe: [
-    ['n', 'Il nucleo', 'Lettura della pompa (SmartThings) e dello Smarther (Netatmo), database, decodifica del ciclo.'],
+    ['n', 'Il nucleo', 'Lettura della pompa (SmartThings) e dello Smarther (Netatmo), database e decodifica del ciclo.'],
     ['n', 'Il sito', 'Server web con login, Dashboard con curva climatica, tempo reale, modalità demo.'],
     ['n', 'Analisi ed Efficienza', 'Grafici sincronizzati, COP stimato, energia al giorno, cicli.'],
     ['n', 'Telegram', 'Avvisi sulle anomalie e riepilogo del mattino.'],
@@ -1042,11 +1205,11 @@ const CHANGELOG = [
   ]},
 ];
 
+const clRiga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;   // una riga del Changelog (Pannello e Plugin)
 function disegnaChangelogPannello() {
-  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
   const voce = (c, attuale) => `<section class="cl-v${attuale ? ' att' : ''}"><div class="cl-h"><span class="cl-n">${esc(c.v)}</span>` +
     `${attuale ? '<span class="pill en">Attuale</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.quando ? `<span class="cl-d">${esc(c.quando)}</span>` : ''}</div>` +
-    `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+    `<ul>${c.righe.map(clRiga).join('')}</ul></section>`;
   const recenti = CHANGELOG.filter((c, k) => k < 3), prima = CHANGELOG.filter((c, k) => k >= 3 && !c.antico), antiche = CHANGELOG.filter(c => c.antico);
   const breve = `<div class="cl-breve"><div class="eti">In breve</div>${CL_BREVE.map(b => `<div class="cl-bi">${CL_IC[b[0]] ? `<span class="cl-ic">${CL_IC[b[0]]}</span>` : iconaMeteo(b[0], 22)}<span><b>${esc(b[1])}</b> ${esc(b[2])}</span></div>`).join('')}</div>`;
   return `${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
@@ -1069,12 +1232,11 @@ function disegnaChangelogPlugin() {
   const voci = [];
   for (const p of plug) if (!filtro || p.nome === filtro) for (const c of p.changelog) voci.push({p, c});
   voci.sort((a, b) => (b.c.data || '').localeCompare(a.c.data || ''));   // stabile: a pari data resta l'ordine del plugin
-  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
   const corpo = voci.map(({p, c}) => {
     const att = c.v === p.versione;
     return `<section class="cl-v${att ? ' att' : ''}"><div class="cl-h">${filtro ? '' : `<span class="pill up">${esc(p.titolo)}</span>`}<span class="cl-n">${esc(c.v)}</span>` +
       `${att ? '<span class="pill en">Installato</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.data ? `<span class="cl-d">${esc(dataIt(c.data))}</span>` : ''}</div>` +
-      `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+      `<ul>${c.righe.map(clRiga).join('')}</ul></section>`;
   }).join('');
   return `${chips}<div class="cl-tl">${corpo}</div>`;
 }
@@ -1087,8 +1249,7 @@ function vistaChangelog() {
 }
 async function caricaChangelogPlugin() {
   try {
-    const r = await fetch('/api/plugin/changelog', {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson('/api/plugin/changelog'); if (!r) return;
     clDati = r.ok ? await r.json() : {plugin: []};
   } catch (e) { clDati = {plugin: []}; }
   if (S.pagina === 'changelog' && S.sub === 'plugin') { const y = window.scrollY; vistaChangelog(); window.scrollTo(0, y); }
@@ -1134,24 +1295,25 @@ function cardBollitore(d) {
   const b = d.bollitore, pb = S.confronto && d.prec && d.prec.completo ? d.prec.bollitore : null;
   const conf = (v, fmtv) => pb === undefined || !S.confronto || !d.prec || !d.prec.completo ? '' : `<small class="conf-t">${v == null ? 'Prima: dati insufficienti' : 'Prima ' + fmtv(v)}</small>`;
   const t = (et, val, sub, cf) => `<div class="tile"><small>${et}</small><b>${val}</b>${sub ? `<small>${sub}</small>` : ''}${cf || ''}</div>`;
-  const p = b && b.perdita, sa = b && b.salita, pp_ = pb && pb.perdita, ps = pb && pb.salita;
-  const tiles = (p ? t('Perdita a riposo, di notte', num(p.gradi_ora, 2) + ' °C/h', `circa ${num(p.watt, 0)} W · ${p.notti} notti`,
-      conf(pp_ ? pp_.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita a riposo, di notte', '—', 'servono almeno 2 notti senza acqua calda'))
+  const p = b && b.perdita, sa = b && b.salita, g = b && b.giorno, pp_ = pb && pb.perdita, ps = pb && pb.salita, pg = pb && pb.giorno;
+  const tiles = (p ? t('Perdita di notte', num(p.gradi_ora, 2) + ' °C/h', `circa ${num(p.watt, 0)} W · ${p.notti} notti`,
+      conf(pp_ ? pp_.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita di notte', '—', 'servono almeno 2 notti senza acqua calda'))
+    + (g ? t('Perdita di giorno', num(g.gradi_ora, 2) + ' °C/h', `circa ${num(g.watt, 0)} W · ${num(g.ore, 1)} ore`,
+      conf(pg ? pg.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita di giorno', '—', 'servono almeno 2 ore tranquille'))
     + (sa ? t('Tempo per salire di 10 °C', durata(sa.min_per_10), `${num(sa.gradi_ora, 1)} °C/h · ${sa.cicli} cicli`,
       conf(ps ? ps.min_per_10 : null, v => durata(v))) : t('Tempo per salire di 10 °C', '—', 'servono almeno 2 cicli completi'))
     + (sa ? t('Ciclo tipico', '+' + num(sa.gradi, 1) + ' °C', `in ${durata(sa.minuti)}`, conf(ps ? ps.gradi : null, v => '+' + num(v, 1) + ' °C')) : '');
   return `<article class="card"><h2>Salute del bollitore</h2><div class="tiles tc c-acs">${tiles}</div>
     <ul class="nota-cv"><li><i class="in"></i><span>Stime dalla sonda dell'acqua calda (${b ? b.litri : 300} litri). Sono indicazioni, non diagnosi. <button type="button" class="come-b" data-come="boll" aria-expanded="false">Come leggerli</button></span></li></ul>
-    <p class="come-t" id="come-boll" hidden>La <b>perdita</b> dice quanto si raffredda l'acqua del bollitore di notte, quando non la usa nessuno e la pompa non la scalda (si guarda il tratto più lungo tra le 23 e le 6). Se col tempo aumenta, può esserci un problema di isolamento o di ricircolo. Il <b>tempo per salire di 10 °C</b> dice quanto ci mette la pompa a scaldare l'acqua di 10 gradi: se si allunga, la pompa rende meno oppure c'è più acqua da scaldare.</p></article>`;
+    <p class="come-t" id="come-boll" hidden>La <b>perdita</b> dice quanto si raffredda l'acqua del bollitore quando la pompa non la scalda: di notte si guarda il tratto più lungo tra le 23 e le 6, di giorno (6–23) solo i tratti tranquilli di almeno un’ora, senza docce o rubinetti aperti, quindi ce ne sono meno e il valore è meno preciso. Il confronto tra i due mostra quanto pesano i consumi e il ricircolo. Se col tempo aumenta, può esserci un problema di isolamento o di ricircolo. Il <b>tempo per salire di 10 °C</b> dice quanto ci mette la pompa a scaldare l'acqua di 10 gradi: se si allunga, la pompa rende meno oppure c'è più acqua da scaldare.</p></article>`;
 }
 // Costo del mese in corso (non dipende dal periodo scelto): stima a fine mese e confronto col mese scorso
 function meseCosto(m) {
   if (!m) return '';
-  const MES = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
-  return `<article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Costo di ${MES[m.mese - 1]}</span></div>
+  return `<article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Costo di ${MESI_IT[m.mese - 1]}</span></div>
       <div class="val"><div class="n"><span>${euro(m.euro)}</span></div></div>
-      <div class="sub">${m.stima_euro != null ? `<span>Stima a fine mese <b>${euro(m.stima_euro)}</b></span>` : ''}${m.scorso_euro != null ? `<span>${MES[m.mese_scorso - 1]} <b>${euro(m.scorso_euro)}</b></span>` : ''}</div>
-      <div class="nota">Stima: media dei giorni passati, indicativa.</div></article>`;
+      <div class="sub">${m.stima_euro != null ? `<span>Stima a fine mese <b>${euro(m.stima_euro)}</b></span>` : ''}${m.scorso_euro != null ? `<span>${MESI_IT[m.mese_scorso - 1]} <b>${euro(m.scorso_euro)}</b></span>` : ''}</div>
+      <div class="nota">Stima: media dei giorni passati, indicativa.${m.dettaglio ? ' <span class="come-b" data-come="eurm" role="button" tabindex="0" aria-expanded="false">Dettaglio</span>' : ''}</div>${m.dettaglio ? `<p class="come-t" id="come-eurm" hidden><span class="nw">Riscaldamento <b>${euro(m.dettaglio.casa)}</b></span><span class="nw">Acqua calda <b>${euro(m.dettaglio.acs)}</b></span><span class="nw">Standby <b>${euro(m.dettaglio.riposo)}</b></span></p>` : ''}</article>`;
 }
 const ICONA_SCARICA = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg>';
 function disegnaEfficienza(d) {
@@ -1169,7 +1331,7 @@ function disegnaEfficienza(d) {
       <div class="sub"><span>Risc. <b>${cop(t.cop_casa)}</b></span><span>Acqua <b>${cop(t.cop_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
     <article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Energia elettrica</span></div>
       <div class="val"><div class="n"><span>${fm(t.el_casa + t.el_acs + t.el_riposo)}</span><i>kWh</i></div></div>
-      <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span>Costo stimato <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
+      <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span><span class="come-b" data-come="eur" role="button" tabindex="0" aria-expanded="false">Costo stimato</span> <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${d.prezzo_kwh > 0 ? `<p class="come-t" id="come-eur" hidden><span class="nw">Riscaldamento <b>${euro(t.el_casa * d.prezzo_kwh)}</b></span><span class="nw">Acqua calda <b>${euro(t.el_acs * d.prezzo_kwh)}</b></span><span class="nw">Standby <b>${euro(t.el_riposo * d.prezzo_kwh)}</b></span></p>` : ''}${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
     ${meseCosto(d.mese)}
     <article class="card acc" style="--acc:var(--casa)"><div class="ch"><span class="et">Calore prodotto (stima)</span></div>
       <div class="val"><div class="n"><span>${fm(t.calore_casa + t.calore_acs)}</span><i>kWh</i></div></div>
@@ -1193,7 +1355,7 @@ function disegnaEfficienza(d) {
   </div>
   ${cardBollitore(d)}
   <article class="card"><h2>Esporta per Excel</h2><div class="exp">
-    <a href="/api/esporta.csv?tipo=giorni&giorni=${d.n_giorni}" download>${ICONA_SCARICA}<span><b>Riepilogo per giorno</b><small>${d.n_giorni} giorni, una riga al giorno</small></span></a>
+    <a href="/api/esporta.csv?tipo=giorni&giorni=${d.n_giorni}" download>${ICONA_SCARICA}<span><b>Riepilogo per giorno</b><small>${d.n_giorni === 1 ? 'oggi, una riga' : d.n_giorni + ' giorni, una riga al giorno'}</small></span></a>
     <a href="/api/esporta.csv?tipo=misure&giorni=7" download>${ICONA_SCARICA}<span><b>Dati grezzi</b><small>ultimi 7 giorni, ogni misura</small></span></a>
   </div></article>`;
   const box = $('#eff'); const f = JSON.stringify([d.ora, d.n_giorni, box.clientWidth]);
@@ -1250,7 +1412,7 @@ function barreGiorni(giorni, W, tip, tel) {
   let L = 34, pw = W - L - R;
   const tot = g => g.el_casa + g.el_acs + g.el_riposo, mx = Math.max(1, ...giorni.map(tot), ...(tip ? Object.values(tip).map(t => t.el) : []));
   const sc = scalaNice(0, mx, 4); sc.lo = 0;
-  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
+  L = larghezzaNumeriY(sc, tel); pw = W - L - R;
   const Y = v => T + ph - v / sc.hi * ph, bw = Math.min(46, pw / n * 0.7), cx = i => L + pw / n * (i + 0.5);
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="en">`;
   EF.en = {xs: giorni.map((_, i) => cx(i)), lab: giorni.map(giornoBreve), L, pw, T,
@@ -1258,7 +1420,7 @@ function barreGiorni(giorni, W, tip, tel) {
     seg: (i, yy) => { const g = giorni[i]; let y0 = Y(0);
       for (const [k, nome] of [['el_riposo', 'Standby'], ['el_acs', 'Acqua'], ['el_casa', 'Risc.']]) { const h = g[k] / sc.hi * ph; if (yy >= y0 - h || k === 'el_riposo' && yy >= y0) return `${nome} ${num(g[k], 1)} kWh`; y0 -= h; }
       return null; }};
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  s += grigliaY(sc, Y, L, W, R);
   giorni.forEach((g, i) => {
     let y = Y(0);
     [['el_riposo', '#3a4558'], ['el_acs', COLS.acs], ['el_casa', COLS.casa]].forEach(([k, c]) => {
@@ -1283,11 +1445,11 @@ function lineeGiorni(giorni, W, tip, tel) {
   let L = 34, pw = W - L - R;
   const vals = giorni.flatMap(g => [g.cop_casa, g.cop_acs, ...(tip && tip[g.giorno] ? [tip[g.giorno].cop_casa, tip[g.giorno].cop_acs] : [])]).filter(v => v != null);
   const sc = scalaNice(0, Math.max(5, ...(vals.length ? vals : [0])), 5); sc.lo = 0;
-  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
+  L = larghezzaNumeriY(sc, tel); pw = W - L - R;
   const Y = v => T + ph - v / sc.hi * ph, X = i => n === 1 ? L + pw / 2 : L + pw * i / (n - 1);
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="cop">`;
   EF.cop = {xs: giorni.map((_, i) => X(i)), lab: giorni.map(giornoBreve), L, pw, T, dots: i => ['cop_casa', 'cop_acs'].map(k => giorni[i][k] == null ? null : Y(giorni[i][k]))};
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  s += grigliaY(sc, Y, L, W, R);
   giorni.forEach((g, i) => { if (n <= 10 || i % Math.ceil(n / 7) === 0) s += `<text x="${X(i).toFixed(1)}" y="${H - 7}" text-anchor="${i === n - 1 && n > 1 ? 'end' : 'middle'}">${giornoBreve(g)}</text>`; });
   [['cop_casa', COLS.casa], ['cop_acs', COLS.acs]].forEach(([k, c]) => {
     let p = '', prec = false;
@@ -1311,13 +1473,13 @@ function curvaCop(bins, W, tel) {
   if (!tutti.length) return '<div class="vuoto">Servono più ore di funzionamento per questo grafico.</div>';
   const x0 = Math.min(...tutti.map(b => b.da)), x1 = Math.max(...tutti.map(b => b.a)), mx = Math.max(5, ...tutti.map(b => b.cop));
   const sc = scalaNice(0, mx, 5); sc.lo = 0;
-  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
+  L = larghezzaNumeriY(sc, tel); pw = W - L - R;
   const X = t => L + (t - x0) / Math.max(1, x1 - x0) * pw, Y = v => T + ph - v / sc.hi * ph;
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="bin">`;
   const das = [...new Set(tutti.map(b => b.da))].sort((a, b) => a - b);
   EF.bin = {bins: das, xs: das.map(t => X(t + 1)), lab: das.map(t => `${t}…${t + 2} °C`), L, pw, T,
     dots: i => ['casa', 'acs'].map(m => { const b = bins[m].find(x => x.da === das[i]); return b ? Y(b.cop) : null; })};
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  s += grigliaY(sc, Y, L, W, R);
   for (let t = Math.ceil(x0 / 2) * 2; t <= x1; t += (x1 - x0 > 20 ? 5 : 2)) s += `<text x="${X(t).toFixed(1)}" y="${H - 16}" text-anchor="${X(t) > W - 14 ? 'end' : 'middle'}">${t}°</text>`;
   s += `<text x="${(L + pw / 2).toFixed(1)}" y="${H - 2}" text-anchor="middle" class="ass">Temperatura esterna</text>`;
   [['casa', COLS.casa], ['acs', COLS.acs]].forEach(([k, c]) => {
@@ -1398,34 +1560,240 @@ function schedaDisp(s, d) {
     ${s.gruppi.map(g => `<section class="dev-gr"><h3 class="eti">${esc(g.titolo)}</h3>${g.righe.map(r => rigaDisp(r, d)).join('')}</section>`).join('')}
   </article>`;
 }
-const TAB_DISP = [['', 'Dispositivi'], ['installatore', 'Installatore']];
+const TAB_DISP = [['', 'Dispositivi'], ['installatore', 'Regolazioni']];
 const tabsDisp = () => `<nav class="sub-tabs" aria-label="Sezioni">${TAB_DISP.map(([k, t]) => `<a href="#/dispositivi${k ? '/' + k : ''}" class="${S.sub === k || (k === '' && S.sub !== 'installatore') ? 'on' : ''}">${t}</a>`).join('')}</nav>`;
 S.fsvAperti = S.fsvAperti || new Set(['20']);
 document.addEventListener('toggle', e => {
   const g = e.target && e.target.dataset && e.target.dataset.fsv; if (!g) return;
   if (e.target.open) S.fsvAperti.add(g); else S.fsvAperti.delete(g);
 }, true);
+// ---- impostazioni installatore: lettura, cronologia e modifica (lucchetto di 30 s, poi matita, poi conferma) ----
+// la matita ✎ sulla riga: attiva solo con le modifiche sbloccate e da casa
+const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo da casa' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
+S.sbloccoFsv = S.sbloccoFsv || 0; S.fsvMod = S.fsvMod || null; S.fsvVal = S.fsvVal || ''; S.fsvErr = S.fsvErr || ''; S.fsvOcc = false;
+function armaSbloccoFsv() { clearTimeout(S.tLockFsv); S.sbloccoFsv = Date.now() + 30000; S.tLockFsv = setTimeout(() => { S.sbloccoFsv = 0; S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = false; S.boostErr = ''; ridisegnaInstallatore(); }, 30200); }
+function ridisegnaInstallatore() { if (S.dati && S.pagina === 'dispositivi' && S.sub === 'installatore') disegnaDispositivi(S.dati); }
+function trovaFsv(id) { const i = S.dati && S.dati.installatore; if (!i) return null; for (const g of i.gruppi) { const r = g.righe.find(x => x.id === id); if (r) return r; } return null; }
+function editorFsv(r) {
+  const campo = r.opzioni
+    ? `<select data-fsv-val aria-label="Nuovo valore di ${esc(r.id)}">${r.opzioni.map(([k, t]) => `<option value="${k}" ${String(k) === String(S.fsvVal) ? 'selected' : ''}>${esc(t)} · ${k}</option>`).join('')}</select>`
+    : `<input type="number" inputmode="numeric" step="1" min="${r.lo}" max="${r.hi}" data-fsv-val value="${esc(S.fsvVal)}" aria-label="Nuovo valore di ${esc(r.id)}"> <span class="mut">${esc(r.unita)}</span>`;
+  return `<div class="fsv-edit"><div class="fe-t">Modifica ${esc(r.id)} · ${esc(r.nome)}</div>
+    <div class="fe-r"><span class="mut">Ora</span><b>${esc(r.v)}</b></div>
+    <div class="fe-r"><span class="mut">Nuovo valore</span><span>${campo}</span></div>
+    ${r.nota ? `<small class="mut">${esc(r.nota)}</small>` : ''}
+    ${r.limiti ? `<small class="mut">Limiti del manuale: ${esc(r.limiti)}</small>` : ''}
+    <small class="mut">Il valore parte dal pannello alla pompa tramite SmartThings. Poi va riletto: finché la pompa non lo conferma, la riga dice «in attesa».</small>
+    ${S.fsvErr ? `<div class="fe-err">${esc(S.fsvErr)}</div>` : ''}
+    <div class="fe-b"><button type="button" class="sec piccolo" data-fsv-annulla ${S.fsvOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-fsv-conf ${S.fsvOcc ? 'disabled' : ''}>${S.fsvOcc ? 'Invio…' : 'Cambia nella pompa'}</button></div></div>`;
+}
 function rigaFsv(r) {
+  const sbl = Date.now() < S.sbloccoFsv;
   const fuori = r.fuori ? ' <span class="pill bad" title="Fuori dai limiti indicati dal manuale">fuori limiti</span>' : '';
   const note = [];
   if (r.limiti) note.push(esc(r.limiti));
-  const cambio = r.cambio ? `<small class="mut nota-r">cambiato il ${esc(dataLunga(r.cambio.ts))} (prima: ${esc(r.cambio.prima)})</small>` : '';
-  return `<div class="riga"><span><i class="fsv-id">${esc(r.id)}</i>${esc(r.nome)}</span><b><span class="val-c">${esc(r.v)}${fuori}</span>${note.length ? `<small class="mut nota-r">${note.join(' · ')}</small>` : ''}${cambio}</b></div>`;
+  const cambio = r.cambio ? `<small class="mut nota-r">visto cambiato il ${esc(dataLunga(r.cambio.ts))} (prima: ${esc(r.cambio.prima)})</small>` : '';
+  const attesa = r.attesa ? `<small class="nota-r in-attesa">in attesa: richiesto ${esc(r.attesa.dopo)} alle ${esc(hhmm(r.attesa.ts))}${r.attesa.vecchia ? ', la pompa non l’ha ancora confermato (controlla sul suo pannello)' : ''}</small>` : '';
+  const matita = r.modificabile && !S.fuori ? bottoneMatita(`data-fsv-mod="${esc(r.id)}"`, sbl, S.fsvOcc, `Modifica ${esc(r.id)}`, 'Modifica questa impostazione') : '';
+  const riga = `<div class="riga"><span><i class="fsv-id">${esc(r.id)}</i>${esc(r.nome)}</span><b><span class="val-c">${esc(r.v)}${fuori}</span>${note.length ? `<small class="mut nota-r nw">${note.join(' · ')}</small>` : ''}${cambio}${attesa}</b>${matita}</div>`;
+  return riga + (sbl && S.fsvMod === r.id ? editorFsv(r) : '');
+}
+const PER_PAG_FSV = 6;
+function cronologiaFsv(lista) {
+  if (!lista || !lista.length) return `<article class="card dev"><div class="ch"><h2>Cronologia modifiche</h2></div><p class="nota-sez">Nessun cambio visto da quando il pannello osserva.</p></article>`;
+  const pagine = Math.ceil(lista.length / PER_PAG_FSV);
+  S.pagFsv = Math.min(Math.max(S.pagFsv || 0, 0), pagine - 1);
+  const righe = lista.slice(S.pagFsv * PER_PAG_FSV, (S.pagFsv + 1) * PER_PAG_FSV).map(v => {
+    const fonte = v.fonte === 'pannello'
+      ? (v.stato === 'in attesa' ? `chiesto dal pannello, in attesa della pompa` : v.stato === 'non confermata' ? `chiesto dal pannello, la pompa non l’ha confermato` : v.stato ? 'chiesto dal pannello (già a quel valore)' : `cambiato dal pannello${v.ip ? ' (' + esc(v.ip) + ')' : ''}`)
+      : 'letto dalla pompa';
+    return `<div class="riga"><span>${esc(dataLunga(v.ts))}</span><b>${esc(v.id)} · ${esc(v.nome)}<small class="mut nota-r">${esc(v.prima)} → ${esc(v.dopo)}</small><small class="mut nota-r">${fonte}</small></b></div>`;
+  }).join('');
+  const nav = pagNav('pagFsv', pagine);
+  return `<article class="card dev"><div class="ch"><h2>Cronologia modifiche</h2></div>
+    <p class="nota-sez">I cambi che il pannello ha visto nelle impostazioni, con il valore di prima. La data è quella in cui il pannello ha visto il valore nuovo: SmartThings può essere in ritardo rispetto alla pompa.</p>${righe}${nav}</article>`;
 }
 function disegnaInstallatore(d) {
-  const i = d.installatore;
-  if (!i || !i.totale) return `<article class="card dev"><div class="vuoto">La pompa non ha ancora comunicato impostazioni installatore. Appena SmartThings le manda, compaiono qui (il pannello le legge ogni ora circa).</div></article>`;
+  S.fuori = d.da_casa === false;     // da fuori casa: FSV, temperatura/modo dell'acqua e boost restano bloccati
+  const i = d.installatore, testa = cardRegolazioni(d);
+  if (!i || !i.totale) return testa + `<article class="card dev"><div class="vuoto">La pompa non ha ancora comunicato impostazioni installatore. Appena SmartThings le manda, compaiono qui (il pannello le legge ogni ora circa).</div></article>`;
   const testo = i.gruppi.map(g => `${g.titolo}\n` + g.righe.map(r => `${r.id}  ${r.nome}: ${r.v}`).join('\n')).join('\n\n');
   const sommario = [`<b>${i.totale}</b> impostazioni`, i.cambiati ? `<b>${i.cambiati}</b> cambiate da quando il pannello osserva` : '', i.fuori ? `<b class="rosso">${i.fuori}</b> fuori limiti` : '', i.letto ? `lette ${esc(fa(i.letto))}` : ''].filter(Boolean).join(' · ');
-  return `<article class="card dev">
-    <div class="ch"><h2>Impostazioni installatore</h2><button type="button" class="copia" data-copia="${esc(testo)}" title="Copia tutto l'elenco">Copia elenco</button></div>
+  return testa + `<article class="card dev">
+    <div class="ch"><h2>Impostazioni installatore (FSV)</h2><span class="ch-b"><button type="button" class="copia" data-copia="${esc(testo)}" title="Copia tutto l'elenco">Copia elenco</button></span></div>
     <p class="nota-sez">${sommario}</p>
-    <p class="nota-sez">Sola lettura: da qui non si cambia nulla. Sono i valori che la pompa comunica tramite SmartThings (i codici FSV del manuale). L'intervallo sotto ogni valore è quello del manuale Samsung EHS Mono e può variare da modello a modello.</p>
-  </article>` + i.gruppi.map(g => `<details class="card dev fsv-gr" data-fsv="${esc(g.id)}" ${S.fsvAperti.has(g.id) ? 'open' : ''}><summary><span class="t">${esc(g.titolo)}</span><span class="d">${g.righe.length} impostazioni</span></summary>${g.righe.map(rigaFsv).join('')}</details>`).join('');
+    <p class="nota-sez">Sono i valori che la pompa comunica tramite SmartThings (i codici FSV del manuale). L'intervallo sotto ogni valore è quello del manuale Samsung EHS Mono e può variare da modello a modello. ${S.fuori ? '' : 'Per cambiarne uno: «Sblocca modifiche» in alto, la matita ✎ della riga, il nuovo valore e la conferma.'}</p>
+  </article>` + i.gruppi.map(g => `<details class="card dev fsv-gr" data-fsv="${esc(g.id)}" ${S.fsvAperti.has(g.id) || (S.fsvMod && g.righe.some(r => r.id === S.fsvMod)) ? 'open' : ''}><summary><span class="t">${esc(g.titolo)}</span><span class="d">${g.righe.length} impostazioni</span></summary>${g.righe.map(rigaFsv).join('')}</details>`).join('') + cronologiaFsv(i.cronologia);
 }
+// pagine «‹ 1 di N ›» (cronologia FSV e registro comandi): chiave = campo di S che tiene la pagina corrente
+const pagNav = (k, tot) => tot > 1 ? `<div class="pager"><button type="button" data-pag="${k}:-1" ${S[k] === 0 ? 'disabled' : ''} aria-label="Più recenti">‹</button><span>${S[k] + 1} di ${tot}</span><button type="button" data-pag="${k}:1" ${S[k] >= tot - 1 ? 'disabled' : ''} aria-label="Meno recenti">›</button></div>` : '';
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('[data-pag]'); if (!b || b.disabled) return;
+  const [k, d] = b.dataset.pag.split(':'); S[k] = (S[k] || 0) + Number(d);
+  disegna();
+});
+document.addEventListener('click', e => {
+  const t = e.target;
+  if (!t.closest) return;
+  if (t.closest('#b-lock-fsv')) {
+    clearTimeout(S.tLockFsv);
+    if (Date.now() < S.sbloccoFsv) { S.sbloccoFsv = 0; S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; } else armaSbloccoFsv();
+    ridisegnaInstallatore(); return;
+  }
+  const m = t.closest('[data-fsv-mod]');
+  if (m && !m.disabled) {
+    const r = trovaFsv(m.dataset.fsvMod); if (!r) return;
+    S.regMod = null; S.regErr = ''; S.fsvMod = r.id; S.fsvErr = ''; S.fsvVal = r.n == null ? '' : String(r.n);
+    armaSbloccoFsv(); ridisegnaInstallatore(); return;
+  }
+  if (t.closest('[data-fsv-annulla]')) { S.fsvMod = null; S.fsvErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+  if (t.closest('[data-fsv-conf]')) confermaFsv();
+});
+async function confermaFsv() {
+  const r = trovaFsv(S.fsvMod); if (!r || S.fsvOcc) return;
+  const nuovo = Number(String(S.fsvVal).replace(',', '.'));
+  const err = m => { S.fsvErr = m; armaSbloccoFsv(); ridisegnaInstallatore(); };
+  if (S.fsvVal === '' || !Number.isFinite(nuovo)) return err('Scrivi o scegli un valore.');
+  if (nuovo !== Math.round(nuovo)) return err('Queste impostazioni vanno a numeri interi.');
+  if (nuovo === r.n) return err('È già a questo valore.');
+  if (!r.opzioni && (nuovo < r.lo || nuovo > r.hi)) return err('Fuori dai limiti del manuale (' + r.limiti + ').');
+  const opz = r.opzioni && r.opzioni.find(o => Number(o[0]) === nuovo);
+  const descr = opz ? `${opz[1]} · ${nuovo}` : `${nuovo} ${r.unita}`.trim();
+  armaSbloccoFsv();
+  if (!window.confirm(`Stai per cambiare un'impostazione installatore della pompa di calore.\n\n${r.id} · ${r.nome}\nOra: ${r.v}\nNuovo: ${descr}\n\nUn valore sbagliato può far lavorare male la pompa. Confermi?`)) return;
+  inviaOp('fsv', '/api/fsv', {codice: r.id, valore: nuovo}, `${r.id}: modifica inviata, aspetto che la pompa la confermi`, () => { S.fsvMod = null; }, 'Modifica non riuscita', 'la modifica è partita, controlla la cronologia');
+}
+// invio di un cambio alla pompa (FSV, regolazione, boost): k = prefisso dello stato in S (fsv/reg/boost: Occ = in corso, Err = messaggio)
+async function inviaOp(k, url, corpo, okMsg, fine, erroreDef, partito) {
+  S[k + 'Occ'] = true; S[k + 'Err'] = ''; ridisegnaInstallatore();
+  try {
+    const x = await inviaPost(url, corpo);
+    if (x.ok) { toast(okMsg); fine(); carica(); }
+    else { S[k + 'Err'] = x.errore || erroreDef; toast(erroreDef, true); }
+  } catch { S[k + 'Err'] = `Il pannello non risponde: non so se ${partito}.`; toast('Il pannello non risponde', true); }
+  S[k + 'Occ'] = false; armaSbloccoFsv(); ridisegnaInstallatore();
+}
+// ---- regolazioni: temperatura e modo dell'acqua calda, modo della pompa (stesso lucchetto degli FSV) ----
+S.regMod = S.regMod || null; S.regVal = S.regVal || ''; S.regErr = S.regErr || ''; S.regOcc = false;
+function trovaReg(cosa) { return S.dati && S.dati.regolazioni ? S.dati.regolazioni[cosa] : null; }
+function editorReg(r) {
+  const opz = r.opzioni && r.opzioni.find(o => String(o[0]) === String(S.regVal));
+  const campo = r.opzioni
+    ? `<select data-reg-val aria-label="Nuovo valore: ${esc(r.nome)}">${r.opzioni.map(o => `<option value="${esc(o[0])}" ${String(o[0]) === String(S.regVal) ? 'selected' : ''}>${esc(o[1])}</option>`).join('')}</select>`
+    : `<input type="number" inputmode="numeric" step="1" min="${r.lo}" max="${r.hi}" data-reg-val value="${esc(S.regVal)}" aria-label="Nuovo valore: ${esc(r.nome)}"> <span class="mut">${esc(r.unita)}</span>`;
+  return `<div class="fsv-edit"><div class="fe-t">Modifica · ${esc(r.nome)}</div>
+    <div class="fe-r"><span class="mut">Ora</span><b>${esc(r.testo)}</b></div>
+    <div class="fe-r"><span class="mut">Nuovo valore</span><span>${campo}</span></div>
+    ${r.lo != null ? `<small class="mut">Limiti della pompa: da ${r.lo} a ${r.hi} ${esc(r.unita)}</small>` : ''}
+    ${opz && opz[2] ? `<small class="avviso-reg">${esc(opz[2])}</small>` : ''}
+    <small class="mut">Il comando parte dal pannello alla pompa tramite SmartThings. Poi va riletto: finché la pompa non lo conferma, la riga dice «in attesa».</small>
+    ${S.regErr ? `<div class="fe-err">${esc(S.regErr)}</div>` : ''}
+    <div class="fe-b"><button type="button" class="sec piccolo" data-reg-annulla ${S.regOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-reg-conf ${S.regOcc ? 'disabled' : ''}>${S.regOcc ? 'Invio…' : 'Cambia nella pompa'}</button></div></div>`;
+}
+function rigaReg(r) {
+  if (!r) return '';
+  const sbl = Date.now() < S.sbloccoFsv;
+  const attesa = r.attesa ? `<small class="nota-r in-attesa">in attesa: richiesto ${esc(r.attesa.dopo)} alle ${esc(hhmm(r.attesa.ts))}, la pompa non l’ha ancora confermato</small>` : '';
+  const matita = r.modificabile && !S.fuori ? bottoneMatita(`data-reg-mod="${esc(r.cosa)}"`, sbl, S.regOcc, `Modifica: ${esc(r.nome)}`, 'Modifica') : '';
+  return `<div class="riga"><span>${esc(r.nome)}</span><b><span class="val-c">${esc(r.testo)}</span>${attesa}</b>${matita}</div>` + (sbl && S.regMod === r.cosa ? editorReg(r) : '');
+}
+function cardRegolazioni(d) {
+  const g = d.regolazioni; if (!g) return '';
+  const sbl = Date.now() < S.sbloccoFsv;
+  const lock = S.fuori ? '' : `<span class="ch-b"><button type="button" class="sec piccolo ${sbl ? 'sbloccato' : ''}" id="b-lock-fsv">${sbl ? 'Modifiche sbloccate · Blocca' : 'Sblocca modifiche'}</button></span>`;
+  const testo = S.fuori ? 'Qui sotto i valori attuali della pompa.'
+    : 'Per cambiare un valore (qui sotto o negli FSV): «Sblocca modifiche» (restano sbloccate 30 secondi dall’ultima azione), la matita ✎, il nuovo valore e la conferma. La pompa deve poi comunicare il valore nuovo: SmartThings può metterci un po’, e finché non lo fa la riga dice «in attesa».';
+  const avviso = S.fuori ? '<div class="avviso warn"><span>⚠️</span><div>Sei collegato da fuori casa: le modifiche (FSV, acqua calda, Boost, modo della pompa) si fanno solo dalla rete di casa.</div></div>' : '';
+  return `<article class="card dev"><div class="ch"><h2>Regolazioni</h2>${lock}</div>
+    <p class="nota-sez">${testo}</p></article>${avviso}
+    <article class="card dev"><div class="ch"><h2>Acqua calda</h2></div>${rigaReg(g.acs_setpoint)}${rigaReg(g.acs_modo)}${rigaBoost(d.boost)}</article>
+    <article class="card dev"><div class="ch"><h2>Pompa</h2></div>${rigaReg(g.pompa_modo)}<p class="nota-sez">Il modo «Riscaldamento» è quello giusto d’inverno; «Raffrescamento» serve d’estate.</p></article>`;
+}
+async function confermaReg() {
+  const r = trovaReg(S.regMod); if (!r || S.regOcc) return;
+  const err = m => { S.regErr = m; armaSbloccoFsv(); ridisegnaInstallatore(); };
+  let valore = S.regVal, descr, avviso = '';
+  if (r.opzioni) {
+    const o = r.opzioni.find(x => String(x[0]) === String(valore)); if (!o) return err('Scegli un valore.');
+    descr = o[1]; avviso = o[2] || '';
+    if (String(o[0]) === String(r.valore)) return err('È già a questo valore.');
+  } else {
+    const n = Number(String(valore).replace(',', '.'));
+    if (valore === '' || !Number.isFinite(n)) return err('Scrivi un valore.');
+    if (n !== Math.round(n)) return err('La temperatura va a gradi interi.');
+    if (n < r.lo || n > r.hi) return err(`Fuori dai limiti della pompa (da ${r.lo} a ${r.hi} ${r.unita}).`);
+    if (n === Number(r.valore)) return err('È già a questo valore.');
+    valore = n; descr = `${n} ${r.unita}`;
+  }
+  armaSbloccoFsv();
+  if (!window.confirm(`Stai per cambiare una regolazione della pompa di calore.\n\n${r.nome}\nOra: ${r.testo}\nNuovo: ${descr}\n${avviso ? '\n' + avviso + '\n' : ''}\nConfermi?`)) return;
+  inviaOp('reg', '/api/regolazioni', {cosa: r.cosa, valore}, `${r.nome}: comando inviato, aspetto che la pompa lo confermi`, () => { S.regMod = null; }, 'Comando non riuscito', 'il comando è partito, controlla più tardi');
+}
+document.addEventListener('click', e => {
+  const t = e.target; if (!t.closest) return;
+  const m = t.closest('[data-reg-mod]');
+  if (m && !m.disabled) {
+    const r = trovaReg(m.dataset.regMod); if (!r) return;
+    S.fsvMod = null; S.fsvErr = ''; S.boostApri = false; S.regMod = r.cosa; S.regErr = '';
+    S.regVal = r.opzioni ? String(r.valore) : (r.valore == null ? '' : String(r.valore));
+    armaSbloccoFsv(); ridisegnaInstallatore(); return;
+  }
+  if (t.closest('[data-reg-annulla]')) { S.regMod = null; S.regErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+  if (t.closest('[data-reg-conf]')) confermaReg();
+});
+// il campo del valore nuovo (FSV, regolazione, boost): si tiene nello stato S mentre lo scrivi
+for (const ev of ['input', 'change']) document.addEventListener(ev, e => {
+  const t = e.target, k = t.matches && ['fsv', 'reg', 'boost'].find(x => t.matches(`[data-${x}-val]`)); if (!k) return;
+  S[k + 'Val'] = t.value; S[k + 'Err'] = ''; armaSbloccoFsv();
+  if (k === 'reg' && ev === 'change' && t.tagName === 'SELECT') ridisegnaInstallatore();
+});
+// ---- Boost acqua calda (come Dwellsee: setpoint più alto + modo «forzato»; a fine boost si rimette tutto com'era) ----
+S.boostApri = false; S.boostVal = ''; S.boostErr = ''; S.boostOcc = false;
+function rigaBoost(b) {
+  if (!b) return '';
+  const sbl = Date.now() < S.sbloccoFsv;
+  const fermaB = S.fuori ? '' : `<button type="button" class="matita" data-boost-ferma ${sbl && !S.boostOcc ? '' : 'disabled'} title="${sbl ? 'Ferma il boost' : 'Prima sblocca le modifiche'}" aria-label="Ferma il boost">■</button>`;
+  const avviaB = S.fuori ? '' : `<button type="button" class="matita" data-boost-apri ${sbl && !S.boostOcc ? '' : 'disabled'} title="${sbl ? 'Avvia un boost' : 'Prima sblocca le modifiche'}" aria-label="Avvia un boost">⚡</button>`;
+  if (b.attivo) {
+    const t = b.temperatura != null ? ` · ora ${(Math.round(b.temperatura * 10) / 10).toString().replace('.', ',')} °C` : '';
+    const err = b.errore ? `<small class="nota-r in-attesa">${esc(b.errore)}</small>` : '';
+    return `<div class="riga"><span>Boost</span><b><span class="val-c">attivo · obiettivo ${b.obiettivo} °C${t}</span><small class="nota-r">finisce quando l’acqua arriva all’obiettivo, al più tardi alle ${esc(hhmm(b.scade))}; poi torna a ${esc(String(b.sp_prima))} °C e al modo di prima</small>${err}</b>${fermaB}</div>${S.boostErr ? `<div class="fe-err">${esc(S.boostErr)}</div>` : ''}`;
+  }
+  const riga = `<div class="riga"><span>Boost</span><b><span class="val-c">spento</span></b>${avviaB}</div>`;
+  if (!(sbl && S.boostApri)) return riga;
+  return riga + `<div class="fsv-edit"><div class="fe-t">Boost acqua calda</div>
+    <div class="fe-r"><span class="mut">Temperatura obiettivo</span><span><input type="number" inputmode="numeric" step="1" data-boost-val value="${esc(S.boostVal)}" aria-label="Temperatura obiettivo del boost"> <span class="mut">°C</span></span></div>
+    <small class="mut">Come Dwellsee: il pannello alza il setpoint a questo valore e mette il modo «Forzato». Finito il boost (acqua arrivata all’obiettivo, o dopo ${b.massimo_min} minuti al massimo) rimette il modo e il setpoint di adesso. Il ripristino riparte anche se il pannello si riavvia.</small>
+    ${S.boostErr ? `<div class="fe-err">${esc(S.boostErr)}</div>` : ''}
+    <div class="fe-b"><button type="button" class="sec piccolo" data-boost-annulla ${S.boostOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-boost-conf ${S.boostOcc ? 'disabled' : ''}>${S.boostOcc ? 'Invio…' : 'Avvia il boost'}</button></div></div>`;
+}
+const inviaBoost = (corpo, okMsg) => inviaOp('boost', '/api/boost', corpo, okMsg, () => { S.boostApri = false; }, 'Comando non riuscito', 'il comando è partito, controlla più tardi');
+document.addEventListener('click', e => {
+  const t = e.target; if (!t.closest) return;
+  const b = S.dati && S.dati.boost;
+  if (t.closest('[data-boost-apri]')) {
+    S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = true; S.boostErr = '';
+    S.boostVal = String(b && b.predefinito != null ? b.predefinito : 50); armaSbloccoFsv(); ridisegnaInstallatore(); return;
+  }
+  if (t.closest('[data-boost-annulla]')) { S.boostApri = false; S.boostErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+  if (t.closest('[data-boost-conf]')) {
+    const n = Number(String(S.boostVal).replace(',', '.'));
+    if (S.boostVal === '' || !Number.isFinite(n) || n !== Math.round(n)) { S.boostErr = 'Scrivi una temperatura a gradi interi.'; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+    armaSbloccoFsv();
+    if (!window.confirm(`Stai per avviare un BOOST dell’acqua calda.\n\nObiettivo: ${n} °C\nModo: Forzato (poi torna a quello di prima)\n\nConfermi?`)) return;
+    inviaBoost({azione: 'avvia', obiettivo: n}, 'Boost avviato: la pompa lo conferma tra poco');
+    return;
+  }
+  if (t.closest('[data-boost-ferma]')) {
+    armaSbloccoFsv();
+    if (!window.confirm('Fermo il boost e rimetto modo e setpoint di prima?')) return;
+    inviaBoost({azione: 'ferma'}, 'Boost fermato: rimetto le impostazioni di prima');
+  }
+});
 function disegnaDispositivi(d) {
   const box = $('#dsp'); if (!box) return;
   if (S.sub === 'installatore') {
+    if ((S.fsvMod || S.regMod || S.boostApri) && box.contains(document.activeElement) && document.activeElement.matches && document.activeElement.matches('[data-fsv-val],[data-reg-val],[data-boost-val]')) return;  // si sta scrivendo un valore
     const h2 = tabsDisp() + disegnaInstallatore(d);
     if (box.dataset.h !== h2) { box.dataset.h = h2; box.innerHTML = h2; }
     return;
@@ -1445,15 +1813,10 @@ function cardComandi(lista) {
   if (!lista || !lista.length) return '';
   const pagine = Math.ceil(lista.length / PER_PAG);
   S.pagCmd = Math.min(Math.max(S.pagCmd || 0, 0), pagine - 1);
-  const righe = lista.slice(S.pagCmd * PER_PAG, (S.pagCmd + 1) * PER_PAG).map(c => `<div class="riga"><span>${esc(dataLunga(c.ts))}</span><b>${esc(c.cosa)} · ${c.acceso ? 'acceso' : 'spento'}<small class="mut nota-r">da ${esc(c.ip)} · ${esc(c.esito)}</small></b></div>`).join('');
-  const nav = pagine > 1 ? `<div class="pager"><button type="button" data-pagcmd="-1" ${S.pagCmd === 0 ? 'disabled' : ''} aria-label="Più recenti">‹</button><span>${S.pagCmd + 1} di ${pagine}</span><button type="button" data-pagcmd="1" ${S.pagCmd >= pagine - 1 ? 'disabled' : ''} aria-label="Meno recenti">›</button></div>` : '';
+  const righe = lista.slice(S.pagCmd * PER_PAG, (S.pagCmd + 1) * PER_PAG).map(c => `<div class="riga"><span>${esc(dataLunga(c.ts))}</span><b>${esc(c.cosa)} · ${c.testo ? esc(c.testo) : c.acceso ? 'acceso' : 'spento'}<small class="mut nota-r">da ${esc(c.ip)} · ${esc(c.esito)}</small></b></div>`).join('');
+  const nav = pagNav('pagCmd', pagine);
   return `<article class="card dev"><div class="ch"><h2>Comandi dati dal pannello</h2></div>${righe}${nav}</article>`;
 }
-document.addEventListener('click', e => {
-  const b = e.target.closest && e.target.closest('[data-pagcmd]'); if (!b || b.disabled) return;
-  S.pagCmd = (S.pagCmd || 0) + Number(b.dataset.pagcmd);
-  disegna();
-});
 async function copiaTesto(t) {
   try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true; } } catch { /* si prova l'altro metodo */ }
   try {
@@ -1550,8 +1913,8 @@ async function plgAggiorna() {
   if (plgOccupato || document.hidden || S.pagina !== 'impostazioni' || S.sub !== 'integrazioni') return;
   plgOccupato = true;
   try {
-    const r = await fetch('/api/impostazioni', {credentials: 'same-origin', cache: 'no-store'});
-    if (!r.ok || S.sub !== 'integrazioni') return;
+    const r = await leggiJson('/api/impostazioni');
+    if (!r || !r.ok || S.sub !== 'integrazioni') return;
     const d = await r.json();
     d.sezioni.filter(x => x.tab === 'integrazioni' && x.plugin).forEach(x => {
       const det = document.querySelector(`#imp details.riq[data-id="s-${x.id}"]`); if (!det) return;
@@ -1630,6 +1993,11 @@ function toast(t, cattivo) {
   let el = $('#toast'); if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
   el.textContent = t; el.className = 'on' + (cattivo ? ' bad' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => el.className = '', cattivo ? 12000 : 4200);
 }
+async function leggiJson(url) {         // GET con sessione; se e' scaduta torna al login e ridà null
+  const r = await fetch(url, {credentials: 'same-origin', cache: 'no-store'});
+  if (r.status === 401) { location.href = '/login'; return null; }
+  return r;
+}
 async function inviaPost(url, corpo) {
   const r = await fetch(url, {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json', 'X-Pdc': '1'}, body: JSON.stringify(corpo)});
   if (r.status === 401) { location.href = '/login'; return {}; }
@@ -1639,8 +2007,7 @@ async function inviaPost(url, corpo) {
 async function aggCarica() {
   const box = $('#agg-corpo'); if (!box || box.dataset.occupato) return;
   try {
-    const r = await fetch('/api/aggiornamento', {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson('/api/aggiornamento'); if (!r) return;
     const a = await r.json(), cosa = (a.parti || []).map(p => esc(p.titolo)).join(', ');
     box.innerHTML = a.stato === 'applicabile'
       ? `<p class="agg-ok"><b>È pronta la versione ${esc(a.versione_disco)}</b> (cambiato: ${cosa}).<br>Si applica subito, <b>senza fermare la raccolta dei dati</b>.</p><div class="azioni"><button type="button" id="agg-applica">Applica aggiornamento</button></div>`
@@ -1651,6 +2018,8 @@ async function aggCarica() {
   } catch { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
 }
 setInterval(() => { if (S.pagina === 'impostazioni' && !S.sub && !document.hidden) aggCarica(); }, 20000);
+// bottone disattivato mentre lavora; se il pannello non risponde lo dice
+async function conBottone(b, f) { b.disabled = true; try { await f(); } catch { toast('Server non raggiungibile', true); } b.disabled = false; }
 async function azioniImpostazioni(e) {
   const id = e.target.id;
   if (id === 'agg-ricontrolla') { aggCarica(); return; }
@@ -1691,13 +2060,9 @@ async function azioniImpostazioni(e) {
     } catch { toast('Server non raggiungibile', true); }
     e.target.disabled = false;
   } else if (id === 'b-prova') {
-    e.target.disabled = true; try { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); } catch { toast('Server non raggiungibile', true); }
-    e.target.disabled = false;
+    await conBottone(e.target, async () => { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); });
   } else if (id === 'plg-ricarica') {
-    e.target.disabled = true;
-    try { const r = await inviaPost('/api/plugin/ricarica', {}); toast(r.ok ? `Plugin riletti: ${r.plugin}` : 'Non riuscito', !r.ok); S.sporco = false; S.ricarica = true; await carica(); }
-    catch { toast('Server non raggiungibile', true); }
-    e.target.disabled = false;
+    await conBottone(e.target, async () => { const r = await inviaPost('/api/plugin/ricarica', {}); toast(r.ok ? `Plugin riletti: ${r.plugin}` : 'Non riuscito', !r.ok); S.sporco = false; S.ricarica = true; await carica(); });
   } else if (id === 'b-pw') {
     const r = await inviaPost('/api/impostazioni/password', {utente: $('#p-ut').value, attuale: $('#p-at').value, nuova: $('#p-nu').value});
     $('#pw-msg').textContent = r.messaggio || ''; $('#pw-msg').className = 'msg ' + (r.ok ? 'ok' : 'bad');
@@ -1707,7 +2072,7 @@ async function azioniImpostazioni(e) {
 
 // ---------- Accesso da internet (Cloudflare) ----------
 const CFS = {zone: null, token: '', passi: null, occupato: false};
-async function cfLeggi() { const r = await fetch('/api/cloudflare', {credentials: 'same-origin', cache: 'no-store'}); if (r.status === 401) { location.href = '/login'; return null; } return r.json(); }
+async function cfLeggi() { const r = await leggiJson('/api/cloudflare'); return r && r.json(); }
 async function cfCarica(forza) {
   const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
   let st; try { st = await cfLeggi(); } catch { return; }
@@ -1825,10 +2190,10 @@ document.addEventListener('toggle', e => { if (e.target.id === 'cf-rim') { const
 // ---------- dati e tempo reale ----------
 function finestra() {
   if (S.pagina === 'impostazioni') return {da: 0, a: 0, live: false};
-  if (S.pagina === 'dispositivi') return {da: 0, a: 0, live: true};
-  if (S.pagina === 'efficienza') return {da: 0, a: 0, live: true};
+  if (S.pagina === 'dispositivi' || S.pagina === 'efficienza') return {da: 0, a: 0, live: true};
   if (S.range === 'custom' && S.custom) return {da: S.custom.da, a: S.custom.a, live: false};
-  return {da: ora() - (S.range === '6h' ? 6 : 24) * 3600, a: ora(), live: true};
+  const a = S.fine || ora();   // S.fine: fine della finestra quando ci si e' spostati indietro nel tempo (vuoto = in diretta)
+  return {da: a - (S.range === '6h' ? 6 : 24) * 3600, a, live: !S.fine};
 }
 function urlDati() {
   const w = finestra();
@@ -1838,6 +2203,20 @@ function urlDati() {
   if (S.pagina === 'analisi') return `/api/analisi?da=${w.da}&a=${w.a}&n=${Math.max(120, Math.min(400, Math.round(($('#pagina').clientWidth || 800) / 3)))}`;
   return `/api/dashboard?da=${w.da}&a=${w.a}`;
 }
+// La finestra della Dashboard (6h/24h) si scrive anche in un cookie: cosi' il server puo' mettere i dati giusti dentro la pagina.
+function ricordaFinestra() {
+  try { document.cookie = `pdc_r=${S.range};path=/;max-age=31536000;samesite=lax${location.protocol === 'https:' ? ';secure' : ''}`; } catch { /* niente */ }
+}
+// La Dashboard arriva gia' dentro la pagina (blocco #dati0): si disegna subito, senza aspettare il giro dei dati. Solo in diretta e sulla finestra salvata.
+function datiIniziali() {
+  const el = $('#dati0'); if (!el) return false;
+  let d = null; try { d = JSON.parse(el.textContent); } catch { /* niente */ }
+  el.remove();
+  if (!d || !d.dati || S.pagina !== 'dashboard' || S.fine || d.r !== S.range) return false;
+  S.dati = d.dati; S.dpag = 'dashboard'; S.off = S.dati.ora - Math.floor(Date.now() / 1000); S.fetchedAt = Date.now();
+  disegna();
+  return true;
+}
 let caricando = false;
 async function carica() {
   if (S.pagina === 'changelog') return;  // pagina fissa: niente da caricare
@@ -1845,8 +2224,7 @@ async function carica() {
   caricando = true;
   const pag = S.pagina;
   try {
-    const r = await fetch(urlDati(), {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson(urlDati()); if (!r) return;
     // se lo script del pannello e' stato aggiornato mentre la pagina era aperta, si ricarica da sola (una volta sola, per evitare giri a vuoto)
     const nuova = r.headers.get('X-Pdc-Build');
     if (nuova && window.BUILD && nuova !== window.BUILD) {
@@ -1904,7 +2282,7 @@ function avvia() {
     }
   });
   document.addEventListener('pointermove', e => {
-    if (zoomaMuovi(e) || dita.size > 1) return;
+    if (spostaMuovi(e) || zoomaMuovi(e) || dita.size > 1) return;
     if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e);
     else { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
   });
@@ -1913,10 +2291,12 @@ function avvia() {
   document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { if (e.target.id.startsWith('cf-')) cfAzione(e); else azioniImpostazioni(e); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
-  document.addEventListener('pointerdown', e => { zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
-  document.addEventListener('pointerup', zoomaSu); document.addEventListener('pointercancel', zoomaSu);
+  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
+  document.addEventListener('pointerup', e => { spostaSu(); zoomaSu(e); }); document.addEventListener('pointercancel', e => { spostaSu(); zoomaSu(e); });
   if (S.range === 'custom' && S.pagina !== 'efficienza') { $('#custom').hidden = false; if (S.custom) { $('#c-da').value = loc(S.custom.da); $('#c-a').value = loc(S.custom.a); } }
-  carica(); collega();
+  ricordaFinestra();
+  datiIniziali() || carica();
+  collega();
   setInterval(() => { if (finestra().live) carica(); }, 60000);
   setInterval(stato, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { controllaFlusso(); if (finestra().live) carica(); } });

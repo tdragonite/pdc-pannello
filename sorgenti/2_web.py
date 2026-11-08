@@ -5,6 +5,7 @@
 # ==========================================================================
 
 import bisect
+import collections
 import gzip
 import hmac
 import math
@@ -17,7 +18,12 @@ from urllib.parse import parse_qs, urlparse
 
 WEB_ASSETS = {}  # @@ASSETS@@  (riempito da costruisci.py: pagine, stile e script)
 # impronta di pagina+stile+script: cambia a ogni modifica, anche senza cambiare numero di versione
-BUILD = hashlib.sha256((VERSIONE + "".join(WEB_ASSETS[k] for k in sorted(WEB_ASSETS))).encode("utf-8")).hexdigest()[:8]
+def _calcola_build(versione, assets):
+    """Impronta delle pagine: cambia con la versione e con ogni file web (le pagine aperte si ricaricano da sole)."""
+    return hashlib.sha256((versione + "".join(assets[k] for k in sorted(assets))).encode("utf-8")).hexdigest()[:8]
+
+
+BUILD = _calcola_build(VERSIONE, WEB_ASSETS)
 
 
 # --------------------------------------------------------------------------
@@ -191,16 +197,6 @@ def q_primo_ts(db):
     return r[0] if r and r[0] is not None else None
 
 
-def q_medie(db, serie, da, a, n=60):
-    """Serie ridotta a ~n punti (media per intervallo): per i grafici piccoli."""
-    da, a = int(da), int(a)
-    dim = max(1, (a - da) // n)
-    with closing(db._c()) as c:
-        righe = c.execute("SELECT (ts-?)/? AS b, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<=? "
-                          "GROUP BY b ORDER BY b", (da, dim, serie, da, a)).fetchall()
-    return [[da + b * dim + dim // 2, round(v, 2)] for b, v in righe]
-
-
 def q_valore_a(db, serie, t):
     with closing(db._c()) as c:
         r = c.execute("SELECT valore FROM misure WHERE serie=? AND ts<=? ORDER BY ts DESC LIMIT 1",
@@ -337,8 +333,20 @@ def _fsv(ult, codice):
         return None
 
 
+def zona_curva(ult):
+    """Quale curva climatica sta usando la pompa: (1 o 2, da dove lo so). Il codice 2041 la sceglie (1 = zona 1,
+    pavimento; 2 = zona 2, ventilconvettori), ma SmartThings non lo comunica per tutte le pompe: senza, si assume
+    la zona 1, che e' quella di default."""
+    z = _fsv(ult, "2041")
+    if z in (1.0, 2.0):
+        return int(z), "2041"
+    return 1, ("4061 = 0: la zona 2 non e' attiva" if _fsv(ult, "4061") == 0 else "ipotesi: 2041 non e' comunicato")
+
+
 def dati_curva(db, ult, da, a, esterna_ora):
-    t1, t2, m1, m2 = (_fsv(ult, c) for c in ("2011", "2012", "2021", "2022"))
+    zona, fonte = zona_curva(ult)
+    c2, c3 = ("2021", "2022") if zona == 1 else ("2031", "2032")
+    t1, t2, m1, m2 = (_fsv(ult, c) for c in ("2011", "2012", c2, c3))
     if None in (t1, t2, m1, m2) or t2 <= t1:
         return None
     es = dict(q_serie(db, "ciclo.esterna", da, a))
@@ -352,7 +360,7 @@ def dati_curva(db, ult, da, a, esterna_ora):
         punti = [punti[int(i * passo)] for i in range(300)]
     curva = (t1, m1, t2, m2)
     return {"basso": {"esterna": t1, "mandata": m1}, "alto": {"esterna": t2, "mandata": m2},
-            "punti": punti,
+            "zona": zona, "zona_fonte": fonte, "punti": punti,
             "ora": {"esterna": esterna_ora,
                     "mandata": mandata_calcolata(curva, esterna_ora) if esterna_ora is not None else None}}
 
@@ -624,8 +632,13 @@ def meteo_riassumi(raw, ora):
             "icona": icona, "testo": testo, "livello": lvl, "ore": dettaglio, "modelli": n}
 
 
+def _meteo_stato(app):
+    return app.__dict__.setdefault("meteo_st", {"raw": None, "ts": 0, "prossimo": 0, "modo": 0, "falliti": 0})
+
+
 def _meteo_lavoro(app, lat, lon):
-    st = app.meteo_st
+    """Una lettura di Open-Meteo (la chiama il thread di fondo «esterni»)."""
+    st = _meteo_stato(app)
     try:
         dati, modo = meteo_scarica(lat, lon, st["modo"])
         st.update(raw=dati, ts=int(time.time()), modo=modo, falliti=0, prossimo=int(time.time()) + METEO_OGNI)
@@ -635,8 +648,6 @@ def _meteo_lavoro(app, lat, lon):
         st["falliti"] += 1
         st["prossimo"] = int(time.time()) + min(300 * st["falliti"], METEO_OGNI)
         (log.warning if st["falliti"] == 1 else log.debug)("Meteo: lettura non riuscita (%s)", e)
-    finally:
-        st["occupato"] = False
 
 
 def meteo_demo(ora):
@@ -655,7 +666,7 @@ def meteo_demo(ora):
 
 
 def meteo_info(app):
-    """Riassunto del meteo per la Dashboard, o None. La lettura di Open-Meteo parte in un thread (mai nella richiesta della pagina)."""
+    """Riassunto del meteo per la Dashboard, o None. Legge solo l'ultima lettura di Open-Meteo, fatta dal thread di fondo."""
     cfg = meteo_config(app)
     if not cfg:
         return None
@@ -663,10 +674,8 @@ def meteo_info(app):
     if app.demo:
         r = meteo_riassumi(meteo_demo(ora), ora)
         return dict(r, agg=ora, modelli_nomi=list(METEO_MODELLI)) if r else None
-    st = app.__dict__.setdefault("meteo_st", {"raw": None, "ts": 0, "prossimo": 0, "occupato": False, "modo": 0, "falliti": 0})
-    if ora >= st["prossimo"] and not st["occupato"]:
-        st["occupato"], st["prossimo"] = True, ora + 60
-        threading.Thread(target=_meteo_lavoro, args=(app, *cfg), daemon=True, name="meteo").start()
+    st = _meteo_stato(app)
+    esterni_assicura(app)
     if not st["raw"] or ora - st["ts"] > METEO_VECCHIO:
         return None
     r = meteo_riassumi(st["raw"], ora)
@@ -710,8 +719,16 @@ def stazione_leggi(js):
     return round(um, 1), ts
 
 
+def _stazione_stato(app, url):
+    st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "vecchio": False})
+    if st["url"] != url:
+        st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0, vecchio=False)
+    return st
+
+
 def _stazione_lavoro(app, url):
-    st = app.stazione_st
+    """Una lettura della stazione (la chiama il thread di fondo «esterni»). Il «dato vecchio» si giudica sul dato appena letto."""
+    st = _stazione_stato(app, url)
     try:
         code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=STAZIONE_ATTESA)
         if code != 200:
@@ -719,33 +736,91 @@ def _stazione_lavoro(app, url):
         um, ts = stazione_leggi(js)
         ora = int(time.time())
         if st["url"] == url:                                  # nel frattempo l'indirizzo e' cambiato: scarto
-            st.update(um=um, ts=ts or ora, errore=None, falliti=0, prossimo=ora + STAZIONE_OGNI)
+            vecchio = ora - (ts or ora) > STAZIONE_VECCHIO
+            if vecchio and not st["vecchio"]:
+                log.warning("Stazione meteo: il sito risponde ma l'ultimo dato della stazione è delle %s, non lo mostro", time.strftime("%H:%M", time.localtime(ts)))
+            elif not vecchio and (st["falliti"] or st["vecchio"]):
+                log.info("Stazione meteo: di nuovo disponibile")
+            st.update(um=um, ts=ts or ora, errore=None, falliti=0, vecchio=vecchio, prossimo=ora + STAZIONE_OGNI)
     except Exception as e:
         st["falliti"] += 1
         st["errore"] = str(e)[:120]
         st["prossimo"] = int(time.time()) + min(300 * st["falliti"], STAZIONE_OGNI)
         (log.warning if st["falliti"] == 1 else log.debug)("Stazione meteo: lettura non riuscita (%s)", e)
-    finally:
-        st["occupato"] = False
 
 
 def stazione_info(app):
     """None se la funzione è spenta, altrimenti {'umidita': % o None, 'ts': ultimo dato della stazione, 'errore': testo o None}.
-    La lettura parte in un thread (mai nella richiesta della pagina); il valore più vecchio di un'ora non si mostra."""
+    Legge solo l'ultima lettura, fatta dal thread di fondo; il valore più vecchio di un'ora non si mostra."""
     ora = int(time.time())
     if app.demo:                                              # nella demo si vede sempre, come il meteo
         return {"umidita": 78.0, "ts": ora - 120, "errore": None}
     url = stazione_url(app)
     if not url:
         return None
-    st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "occupato": False})
-    if st["url"] != url:
-        st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0)
-    if ora >= st["prossimo"] and not st["occupato"]:
-        st["occupato"], st["prossimo"] = True, ora + 60
-        threading.Thread(target=_stazione_lavoro, args=(app, url), daemon=True, name="stazione").start()
-    um = st["um"] if st["um"] is not None and ora - st["ts"] <= STAZIONE_VECCHIO else None
+    st = _stazione_stato(app, url)
+    esterni_assicura(app)
+    vecchio = st["um"] is not None and ora - st["ts"] > STAZIONE_VECCHIO
+    um = None if vecchio else st["um"]
     return {"umidita": um, "ts": st["ts"] or None, "errore": st["errore"]}
+
+
+# --------------------------------------------------------------------------
+# Un solo thread di fondo per i dati esterni: stazione meteo vicina e previsione Open-Meteo restano sempre freschi,
+# anche quando nessuno ha la pagina aperta (prima la lettura partiva solo con la Dashboard, e Alexa o il widget trovavano il buco)
+# --------------------------------------------------------------------------
+
+_lock_esterni = threading.Lock()
+
+
+def esterni_giro(app):
+    """Un giro: fa le letture scadute. -> fra quanti secondi guardare di nuovo (tra 15 e 60)."""
+    if app.demo:
+        return 60
+    prossimi = []
+    url = stazione_url(app)
+    if url:
+        st = _stazione_stato(app, url)
+        if time.time() >= st["prossimo"]:
+            _stazione_lavoro(app, url)
+        prossimi.append(st["prossimo"])
+    cfg = meteo_config(app)
+    if cfg:
+        st = _meteo_stato(app)
+        if time.time() >= st["prossimo"]:
+            _meteo_lavoro(app, *cfg)
+        prossimi.append(st["prossimo"])
+    return max(15, min(60, min(prossimi) - int(time.time()))) if prossimi else 60
+
+
+class Esterni(threading.Thread):
+    def __init__(self, app):
+        super().__init__(daemon=True, name="esterni")
+        self.app, self.fermo = app, threading.Event()
+
+    def run(self):
+        self.fermo.wait(3)                # lascia partire il resto
+        while not self.fermo.is_set():
+            try:
+                attesa = esterni_giro(self.app)
+            except Exception:
+                log.exception("errore nella lettura dei dati esterni (stazione, meteo)")
+                attesa = 60
+            self.fermo.wait(attesa)
+
+
+def esterni_assicura(app):
+    """Avvia il thread se non c'e'. All'avvio lo fa il programma; dopo un aggiornamento a caldo (che non riavvia i thread) basta la prima richiesta."""
+    if app.demo:
+        return
+    t = app.__dict__.get("esterni")
+    if t is not None and t.is_alive():
+        return
+    with _lock_esterni:
+        t = app.__dict__.get("esterni")
+        if t is None or not t.is_alive():
+            t = app.__dict__["esterni"] = Esterni(app)
+            t.start()
 
 
 # --------------------------------------------------------------------------
@@ -1002,7 +1077,20 @@ def stima_ripartenza(app, ora, t_casa, ts_casa, richiesta, esterna, target, diag
     if eta is None:
         return no((ed or {}).get("motivo") or "stima non calcolabile")
     q15 = 900
-    return int(round(eta / q15) * q15)
+    nuova = int(round(eta / q15) * q15)
+    if diag is not None:
+        return nuova
+    # Orario stabile: il sensore da' la casa a passi di 0.1 gradi e, con la casa che scende piano, un passo vale anche mezz'ora o piu'.
+    # Si tiene l'orario gia' mostrato finche' la nuova stima non si sposta di piu' di una soglia (il 40% del tempo che manca, tra 5 e 30 minuti:
+    # piu' la ripartenza e' vicina, piu' l'orario segue la realta'). Si riparte da zero a ogni nuova pausa o dopo 30 minuti senza stima.
+    ciclo = r[0] if r else None
+    m = app.__dict__.get("rip_mostrata")
+    if m and m["ciclo"] == ciclo and ora - m["ts"] <= 1800 and m["eta"] > ora - 600:
+        soglia = min(1800, max(300, 0.4 * (m["eta"] - ora)))
+        if abs(nuova - m["eta"]) <= soglia:
+            nuova = m["eta"]
+    app.rip_mostrata = {"ciclo": ciclo, "eta": nuova, "ts": ora}
+    return nuova
 
 
 @api("/api/dashboard")
@@ -1010,7 +1098,7 @@ def api_dashboard(app, q):
     ora = int(time.time())
     da, a = finestra(q, ora)
     db = app.db
-    ult = {r[0]: r for r in db.ultimi()}
+    ult = db.ultimi_dict()
     tol = max(150, int(app.intervallo_pdc() * 1.5))
 
     def num(s):
@@ -1041,6 +1129,7 @@ def api_dashboard(app, q):
     stato_acs = "spento" if not pdc_acc else ("attivo" if modo == "acs" else "standby")
     curva = dati_curva(db, ult, da, a, num("ciclo.esterna"))
     stz = stazione_info(app)
+    kwh_per = energia_kwh(db, da, a)
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     return {
@@ -1052,22 +1141,23 @@ def api_dashboard(app, q):
         "riscaldamento": {
             "stato": stato_risc, "temp": acqua, "target": num("risc.setpoint"), "ritorno": ritorno,
             "delta": round(acqua - ritorno, 1) if acqua is not None and ritorno is not None else None,
-            "spark": q_medie(db, "risc.acqua", da, a)},
+            "spark": q_griglia(db, "risc.acqua", da, a, 60)[0]},
         "acs": {
             "stato": stato_acs, "temp": num("acs.temperatura"), "target": num("acs.setpoint"),
             "modo": NOMI_MODO_ACS.get(txt("pdc.modo"), txt("pdc.modo")),
-            "spark": q_medie(db, "acs.temperatura", da, a)},
+            "spark": q_griglia(db, "acs.temperatura", da, a, 60)[0]},
         "esterna": {"temp": num("ciclo.esterna"), "ts": ts_("ciclo.esterna"), "min": es_min, "max": es_max,
                     "umidita": (stz or {}).get("umidita"), "umidita_attiva": stz is not None,
-                    "spark": q_medie(db, "ciclo.esterna", da, a)},
-        "energia": {"kwh": energia_kwh(db, da, a), "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
-                    "spark": q_medie(db, "pot.watt", da, a)},
+                    "spark": q_griglia(db, "ciclo.esterna", da, a, 60)[0]},
+        "energia": {"kwh": kwh_per, "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
+                    "dettaglio": dettaglio_costo(app, da, a, kwh_per, prezzo_kwh(app), ora),
+                    "spark": q_griglia(db, "pot.watt", da, a, 60)[0]},
         "casa": {"temp": num("casa.temperatura"), "umidita": num("casa.umidita"), "soglie_umidita": soglie_umidita(app), "target": num("casa.setpoint"),
                  "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
                                              num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
                  "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
-                 "ts": ts_("casa.temperatura"), "spark": q_medie(db, "casa.temperatura", da, a),
-                 "spark_um": q_medie(db, "casa.umidita", da, a)},
+                 "ts": ts_("casa.temperatura"), "spark": q_griglia(db, "casa.temperatura", da, a, 60)[0],
+                 "spark_um": q_griglia(db, "casa.umidita", da, a, 60)[0]},
         "prestazioni": {k: num(f"ciclo.{k}") for k in ("freq_compressore", "freq_target", "vel_pompa", "portata",
                                                        "scarico")},
         "prestazioni_ts": ts_("ciclo.freq_compressore"),
@@ -1143,6 +1233,33 @@ def prezzo_kwh(app):
         return 0.0
 
 
+def dettaglio_costo(app, da, a, kwh, prezzo, ora):
+    """Costo del periodo diviso in riscaldamento, acqua calda e standby (euro), stesse proporzioni di Efficienza applicate
+    al totale del contatore. None se manca il prezzo o i dati. Calcolo tenuto in memoria 5 minuti per periodo."""
+    if prezzo <= 0 or not kwh or kwh <= 0:
+        return None
+    cache = app.__dict__.setdefault("det_cache", {})
+    voce = cache.get(round(da))
+    if voce and ora - voce["ts"] < 300:
+        tot = voce["tot"]
+    else:
+        try:
+            tol = max(150, int(app.intervallo_pdc() * 1.5))
+            tot = calcola_efficienza(app.db, da, a, tol, ora)["tot"]
+        except Exception:
+            tot = None
+        if len(cache) > 8:
+            cache.clear()
+        cache[round(da)] = {"ts": ora, "tot": tot}
+    if not tot:
+        return None
+    parti = {k: max(0.0, tot.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
+    somma = sum(parti.values())
+    if somma <= 0:
+        return None
+    return {k: round(kwh * prezzo * v / somma, 2) for k, v in parti.items()}
+
+
 def costo_mese(app, ora):
     """Costo del mese in corso, stima a fine mese e confronto col mese scorso (None se manca il prezzo o i dati).
     La stima e' lineare (consumo medio per giorno trascorso x giorni del mese): vale solo come ordine di grandezza."""
@@ -1169,7 +1286,26 @@ def costo_mese(app, ora):
     if primo <= t_in and trascorso >= 1.0:
         stima = kwh / trascorso * durata
     scorso = energia_kwh(db, t_prec, t_in) if primo <= t_prec + 3600 else None
-    return {"kwh": kwh, "euro": round(kwh * prezzo, 2),
+    # divisione tra riscaldamento, acqua calda e standby: stesse proporzioni della stima di Efficienza, applicate al
+    # totale del contatore, cosi' la somma torna sempre con il costo del mese. Calcolo tenuto in memoria 5 minuti.
+    det = None
+    cache = app.__dict__.get("mese_cache")
+    if cache and cache["mese"] == t_in and ora - cache["ts"] < 300:
+        det = cache["tot"]
+    else:
+        try:
+            tol = max(150, int(app.intervallo_pdc() * 1.5))
+            det = calcola_efficienza(db, max(t_in, primo), ora, tol, ora)["tot"]
+            app.__dict__["mese_cache"] = {"mese": t_in, "ts": ora, "tot": det}
+        except Exception:
+            det = None
+    dettaglio = None
+    if det:
+        parti = {k: max(0.0, det.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
+        somma = sum(parti.values())
+        if somma > 0:
+            dettaglio = {k: round(kwh * prezzo * v / somma, 2) for k, v in parti.items()}
+    return {"kwh": kwh, "euro": round(kwh * prezzo, 2), "dettaglio": dettaglio,
             "stima_euro": None if stima is None else round(stima * prezzo, 2),
             "scorso_euro": None if scorso is None else round(scorso * prezzo, 2),
             "mese": inizio.month, "mese_scorso": prec.month}
@@ -1177,7 +1313,7 @@ def costo_mese(app, ora):
 
 def cornice(app, ora):
     """Parti comuni a tutte le risposte: stato collegamenti e avvisi (per il pallino in alto e il banner)."""
-    ult = {r[0]: r for r in app.db.ultimi()}
+    ult = app.db.ultimi_dict()
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     r = ult.get("acs.temperatura")
@@ -1251,6 +1387,172 @@ def dirada_richiesta(punti, passo_max=600):
     return out
 
 
+# ---------- Finestre aperte (riconosciute dai dati) ----------
+FIN_BASE = {"calo": 0.5, "ah": None}     # calo minimo in gradi; variazione minima (negativa) dell'umidita' assoluta, None = non richiesta
+
+
+def fin_tabella(db):
+    """La tabella nasce all'avvio; se il pannello e' stato aggiornato a caldo si crea qui, una volta sola."""
+    if not getattr(db, "_fin_ok", False):
+        with db.lock, closing(db._c()) as c, c:
+            c.execute("CREATE TABLE IF NOT EXISTS finestre(da INTEGER PRIMARY KEY, a INTEGER NOT NULL, calo REAL, ah REAL,"
+                      " stato TEXT NOT NULL, manuale INTEGER NOT NULL DEFAULT 0)")
+        db._fin_ok = True
+
+
+def fin_soglie(db):
+    try:
+        v = json.loads(db.meta_get("fin_soglie") or "{}")
+    except ValueError:
+        v = {}
+    return {"calo": float(v.get("calo", FIN_BASE["calo"])), "ah": v.get("ah", FIN_BASE["ah"]), "n": int(v.get("n", 0))}
+
+
+def umidita_assoluta(t, u):
+    """g/m3 a partire da temperatura (gradi) e umidita' relativa (%)."""
+    return 6.112 * math.exp(17.62 * t / (243.12 + t)) * u * 2.1674 / (273.15 + t)
+
+
+def _ah_vicina(U, Uts, tt, ini_ts):
+    """Variazione dell'umidita' assoluta tra l'inizio e il punto piu' freddo, o None se mancano i dati."""
+    def umid(x):
+        k = bisect.bisect_left(Uts, x - 150)
+        return U[k][1] if k < len(U) else None
+    u0, u1 = umid(ini_ts[0]), umid(tt[0])
+    return None if u0 is None or u1 is None else round(umidita_assoluta(tt[1], u1) - umidita_assoluta(ini_ts[1], u0), 1)
+
+
+def fin_rileva(db, da, a, soglie=None):
+    """Finestre aperte probabili: la temperatura di casa scende piu' in fretta e piu' in basso di come farebbe da sola.
+    Lavora su tutto lo storico (e' retroattivo): un solo passaggio sui campioni."""
+    s = soglie or fin_soglie(db)
+    T = q_serie(db, "casa.temperatura", da - 3600, a)
+    U = q_serie(db, "casa.umidita", da - 3600, a)
+    Uts = [x[0] for x in U]
+    n, ev, i, p, coda = len(T), [], 0, 0, collections.deque()     # coda: massimi degli ultimi 25 minuti, dal piu' vecchio
+    inneschi = max(0.3, s["calo"] * 0.8)
+    while i < n:
+        while p <= i:
+            while coda and coda[-1][1] < T[p][1]:
+                coda.pop()
+            coda.append(T[p])
+            p += 1
+        t, v = T[i]
+        while coda[0][0] < t - 1500:
+            coda.popleft()
+        pic = coda[0]
+        if pic[1] - v >= inneschi:
+            vmin, tmin, j = v, t, i
+            while j + 1 < n:
+                j += 1
+                tj, vj = T[j]
+                if vj < vmin:
+                    vmin, tmin = vj, tj
+                if vj - vmin >= 0.25 or tj - pic[0] > 10800:
+                    break
+            calo = pic[1] - vmin
+            if calo >= s["calo"] and tmin - pic[0] <= 10800:
+                dah = _ah_vicina(U, Uts, (tmin, vmin), pic)
+                if s["ah"] is None or dah is None or dah <= s["ah"]:
+                    ev.append({"da": pic[0], "a": tmin + 300, "calo": round(calo, 1), "ah": dah})
+            i = j + 1
+        else:
+            i += 1
+    return [e for e in ev if e["a"] > da and e["da"] < a]
+
+
+def fin_eventi(db, da, a):
+    """Quello che il grafico mostra: le finestre confermate (anche a mano) e quelle ancora da confermare.
+    Le risposte «no» spariscono, e con loro i rilevamenti che si sovrappongono."""
+    fin_tabella(db)
+    with closing(db._c()) as c:
+        reg = c.execute("SELECT da, a, calo, ah, stato, manuale FROM finestre WHERE a > ? AND da < ? ORDER BY da", (int(da), int(a))).fetchall()
+        tot = c.execute("SELECT COUNT(*) FROM finestre WHERE manuale=0").fetchone()[0]
+    out = [{"da": r[0], "a": r[1], "calo": r[2], "ah": r[3], "stato": "si", "manuale": r[5]} for r in reg if r[4] == "si"]
+    for e in fin_rileva(db, da, a):
+        if not any(r[0] < e["a"] and r[1] > e["da"] for r in reg):
+            out.append({**e, "stato": "da confermare", "manuale": 0})
+    out.sort(key=lambda e: e["da"])
+    s = fin_soglie(db)
+    return out, {"risposte": tot, "tarato": s["n"] >= 10, "n": s["n"]}
+
+
+def fin_calibra(db):
+    """Dopo almeno 10 risposte (con almeno 2 si' e 2 no) sceglie le soglie che sbagliano meno sulle risposte date."""
+    with closing(db._c()) as c:
+        righe = c.execute("SELECT calo, ah, stato FROM finestre WHERE calo IS NOT NULL").fetchall()
+    si = [r for r in righe if r[2] == "si"]
+    no = [r for r in righe if r[2] == "no"]
+    if len(righe) < 10 or len(si) < 2 or len(no) < 2:
+        return
+    def passa(r, c, h):
+        return r[0] >= c - 1e-9 and (h is None or r[1] is None or r[1] <= h)
+    migliori = None
+    for c in [round(0.3 + 0.1 * k, 1) for k in range(13)]:
+        for h in (None, 0.0, -0.3, -0.6, -1.0, -1.5):
+            giusti = sum(passa(r, c, h) for r in si) + sum(not passa(r, c, h) for r in no)
+            chiave = (-giusti, abs(c - FIN_BASE["calo"]), 0 if h is None else 1)
+            if migliori is None or chiave < migliori[0]:
+                migliori = (chiave, c, h)
+    db.meta_set("fin_soglie", json.dumps({"calo": migliori[1], "ah": migliori[2], "n": len(righe)}))
+
+
+def _num_fin(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+@api_post("/api/finestre/giudica")
+def api_fin_giudica(app, corpo, h):
+    fin_tabella(app.db)
+    da, a, calo, ah = _num_fin(corpo.get("da")), _num_fin(corpo.get("a")), _num_fin(corpo.get("calo")), _num_fin(corpo.get("ah"))
+    stato = corpo.get("stato")
+    if da is None or a is None or a <= da or a - da > 86400 or stato not in ("si", "no"):
+        return {"ok": False, "errore": "Dati non validi."}
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
+        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?,?,0)", (int(da), int(a), calo, ah, stato))
+    fin_calibra(app.db)
+    return {"ok": True}
+
+
+@api_post("/api/finestre/manuale")
+def api_fin_manuale(app, corpo, h):
+    fin_tabella(app.db)
+    da, a = _num_fin(corpo.get("da")), _num_fin(corpo.get("a"))
+    if da is None or a is None or a <= da or a - da > 86400:
+        return {"ok": False, "errore": "L'intervallo non è valido (max 24 ore)."}
+    T = q_serie(app.db, "casa.temperatura", da - 1500, a)
+    U = q_serie(app.db, "casa.umidita", da - 1500, a)
+    calo = ah = None
+    if len(T) >= 2:
+        dentro = [x for x in T if x[0] >= da] or T
+        pic = max((x for x in T if x[0] <= da + 1500), key=lambda x: (x[1], -x[0]), default=T[0])
+        minimo = min(dentro, key=lambda x: x[1])
+        calo = round(max(0.0, pic[1] - minimo[1]), 1)
+        ah = _ah_vicina(U, [x[0] for x in U], minimo, pic)
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
+        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?, 'si', 1)", (int(da), int(a), calo, ah))
+    fin_calibra(app.db)
+    return {"ok": True}
+
+
+@api_post("/api/finestre/annulla")
+def api_fin_annulla(app, corpo, h):
+    fin_tabella(app.db)
+    da = _num_fin(corpo.get("da"))
+    if da is None:
+        return {"ok": False, "errore": "Dati non validi."}
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE da=?", (int(da),))
+    fin_calibra(app.db)
+    return {"ok": True}
+
+
 @api("/api/analisi")
 def api_analisi(app, q):
     ora = int(time.time())
@@ -1278,6 +1580,7 @@ def api_analisi(app, q):
     richiesta = dirada_richiesta(q_serie(app.db, "casa.richiesta_calore", da, a))
     out.update({"da": da, "a": a, "passo": dim, "grafici": grafici, "richiesta": richiesta, "soglie_umidita": soglie_umidita(app),
                 "modi": calcola_modi(app.db, da, a, tol, ora)})
+    out["finestre"], out["finestre_info"] = fin_eventi(app.db, da, a)
     return out
 
 
@@ -1327,9 +1630,63 @@ def _mediana(v):
     return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
 
 
+def _tratti_calmi(temp, tts, cicli, w0, w1):
+    """[(inizio, fine)] dei tratti tranquilli tra w0 e w1, lunghi almeno 1 ora: senza riscaldo dell'acqua (piu' 20 minuti di rimescolamento dopo)
+    e senza prelievi (calo di 1 grado o piu' in 15 minuti) ne' rimescolamenti (salita di 0,3 gradi o piu'). Dopo un evento si aspettano 10 minuti."""
+    occ = sorted((i, f + 1200) for i, f in cicli if f + 1200 > w0 and i < w1)
+    liberi, cur = [], w0
+    for i, f in occ:
+        if i > cur:
+            liberi.append((cur, i))
+        cur = max(cur, f)
+    if cur < w1:
+        liberi.append((cur, w1))
+    out = []
+    for g0, g1 in liberi:
+        pts = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
+        ini = g0
+        for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+            if tb - ta <= 900 and (va - vb >= 1.0 or vb - va >= 0.3):
+                if ta - ini >= 3600:
+                    out.append((ini, ta))
+                ini = tb + 600
+        if g1 - ini >= 3600:
+            out.append((ini, g1))
+    return out
+
+
+def perdita_giorno(temp, tts, cicli, t_at, da, a, litri, ore_da=6, ore_a=23):
+    """Perdita a riposo di giorno (6-23): i gradi persi per ora nei tratti tranquilli, tutti insieme (somma dei gradi / somma delle ore).
+    None se in tutto ci sono meno di 2 ore tranquille."""
+    lt = time.localtime(da)
+    gradi = ore = 0.0
+    n = 0
+    for k in range(0, (a - da) // 86400 + 3):
+        w0 = max(da, _ore_locali(lt, ore=ore_da, giorni=k - 1))
+        w1 = min(a, _ore_locali(lt, ore=ore_a, giorni=k - 1))
+        if w1 - w0 < 3600:
+            continue
+        for g0, g1 in _tratti_calmi(temp, tts, cicli, w0, w1):
+            v0, v1 = t_at(g0, 900), t_at(g1, 900)
+            if v0 is None or v1 is None:
+                continue
+            dentro = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
+            h = (g1 - g0) / 3600.0
+            if (dentro and max(v for _, v in dentro) > v0 + 0.5) or not 0 <= (v0 - v1) / h <= 3:
+                continue
+            gradi += v0 - v1
+            ore += h
+            n += 1
+    if ore < 2:
+        return None
+    r = gradi / ore
+    return {"gradi_ora": round(r, 2), "watt": round(r * litri * 1.163), "ore": round(ore, 1), "tratti": n}
+
+
 def calcola_bollitore(db, da, a, ora, litri=300):
     """Salute del bollitore (stime dalla sonda dell'acqua calda):
     - perdita a riposo: di notte (23-06), nel tratto piu' lungo (>=3 h) senza riscaldo dell'acqua, di quanto scende la temperatura (gradi/ora);
+    - perdita di giorno (6-23): come sopra ma sui tratti tranquilli di almeno 1 ora, senza prelievi (vedi perdita_giorno);
     - salita: nei cicli di riscaldo dell'acqua, di quanto sale la temperatura e in quanto tempo.
     None se i dati non bastano."""
     da, a = int(da), min(int(a), int(ora))
@@ -1354,8 +1711,8 @@ def calcola_bollitore(db, da, a, ora, litri=300):
     perd = []
     lt = time.localtime(da)
     for k in range(0, (a - da) // 86400 + 3):
-        w0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + k - 1, 23, 0, 0, 0, 0, -1)))
-        w1 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + k, 6, 0, 0, 0, 0, -1)))
+        w0 = _ore_locali(lt, ore=23, giorni=k - 1)
+        w1 = _ore_locali(lt, ore=6, giorni=k)
         if w0 < da or w1 > a:
             continue
         occ = sorted((max(i, w0), min(f + 300, w1)) for i, f in cicli if f + 300 > w0 and i < w1)
@@ -1379,7 +1736,7 @@ def calcola_bollitore(db, da, a, ora, litri=300):
         r = (v0 - v1) / ((g1 - g0) / 3600.0)
         if 0 <= r <= 3:
             perd.append(r)
-    out = {"perdita": None, "salita": None, "litri": litri}
+    out = {"perdita": None, "salita": None, "giorno": perdita_giorno(temp, tts, cicli, t_at, da, a, litri), "litri": litri}
     if len(perd) >= 2:
         r = _mediana(perd)
         out["perdita"] = {"gradi_ora": round(r, 2), "watt": round(r * litri * 1.163), "notti": len(perd)}
@@ -1388,7 +1745,7 @@ def calcola_bollitore(db, da, a, ora, litri=300):
         out["salita"] = {"gradi_ora": round(rate, 1), "min_per_10": round(600.0 / rate) if rate > 0 else None,
                          "minuti": round(_mediana([d for d, _ in sal]) / 60), "gradi": round(_mediana([g for _, g in sal]), 1),
                          "cicli": len(sal)}
-    return out if (out["perdita"] or out["salita"]) else None
+    return out if (out["perdita"] or out["salita"] or out["giorno"]) else None
 
 
 SBR_MAX_ELENCO = 50
@@ -1453,7 +1810,7 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         lt = time.localtime(t)
         chiave = time.strftime("%Y-%m-%d", lt)
         g = giorni.setdefault(chiave, {
-            "giorno": chiave, "ts": int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))),
+            "giorno": chiave, "ts": _ore_locali(lt),
             "el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
             "el_cop": {"casa": 0.0, "acs": 0.0}, "min": {"casa": 0, "acs": 0}, "est": [], "nodati_min": 0})
         if m == "nodati":
@@ -1576,7 +1933,7 @@ def api_efficienza(app, q):
         giorni = 7
     giorni = max(1, min(90, giorni))
     lt = time.localtime(ora)
-    oggi0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    oggi0 = _ore_locali(lt)
     da = oggi0 - (giorni - 1) * 86400
     # i confini dei giorni cadono su mezzanotte locale: la griglia da 5 minuti parte da li'
     tol = max(150, int(app.intervallo_pdc() * 1.5))
@@ -1613,7 +1970,7 @@ def csv_esporta(app, q):
     out = io.StringIO()
     w = csv.writer(out, delimiter=";", lineterminator="\r\n")
     lt = time.localtime(ora)
-    oggi0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    oggi0 = _ore_locali(lt)
     if tipo == "misure":
         giorni = max(1, min(7, giorni))
         da = oggi0 - (giorni - 1) * 86400
@@ -1648,9 +2005,21 @@ def csv_esporta(app, q):
 # Icona dell'app (PNG disegnato a mano: serve a iPhone per la schermata Home)
 # --------------------------------------------------------------------------
 
+def _liscio(d, bordo):
+    """1 dentro, 0 fuori, con bordo morbido (d = distanza dal bordo in pixel)."""
+    return max(0.0, min(1.0, 0.5 - d / bordo))
+
+
+def _png(n, tipo_colore, righe, alto=None):
+    """PNG n x alto (quadrato se manca alto) a 8 bit da righe gia' pronte (ciascuna col byte di filtro iniziale); tipo_colore 2 = RGB, 6 = RGBA."""
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, alto or n, 8, tipo_colore, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(righe), 9)) + chunk(b"IEND", b""))
+
+
 def png_icona(n=180):
-    def liscio(d, bordo):  # 1 dentro, 0 fuori, con bordo morbido
-        return max(0.0, min(1.0, 0.5 - d / bordo))
     righe = []
     for y in range(n):
         r = bytearray([0])
@@ -1659,33 +2028,95 @@ def png_icona(n=180):
             d = math.hypot(dx, dy)
             t = y / n
             col = [11 + 12 * t, 15 + 14 * t, 23 + 30 * t]
-            anello = liscio(abs(d - n * .27) - n * .055, 1.4)
+            anello = _liscio(abs(d - n * .27) - n * .055, 1.4)
             if anello:
                 k = (dx / n + .5)
                 c2 = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
                 col = [col[i] * (1 - anello) + c2[i] * anello for i in range(3)]
-            punto = liscio(d - n * .095, 1.4)
+            punto = _liscio(d - n * .095, 1.4)
             if punto:
                 c3 = [52, 211, 176]
                 col = [col[i] * (1 - punto) + c3[i] * punto for i in range(3)]
             r += bytes(int(max(0, min(255, v))) for v in col)
         righe.append(bytes(r))
-    raw = zlib.compress(b"".join(righe), 9)
+    return _png(n, 2, righe)
 
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", raw) + chunk(b"IEND", b""))
+
+def png_favicon(n=64):
+    """Icona della scheda del browser: solo il simbolo (anello e punto), sfondo trasparente e piu' grande di quella della Home."""
+    righe = []
+    for y in range(n):
+        r = bytearray([0])
+        for x in range(n):
+            dx, dy = x + .5 - n / 2, y + .5 - n / 2
+            d = math.hypot(dx, dy)
+            a = _liscio(abs(d - n * .37) - n * .075, 1.1)
+            k = dx / n + .5
+            col = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
+            p = _liscio(d - n * .13, 1.1)
+            if p:
+                col = [col[i] * (1 - p) + (52, 211, 176)[i] * p for i in range(3)]
+                a = max(a, p)
+            r += bytes(int(max(0, min(255, v))) for v in col) + bytes([int(a * 255)])
+        righe.append(bytes(r))
+    return _png(n, 6, righe)
+
+
+# Schermate di avvio per l'iPhone (apple-touch-startup-image): senza, all'apertura dalla Home si vede un lampo bianco.
+# Fondo scuro come la pagina e solo anello e punto al centro; i formati sono i pixel reali dei vari iPhone.
+AVVIO_FORMATI = [  # (larghezza pt, altezza pt, densita')
+    (440, 956, 3), (430, 932, 3), (428, 926, 3), (420, 912, 3), (414, 896, 3), (414, 896, 2), (414, 736, 3),
+    (402, 874, 3), (393, 852, 3), (390, 844, 3), (375, 812, 3), (375, 667, 2)]
+AVVIO_PIXEL = {f"{w * d}x{h * d}": (w * d, h * d) for w, h, d in AVVIO_FORMATI}
+
+
+def png_avvio(w, h):
+    fondo = bytes((11, 15, 23))
+    vuota = b"\x00" + fondo * w
+    n = round(w * .28)          # lato del riquadro con anello e punto
+    x0, y0 = (w - n) // 2, (h - n) // 2
+    righe = [vuota] * h
+    for y in range(n):
+        r = bytearray(b"\x00" + fondo * x0)
+        for x in range(n):
+            dx, dy = x + .5 - n / 2, y + .5 - n / 2
+            d = math.hypot(dx, dy)
+            a = _liscio(abs(d - n * .37) - n * .075, 1.1)
+            k = dx / n + .5
+            col = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
+            pt = _liscio(d - n * .13, 1.1)
+            if pt:
+                col = [col[i] * (1 - pt) + (52, 211, 176)[i] * pt for i in range(3)]
+                a = max(a, pt)
+            r += bytes(int(max(0, min(255, fondo[i] * (1 - a) + col[i] * a))) for i in range(3))
+        r += fondo * (w - x0 - n)
+        righe[y0 + y] = bytes(r)
+    return _png(w, 2, righe, h)
+
+
+_AVVIO = {}
+
+
+def avvio(chiave):
+    if chiave not in _AVVIO:
+        _AVVIO[chiave] = png_avvio(*AVVIO_PIXEL[chiave])
+    return _AVVIO[chiave]
 
 
 _ICONA = []
+_FAVICON = []
 
 
 def icona():
     if not _ICONA:
         _ICONA.append(png_icona())
     return _ICONA[0]
+
+
+def favicon():
+    if not _FAVICON:
+        _FAVICON.append(png_favicon())
+    return _FAVICON[0]
 
 
 MANIFEST = {"name": "Pompa di calore", "short_name": "PDC", "start_url": "/", "display": "standalone",
@@ -1708,6 +2139,20 @@ def ip_client(h):
     if ip in ("127.0.0.1", "::1"):  # dietro cloudflared: l'indirizzo vero sta nell'intestazione
         return h.headers.get("CF-Connecting-IP") or ip
     return ip
+
+
+def da_casa(h):
+    """True solo se la richiesta arriva dalla rete di casa: niente intestazioni del tunnel Cloudflare (le mette sempre
+    lui) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno."""
+    if any(h.headers.get(x) for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "Cf-Visitor")):
+        return False
+    try:
+        ip = ipaddress.ip_address(h.client_address[0].split("%")[0])
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
 def e_https(h):
@@ -1774,6 +2219,21 @@ class Gestore(BaseHTTPRequestHandler):
             t = t.replace("{{" + k + "}}", v)
         return t.replace("{{versione}}", VERSIONE.split()[0]).replace("{{build}}", BUILD)
 
+    def _dati_iniziali(self, app):
+        """La Dashboard gia' pronta dentro la pagina: il browser la disegna subito, senza il giro in piu' per i dati.
+        Vale per la finestra salvata dal browser (cookie pdc_r: 6 o 24 ore); se il browser ne usa un'altra, la ignora."""
+        if self.command == "HEAD":
+            return "null"
+        r = "6h" if self._cookie("pdc_r") == "6h" else "24h"
+        ora = int(time.time())
+        try:
+            q = {"da": [str(ora - (6 if r == "6h" else 24) * 3600)], "a": [str(ora)], "_casa": ["1" if da_casa(self) else "0"]}
+            dati = API["/api/dashboard"](app, q)
+        except Exception:
+            log.exception("dati iniziali della Dashboard")
+            return "null"
+        return json.dumps({"r": r, "dati": dati}, separators=(",", ":"), ensure_ascii=False).replace("<", "\\u003c")
+
     def _cookie(self, nome):
         for parte in self.headers.get("Cookie", "").split(";"):
             k, _, v = parte.strip().partition("=")
@@ -1801,12 +2261,18 @@ class Gestore(BaseHTTPRequestHandler):
             pubbliche = {"/app.css": "text/css; charset=utf-8", "/app.js": "text/javascript; charset=utf-8"}
             if p in pubbliche and p[1:] in WEB_ASSETS:
                 etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta via tunnel)
-                extra = [("Cache-Control", "no-cache"), ("ETag", etag)]
+                # con ?v= uguale alla versione in corso il file non cambia mai: il browser lo tiene senza nemmeno chiedere (un giro in meno)
+                fisso = q.get("v") == [BUILD]
+                extra = [("Cache-Control", "public, max-age=31536000, immutable" if fisso else "no-cache"), ("ETag", etag)]
                 if self.headers.get("If-None-Match") == etag:
                     return self._invia(304, b"", pubbliche[p], extra)
                 return self._invia(200, WEB_ASSETS[p[1:]], pubbliche[p], extra, gz_chiave=p)
             if p == "/icona.png":
                 return self._invia(200, icona(), "image/png", [("Cache-Control", "max-age=86400")])
+            if p.startswith("/avvio/") and p.endswith(".png") and p[7:-4] in AVVIO_PIXEL:
+                return self._invia(200, avvio(p[7:-4]), "image/png", [("Cache-Control", "max-age=86400")])
+            if p == "/favicon.png":
+                return self._invia(200, favicon(), "image/png", [("Cache-Control", "max-age=86400")])
             if p == "/manifest.webmanifest":
                 return self._invia(200, json.dumps(MANIFEST), "application/manifest+json")
             if p == "/login":
@@ -1826,7 +2292,7 @@ class Gestore(BaseHTTPRequestHandler):
                     return self._json({"errore": "non autenticato"}, 401)
                 return self._vai("/login")
             if p == "/":
-                return self._invia(200, self._pagina("index.html"))
+                return self._invia(200, self._pagina("index.html", dati0=self._dati_iniziali(app)))
             if p.startswith("/loghi/") and self.command in ("GET", "HEAD"):
                 return self._logo(app, p[7:])
             if p == "/api/flusso":
@@ -1836,11 +2302,12 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(200, dati, "text/csv; charset=utf-8",
                                    [("Content-Disposition", f'attachment; filename="{nome}"')])
             if p in API and self.command in ("GET", "HEAD"):
+                q["_casa"] = ["1" if da_casa(self) else "0"]
                 return self._json(API[p](app, q))
             if p in API_POST and self.command == "POST":
                 return self._post_api(app, p)
             self._invia(404, "Non trovato", "text/plain; charset=utf-8")
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        except (ConnectionError, TimeoutError):     # il browser se n'e' andato a meta' (pipe rotta, reset, abort 10053 di Windows)
             pass
         except Exception:
             log.exception("errore nella richiesta web %s", self.path)
@@ -1850,10 +2317,10 @@ class Gestore(BaseHTTPRequestHandler):
                 pass
 
     def _logo(self, app, nome):
-        """File dalla cartella dati/loghi (o dalla vecchia 'loghi'). Solo nomi e estensioni previsti: niente percorsi liberi."""
+        """File dalla cartella dati/loghi. Solo nomi e estensioni previsti: niente percorsi liberi."""
         m = re.fullmatch(r"(smarther|samsung|netatmo|bticino)\.(svg|png|webp|jpe?g)", nome)
-        f = next((c / nome for c in cartelle_loghi(app.base) if m and (c / nome).is_file()), None)
-        if not m or f is None or f.stat().st_size > 2_000_000:
+        f = app.base / "dati" / "loghi" / nome
+        if not m or not f.is_file() or f.stat().st_size > 2_000_000:
             return self._invia(404, "Non trovato", "text/plain; charset=utf-8")
         tipo = {"svg": "image/svg+xml", "png": "image/png", "webp": "image/webp", "jpg": "image/jpeg",
                 "jpeg": "image/jpeg"}[m.group(2)]

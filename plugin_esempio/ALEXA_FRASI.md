@@ -35,5 +35,27 @@ Sempre disponibili: *aiuto* (elenca cosa si può chiedere), *stop / annulla* («
 
 ## Note
 
-- Funziona nell'Alexa classica. Con **Alexa+** i nomi di invocazione vengono intercettati dalla "Casa intelligente": non risolto (vedi changelog).
+- Funziona nell'Alexa classica. Con **Alexa+** i nomi di invocazione vengono intercettati dalla "Casa intelligente" o confusi con altre skill e l'esito è instabile: non risolto (vedi changelog); consigliata l'Alexa classica.
+- Per imparare le frasi: usa quelle della tua **Routine** (tabella «Le Routine create» qui sotto); la forma con la skill serve solo se la Routine non c'è.
 - Se aggiungi frasi al modello vocale (`alexa_modello_it.json`): Console Amazon → Build → JSON Editor → incolla → Save → Build.
+
+## Le Routine create nell'app Alexa (04/11/2026, dagli screenshot)
+
+Frase che dici (il «Quando» della Routine) → azione Personalizzata `chiedi a centrale termica <frase della tabella sopra>`. Sono 11, una per domanda, nessuna ripetuta:
+
+| # | Frase che dici | Cosa chiede |
+|---|---|---|
+| 1 | che temperatura c'è in casa | temperatura |
+| 2 | che umidità c'è in casa | umidità |
+| 3 | quanti gradi ci sono fuori | temperatura fuori |
+| 4 | che umidità c'è fuori | umidità fuori |
+| 5 | il riscaldamento è acceso | riscaldamento acceso |
+| 6 | a che ora partirà il riscaldamento | quando riparte |
+| 7 | cosa sta facendo la pompa di calore | pompa di calore |
+| 8 | a che temperatura è l'acqua calda | acqua calda |
+| 9 | che mandata ha il riscaldamento | mandata |
+| 10 | Accendi il termostato | accendi il termostato |
+| 11 | spegni il termostato | spegni il termostato |
+
+Con Alexa+ (prova del 04/11): la skill risponde bene ma Alexa+ a volte sceglie un'altra skill (riuscito al 5° tentativo); «apri centrale termica» non parte, «apri la skill centrale termica» si; il saluto «Benvenuto in <nome pubblico della skill>» lo dice Alexa. Frasi-variante da aggiungere: vedi PIANO.md.
+

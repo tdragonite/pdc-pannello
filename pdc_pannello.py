@@ -3,12 +3,12 @@
 """
 Pannello locale per pompa di calore Samsung EHS (SmartThings) + Smarther (Netatmo).
 
-PEZZI FATTI: 1 nucleo, 2 web con Dashboard, 3 Analisi ed Efficienza, 4 Telegram, 5 Impostazioni modificabili, 6 tunnel Cloudflare, 7 storico compatto e README:
+Cosa fa:
+  - legge a intervalli SmartThings (pompa) e Netatmo (Smarther) e salva tutto in SQLite (dati/pdc.db)
+  - decodifica i dati "ehsCycleData" (mandata, ritorno, esterna, portata, Hz, pompa)
+  - serve il pannello web (Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni, Changelog)
+  - avvisi Telegram, tunnel Cloudflare, plugin (Alexa, widget), backup e compattazione notturni
   - configurazione in config.json (stesso file di pdc_strumenti.py)
-  - lettura periodica di SmartThings (pdc) e Netatmo (Smarther)
-  - decodifica dei dati "ehsCycleData" (mandata, ritorno, esterna, portata, Hz, pompa)
-  - database SQLite nella stessa cartella dello script
-  - gestione errori/anomalie con eventi (a cui Telegram si agganciera' nel pezzo 4)
 
 Solo libreria standard di Python (3.9 o piu' recente). Tutto vive nella cartella dello script.
 
@@ -24,7 +24,8 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.21.1"
+VERSIONE = "0.25.1"
+PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
 import base64
@@ -102,7 +103,7 @@ _OUTDOOR = {
 MAPPA_CICLO_DEFAULT = {
     "_nota": "valore = (byte + offset) * scala. Fonte: guida di decodifica Dwellsee. Per disattivare "
              "un campo metti \"attivo\": false. Dopo ogni modifica: python pdc_pannello.py ridecodifica",
-    "outdoor_28": dict(_OUTDOOR, aspirazione=_t(7)),
+    "outdoor_28": dict(_OUTDOOR, aspirazione=_t(7), scarico=_t(4, -20, 150)),     # su questa pdc lo scarico e' nel byte 4 (il 5 e' sempre 255)
     "outdoor_18": dict(_OUTDOOR),
     "indoor_31": {
         "ritorno": _t(2),
@@ -323,6 +324,13 @@ def unisci(base, extra):
     return out
 
 
+# Testi predefiniti che una versione ha cambiato: (percorso nel config.json, testo della versione precedente). Vedi Config.completa().
+TESTI_PREDEFINITI_VECCHI = [
+    (("telegram", "messaggi", "sbrinamento_inizio"), "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}."),
+    (("telegram", "messaggi", "sbrinamento_fine"), "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}."),
+]
+
+
 class Config:
     def __init__(self, path):
         self.path = Path(path)
@@ -357,9 +365,23 @@ class Config:
                 elif isinstance(v, dict) and isinstance(raw[k], dict):
                     mod = rec(raw[k], v) or mod
             return mod
+        def rinnova(raw):
+            """Un testo predefinito cambiato in una versione nuova: si aggiorna SOLO se nel file c'e' ancora identico quello vecchio
+            (se l'hai personalizzato non si tocca)."""
+            mod = False
+            for percorso, vecchio in TESTI_PREDEFINITI_VECCHI:
+                dove, nuovo = raw, TEMPLATE
+                for k in percorso[:-1]:
+                    dove, nuovo = dove.get(k) if isinstance(dove, dict) else None, nuovo.get(k) if isinstance(nuovo, dict) else None
+                if isinstance(dove, dict) and isinstance(nuovo, dict) and dove.get(percorso[-1]) == vecchio and nuovo.get(percorso[-1]) not in (None, vecchio):
+                    dove[percorso[-1]] = nuovo[percorso[-1]]
+                    mod = True
+            return mod
         with self.lock:
             raw = self._raw()
-            if rec(raw, TEMPLATE):
+            mod = rec(raw, TEMPLATE)
+            mod = rinnova(raw) or mod
+            if mod:
                 self._scrivi(raw)
                 return True
         return False
@@ -403,6 +425,8 @@ CREATE TABLE IF NOT EXISTS ciclo(tipo TEXT NOT NULL, ts INTEGER NOT NULL, hex TE
 CREATE TABLE IF NOT EXISTS eventi(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
     codice TEXT NOT NULL, livello TEXT NOT NULL, testo TEXT NOT NULL, chiuso_ts INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS finestre(da INTEGER PRIMARY KEY, a INTEGER NOT NULL, calo REAL, ah REAL,
+    stato TEXT NOT NULL, manuale INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sessioni(h TEXT PRIMARY KEY, scade INTEGER NOT NULL);
 """
 
@@ -415,6 +439,12 @@ class Rec:
         self.stati = {}    # serie -> testo
         self.ciclo = []    # (tipo, ts, hex)
         self.problemi = []  # problemi di decodifica
+
+    def agg_num(self, serie, ts, val, lento=False):
+        """Aggiunge un valore numerico (se lo e': i dati mancanti o strani si saltano)."""
+        val = _num(val)
+        if val is not None:
+            self.num.append((serie, ts, val, lento))
 
 
 class ErroreDB(ErroreConfig):
@@ -471,6 +501,10 @@ class DB:
     def ultimi(self):
         with closing(self._c()) as c:
             return c.execute("SELECT serie, ts, num, txt FROM ultimo ORDER BY serie").fetchall()
+
+    def ultimi_dict(self):
+        """{serie: (serie, ts, num, txt)}: l'ultimo valore di ogni serie."""
+        return {r[0]: r for r in self.ultimi()}
 
     def ridecodifica(self, mappa):
         with self.lock, closing(self._c()) as c, c:
@@ -560,20 +594,57 @@ class Eventi:
 # TOKEN
 # ==========================================================================
 
+def _ore_locali(lt, giorni=0, ore=0):
+    """Epoch dell'ora locale `ore` del giorno di `lt` (un time.struct_time locale), spostato di `giorni` giorni: con l'ora legale si
+    lascia fare a mktime (giorni=-1, ore=23 vale «ieri alle 23»)."""
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + giorni, ore, 0, 0, 0, 0, -1)))
+
+
 def _basic(cid, secret):
     return "Basic " + base64.b64encode(f"{cid}:{secret}".encode()).decode()
 
 
-class TokenST:
-    """Token SmartThings: OAuth (si rinnova da solo) oppure PAT (24 ore, incollato a mano)."""
+class _TokenOAuth:
+    """Parte comune dei token: un rinnovo OAuth con refresh token. Il refresh token e' MONOUSO: la risposta si salva SUBITO
+    in config.json, altrimenti se si perde bisogna rifare l'autorizzazione."""
 
-    def __init__(self, cfg, db):
-        self.cfg, self.db = cfg, db
+    def __init__(self, cfg):
+        self.cfg = cfg
         self.lock = threading.Lock()
         self.forza = False
 
     def invalida(self):
         self.forza = True
+
+    def _rinnova_oauth(self, nome, url, intestazioni, corpo, rifiuto, scadenza_def, percorso):
+        """POST al servizio, poi salva access/refresh token e scadenza nella sezione `percorso` di config.json."""
+        code, js = http_json("POST", url, intestazioni, corpo)
+        if code != 200 or "access_token" not in js:
+            e = classifica(nome, code, js)
+            if e.tipo in ("richiesta", "auth"):
+                raise ErroreAPI("auth", code, rifiuto)
+            raise e
+        scad = int(time.time()) + int(js.get("expires_in", scadenza_def))
+
+        def salva(raw):
+            o = raw
+            for k in percorso:
+                o = o.setdefault(k, {})
+            o["access_token"] = js["access_token"]
+            if js.get("refresh_token"):
+                o["refresh_token"] = js["refresh_token"]
+            o["expires_at"] = scad
+        self.cfg.aggiorna(salva)
+        self.forza = False
+        return js["access_token"]
+
+
+class TokenST(_TokenOAuth):
+    """Token SmartThings: OAuth (si rinnova da solo) oppure PAT (24 ore, incollato a mano)."""
+
+    def __init__(self, cfg, db):
+        super().__init__(cfg)
+        self.db = db
 
     def usa_pat(self):
         oa = self.cfg.leggi()["smartthings"]["oauth"]
@@ -603,41 +674,16 @@ class TokenST:
         return (time.time() - float(t)) / 3600 if t else None
 
     def _rinnova(self, oa):
-        code, js = http_json(
-            "POST", ST_BASE + "/oauth/token",
+        return self._rinnova_oauth(
+            "SmartThings", ST_BASE + "/oauth/token",
             {"Authorization": _basic(oa["client_id"], oa["client_secret"]),
              "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-            {"grant_type": "refresh_token", "client_id": oa["client_id"],
-             "refresh_token": oa["refresh_token"]})
-        if code != 200 or "access_token" not in js:
-            e = classifica("SmartThings", code, js)
-            if e.tipo in ("richiesta", "auth"):
-                raise ErroreAPI("auth", code, "SmartThings: il rinnovo del token OAuth e' stato rifiutato. "
-                                              "Il refresh token e' scaduto o gia' usato: rifai "
-                                              "'python pdc_strumenti.py st-oauth'.")
-            raise e
-        scad = int(time.time()) + int(js.get("expires_in", 86400))
-
-        def salva(raw):  # SUBITO: il refresh token e' monouso, se si perde si ricomincia
-            o = raw.setdefault("smartthings", {}).setdefault("oauth", {})
-            o["access_token"] = js["access_token"]
-            if js.get("refresh_token"):
-                o["refresh_token"] = js["refresh_token"]
-            o["expires_at"] = scad
-        self.cfg.aggiorna(salva)
-        self.forza = False
-        return js["access_token"]
+            {"grant_type": "refresh_token", "client_id": oa["client_id"], "refresh_token": oa["refresh_token"]},
+            "SmartThings: il rinnovo del token OAuth e' stato rifiutato. Il refresh token e' scaduto o gia' usato: "
+            "rifai 'python pdc_strumenti.py st-oauth'.", 86400, ("smartthings", "oauth"))
 
 
-class TokenNT:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.lock = threading.Lock()
-        self.forza = False
-
-    def invalida(self):
-        self.forza = True
-
+class TokenNT(_TokenOAuth):
     def get(self):
         with self.lock:
             n = self.cfg.leggi()["netatmo"]
@@ -647,28 +693,13 @@ class TokenNT:
             if (not self.forza and n.get("access_token")
                     and time.time() < float(n.get("expires_at") or 0) - 120):
                 return n["access_token"]
-            code, js = http_json(
-                "POST", NT_BASE + "/oauth2/token",
+            return self._rinnova_oauth(
+                "Netatmo", NT_BASE + "/oauth2/token",
                 {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
                 {"grant_type": "refresh_token", "refresh_token": n["refresh_token"],
-                 "client_id": n["client_id"], "client_secret": n["client_secret"]})
-            if code != 200 or "access_token" not in js:
-                e = classifica("Netatmo", code, js)
-                if e.tipo in ("richiesta", "auth"):
-                    raise ErroreAPI("auth", code, "Netatmo: il rinnovo del token e' stato rifiutato. Se hai "
-                                                  "rigenerato i token dal portale, copia in config.json quelli NUOVI.")
-                raise e
-            scad = int(time.time()) + int(js.get("expires_in", 10800))
-
-            def salva(raw):
-                o = raw.setdefault("netatmo", {})
-                o["access_token"] = js["access_token"]
-                if js.get("refresh_token"):
-                    o["refresh_token"] = js["refresh_token"]
-                o["expires_at"] = scad
-            self.cfg.aggiorna(salva)
-            self.forza = False
-            return js["access_token"]
+                 "client_id": n["client_id"], "client_secret": n["client_secret"]},
+                "Netatmo: il rinnovo del token e' stato rifiutato. Se hai rigenerato i token dal portale, "
+                "copia in config.json quelli NUOVI.", 10800, ("netatmo",))
 
 
 # ==========================================================================
@@ -691,9 +722,7 @@ def estrai_st(status, mappa, ts):
     rec = Rec()
 
     def n(serie, val, lento=False, t=None):
-        val = _num(val)
-        if val is not None:
-            rec.num.append((serie, t or ts, val, lento))
+        rec.agg_num(serie, t or ts, val, lento)
 
     def s(serie, val):
         if val is not None and val != "":
@@ -778,9 +807,7 @@ def estrai_netatmo(js, room_id, ts):
     modulo = next((m for m in moduli if m.get("type") == "BNS"), moduli[0] if moduli else None)
 
     def n(serie, val, lento=False):
-        val = _num(val)
-        if val is not None:
-            rec.num.append((serie, ts, val, lento))
+        rec.agg_num(serie, ts, val, lento)
 
     if stanza:
         n("casa.temperatura", stanza.get("therm_measured_temperature"))
@@ -1172,12 +1199,6 @@ class ServizioNT(Raccoglitore):
         return self.app.db.salva(rec, ts)
 
 
-def cartelle_loghi(base):
-    """Dove cercare i loghi: dati/loghi (nuova) e, per abitudine, anche la vecchia 'loghi' accanto allo script."""
-    base = Path(base)
-    return [base / "dati" / "loghi", base / "loghi"]
-
-
 def cartella_log(base):
     p = Path(base) / "log"
     try:
@@ -1185,124 +1206,6 @@ def cartella_log(base):
     except OSError:
         pass
     return p
-
-
-def _sposta(src, dst):
-    """Sposta un file o una cartella senza mai sovrascrivere nulla. Una cartella gia' presente nella destinazione
-    non si cancella: ci si aggiungono solo i file che mancano. -> True se qualcosa e' stato spostato."""
-    src, dst = Path(src), Path(dst)
-    if not src.exists():
-        return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_dir() and dst.is_dir():
-        fatto = False
-        for f in list(src.iterdir()):
-            if not (dst / f.name).exists():
-                os.replace(f, dst / f.name)
-                fatto = True
-        try:
-            src.rmdir()
-        except OSError:
-            pass
-        return fatto
-    if dst.exists():
-        return False
-    os.replace(src, dst)
-    return True
-
-
-def riordina_cartelle(base, cfg):
-    """Dalla vecchia disposizione (tutto accanto allo script) alle sottocartelle dati/, log/, cloudflared/.
-    Sposta e basta (stesso disco: un rinomina, non una copia), mai sovrascrive; il database si sposta con i suoi -wal/-shm
-    tutto insieme o per niente. Si fa solo con il pannello fermo.
-    -> (codice, righe): codice 0 = si puo' proseguire, altrimenti il programma deve fermarsi (con le righe da mostrare)."""
-    base = Path(base)
-    righe = []
-    try:
-        g = cfg.leggi()
-    except ErroreConfig:
-        return 0, []                       # il config rotto lo segnala chi lo usa dopo
-    gen, bk = g.get("generale", {}), g.get("backup") or {}
-    db_vecchio = str(gen.get("database", "")) == "pdc.db"
-    bk_vecchio = str(bk.get("cartella", "")) == "backup"
-    lavori = []                            # (descrizione, src, dst)
-    db_files = [(base / n, base / "dati" / n) for n in ("pdc.db", "pdc.db-wal", "pdc.db-shm")] if db_vecchio else []
-    if db_vecchio and (base / "pdc.db").exists() and (base / "dati" / "pdc.db").exists():
-        return 1, ["Trovo due database: pdc.db (vecchio) e dati/pdc.db (nuovo). Non decido io quale sia quello giusto.",
-                   "Tieni quello con i dati e sposta l'altro altrove (per esempio rinominandolo), poi rilancia."]
-    for s, d in db_files:
-        if s.exists():
-            lavori.append(("database", s, d))
-    if bk_vecchio and (base / "backup").exists():
-        lavori.append(("backup", base / "backup", base / "dati" / "backup"))
-    if (base / "loghi").is_dir():
-        lavori.append(("loghi", base / "loghi", base / "dati" / "loghi"))
-    for nome in ("pdc_pannello.log", "pdc_pannello.log.1", "pdc_pannello.log.2", "pdc_pannello.log.3"):
-        if (base / nome).exists() and not (base / "log" / nome).exists():
-            lavori.append(("log", base / nome, base / "log" / nome))
-    for f in sorted(base.glob("dump_*.json")):          # i file di diagnosi (strumenti e esporta-diagnostica) hanno una cartella a parte
-        if not (base / "diagnostica" / f.name).exists():
-            lavori.append(("diagnostica", f, base / "diagnostica" / f.name))
-    if (base / "dati" / "diagnostica.json").exists() and not (base / "diagnostica" / "diagnostica.json").exists():
-        lavori.append(("diagnostica", base / "dati" / "diagnostica.json", base / "diagnostica" / "diagnostica.json"))
-    if (base / "cloudflared.log").exists() and not (base / "log" / "cloudflared.log").exists():
-        lavori.append(("log", base / "cloudflared.log", base / "log" / "cloudflared.log"))
-    if (base / "cloudflared.pid").exists() and not (base / "cloudflared" / "cloudflared.pid").exists():
-        lavori.append(("tunnel", base / "cloudflared.pid", base / "cloudflared" / "cloudflared.pid"))
-    if not lavori and not db_vecchio and not bk_vecchio:
-        return 0, []
-    if lavori:
-        # sposto file che potrebbero essere in uso: serve la certezza che il pannello non sia acceso
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind(("127.0.0.1", int(gen.get("porta_lock", 7099))))
-        except OSError:
-            return 1, ["Un'altra copia del pannello e' accesa: prima di aggiornare le cartelle chiudila, poi rilancia."]
-        finally:
-            s.close()
-    fatti = []
-    try:
-        # il database va spostato intero, o per niente
-        for desc, s, d in lavori:
-            if desc != "database":
-                continue
-            d.parent.mkdir(parents=True, exist_ok=True)
-            if d.exists():
-                raise OSError(f"{d.name} esiste gia' in dati/")
-            os.replace(s, d)
-            fatti.append((s, d))
-    except OSError as e:
-        for s, d in reversed(fatti):
-            try:
-                os.replace(d, s)
-            except OSError:
-                pass
-        return 1, [f"Non riesco a spostare il database in dati/ ({e}). Non ho toccato nulla: e' aperto in un altro programma?"]
-    if fatti:
-        righe.append("database spostato in dati/")
-    for desc, s, d in lavori:
-        if desc == "database":
-            continue
-        try:
-            if _sposta(s, d):
-                righe.append(f"{s.name} -> {d.parent.relative_to(base)}/")
-        except OSError as e:
-            righe.append(f"{s.name} lasciato dov'era ({e})")
-    try:
-        def agg(raw):
-            if db_vecchio:
-                raw.setdefault("generale", {})["database"] = "dati/pdc.db"
-            if bk_vecchio and isinstance(raw.get("backup"), dict):
-                raw["backup"]["cartella"] = "dati/backup"
-        cfg.aggiorna(agg)
-    except (ErroreConfig, OSError) as e:
-        for s, d in reversed(fatti):
-            try:
-                os.replace(d, s)
-            except OSError:
-                pass
-        return 1, [f"Non riesco ad aggiornare config.json ({e}): ho rimesso il database dov'era."]
-    return 0, ([("Cartelle riordinate: " + "; ".join(righe))] if righe else [])
 
 
 class App:
@@ -1333,7 +1236,6 @@ class App:
         self.token_st = TokenST(self.cfg, self.db)
         self.token_nt = TokenNT(self.cfg)
         self.servizi = [] if demo else [ServizioST(self), ServizioNT(self)]
-        self._lock_sock = None
 
     def intervallo_pdc(self):
         if self.demo:
@@ -1375,6 +1277,7 @@ class App:
 # ==========================================================================
 
 import bisect
+import collections
 import gzip
 import hmac
 import math
@@ -1438,10 +1341,12 @@ main{min-width:0;padding:22px 26px 40px}
 .chips button{border:0;background:none;padding:8px 14px;border-radius:9px;color:var(--mut);cursor:pointer;font-size:14px;min-height:36px}
 .chips button.on{background:var(--card2);color:var(--txt);box-shadow:0 1px 0 rgba(255,255,255,.06) inset}
 [hidden]{display:none!important}
-.custom{display:flex;flex-wrap:wrap;gap:10px;align-items:end;background:var(--card);border:1px solid var(--linea);border-radius:var(--r);padding:12px 14px;margin-bottom:16px}
-.custom label{display:grid;gap:4px;font-size:12px;color:var(--mut)}
-.custom input{font-size:16px;background:var(--bg2);border:1px solid var(--linea);color:var(--txt);border-radius:10px;padding:9px 10px;color-scheme:dark}
-.custom button{border:0;border-radius:10px;padding:11px 16px;background:var(--acs);color:#06101d;font-weight:650;cursor:pointer}
+.custom{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;background:var(--card);border:1px solid var(--linea);border-radius:var(--r);padding:8px 16px;margin-bottom:16px}
+.custom label{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mut)}
+.custom input{font:inherit;font-size:14px;height:32px;box-sizing:border-box;background:var(--bg2);border:1px solid var(--linea);color:var(--txt);border-radius:8px;padding:0 10px;color-scheme:dark}
+.custom button{height:32px;border:0;border-radius:8px;padding:0 14px;font-size:13px;background:var(--acs);color:#06101d;font-weight:650;cursor:pointer}
+#i-t{flex:1;font-size:13px;color:var(--mut)}#i-t b{color:var(--txt);font-weight:600;font-variant-numeric:tabular-nums}
+@media (max-width:513px){.custom label{display:grid;grid-template-columns:2.2em 1fr;width:100%}.custom label input{min-width:0;font-size:16px;height:36px}.custom button{width:100%;height:36px}#i-t{flex-basis:100%}}
 .avviso{--c:var(--c-bad);display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:12px;margin-bottom:10px;font-size:14px;
   background:rgba(var(--c),.09);border:1px solid rgba(var(--c),.3)}
 .avviso.warn{--c:var(--c-en)}
@@ -1503,6 +1408,7 @@ main{min-width:0;padding:22px 26px 40px}
 .mt-pi.certa{color:#6cb4ff}.mt-pi.possibile{color:var(--warn)}.mt-pi.nessuna{color:var(--mut2);font-weight:500}
 .mt-pan{position:fixed;z-index:60;padding:12px 14px;border-radius:14px;background:#0a0f19;border:1px solid rgba(255,255,255,.12);box-shadow:0 14px 40px rgba(0,0,0,.6);font-size:12.5px;font-variant-numeric:tabular-nums}
 .mt-pan .eti{margin-bottom:4px}
+.mt-pan .riga{padding:3px 0;border:0;font-size:inherit}
 .mt-r{display:grid;grid-template-columns:20px 46px 34px 1fr;gap:10px;align-items:center;padding:3px 0;color:var(--mut)}
 .mt-r b{color:var(--txt);text-align:right}
 .mt-mm{white-space:nowrap;text-align:right}
@@ -1554,6 +1460,7 @@ main{min-width:0;padding:22px 26px 40px}
 .gr .cur-tx,#eff .cur-tx{fill:var(--txt);font-size:11.5px;font-variant-numeric:tabular-nums}
 .gr .cur-tx .nd{fill:var(--mut)}
 .bordo-vuoto{stroke:#8793a8;stroke-opacity:.4;stroke-width:1;stroke-dasharray:3 3}
+.bordo-vuoto.fin{stroke:#23a876;stroke-opacity:1}[data-fin]{cursor:pointer}
 .gl{stroke:rgba(255,255,255,.06)}.gv{stroke:rgba(255,255,255,.035)}
 .cur{stroke:rgba(255,255,255,.32);stroke-width:1}
 .legg{display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:flex-end;font-size:12.5px;color:var(--mut)}
@@ -1567,7 +1474,7 @@ main{min-width:0;padding:22px 26px 40px}
 #eff svg .vt{fill:var(--txt);font-size:10.5px}
 #eff svg .ass{fill:var(--mut)}
 .nota.f{color:var(--mut2);font-size:12px;line-height:1.5;margin:14px 2px 4px}
-.nota.f span{display:block;text-wrap:balance}
+.nota.f span{display:block}
 @media (max-width:760px){.nota.f span{text-wrap:pretty}.nota.f span+span{margin-top:4px}}
 .grid2.uguali{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 #eff .grid2,#eff>.avviso,#eff>.card{margin-top:14px}
@@ -1576,8 +1483,9 @@ main{min-width:0;padding:22px 26px 40px}
 /* ---------- impostazioni ---------- */
 #imp .card{margin-bottom:14px}
 .sez-t{margin:22px 2px 10px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
+.nota-sez,.fsv-edit small{text-wrap:pretty}
 .nota-sez{color:var(--mut);font-size:13px;margin:6px 0 4px}
-.campo input[type=text],.campo input[type=password],.campo input[type=time],.campo textarea{width:100%;font:inherit;font-size:16px;background:var(--bg2);
+.campo input[type=text],.campo input[type=password],.campo input[type=time],.campo select,.campo textarea{width:100%;font:inherit;font-size:16px;background:var(--bg2);
   border:1px solid var(--linea);color:var(--txt);border-radius:10px;padding:10px 12px;color-scheme:dark}
 .campo textarea{display:block;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:13.5px;line-height:1.45}
 .campo input:focus,.campo textarea:focus{outline:2px solid color-mix(in srgb,var(--acs) 60%,transparent);outline-offset:0}
@@ -1620,7 +1528,6 @@ details.guida{margin:12px 0;background:var(--bg2);border:1px solid var(--linea);
 details.guida summary{cursor:pointer;font-weight:650}
 details.guida ol{margin:10px 0 4px;padding-left:20px;display:grid;gap:8px;color:var(--mut);font-size:14px}
 details.guida b{color:var(--txt)}
-.campo select{width:100%;font:inherit;font-size:16px;background:var(--bg2);border:1px solid var(--linea);color:var(--txt);border-radius:10px;padding:10px 12px;color-scheme:dark}
 ul.passi{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px;font-size:14px}
 ul.passi li.ok{color:var(--ok)}ul.passi li.bad{color:var(--bad)}
 a{color:var(--acs)}
@@ -1653,7 +1560,7 @@ a{color:var(--acs)}
 .nota-cv.lun{margin:14px 2px 4px}.nota-cv.lun li{align-items:flex-start}.nota-cv.lun .in{margin-top:3px}.nota-cv.lun .tt{display:none}@media (hover:none){.nota-cv.lun .tt{display:flex}}
 .vuoto{color:var(--mut);padding:30px 6px;text-align:center}
 
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(98,235,166,.55)}70%{box-shadow:0 0 0 7px rgba(98,235,166,0)}100%{box-shadow:0 0 0 0 rgba(52,211,176,0)}}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(98,235,166,.55)}70%{box-shadow:0 0 0 7px rgba(98,235,166,0)}100%{box-shadow:0 0 0 0 rgba(98,235,166,0)}}
 @keyframes flash{0%{color:#fff;text-shadow:0 0 14px var(--acc,#fff)}100%{text-shadow:none}}
 
 /* ---------- telefono ---------- */
@@ -1664,16 +1571,17 @@ a{color:var(--acs)}
   .shell{grid-template-columns:1fr}
   .nav{position:fixed;z-index:10;left:0;right:0;bottom:0;top:auto;height:auto;flex-direction:row;justify-content:space-around;gap:0;
     padding:6px 6px calc(6px + var(--sab));border-right:0;border-top:1px solid var(--linea);background:rgba(11,15,23,.92)}
-  .brand,.nav .sp{display:none}
+  .brand,.nav .sp,.nav a.mini{display:none}
   .nav a,.nav button.esci{flex-direction:column;gap:3px;padding:7px 4px;font-size:11px;text-align:center;justify-content:center;flex:1;min-height:52px}
   .nav form{flex:1;display:flex}
   main{padding:calc(16px + var(--sat)) 14px calc(86px + var(--sab))}
   .top h1{font-size:22px}
   .stato{order:3;flex-basis:100%}
-  .chips{width:100%}.chips button{flex:1;padding:9px 6px}
+  .chips{width:100%}.chips button{flex:1;padding:9px 6px}.chips:has(.conf-btn){gap:2px}.chips:has(.conf-btn) button{font-size:13px;padding:9px 3px;white-space:nowrap}.chips:has(.conf-btn) .conf-btn{padding-left:9px;margin-left:2px}
   .cards{grid-template-columns:1fr 1fr;gap:10px}
   .cards .card:last-child:nth-child(odd){grid-column:1/-1}
-  .card{padding:13px 13px 8px}
+  .card{padding:13px 13px 8px}.custom{padding:8px 13px}
+  .fsv-gr:not([open]){padding-bottom:13px}
   .val{flex-direction:column;align-items:flex-start;gap:6px}
   .val .n{font-size:30px}
   .spark{max-width:none;width:100%;height:30px;flex:none}
@@ -1700,19 +1608,21 @@ a{color:var(--acs)}
 .dev-logo.piccolo{height:14px;max-width:80px}
 .dev-logo.lg-smarther{height:20px}
 .nel-testo{height:9px;vertical-align:baseline;margin:0 1px;object-fit:contain;opacity:.8}
-.nel-testo.bianco{filter:brightness(0) invert(1)}
 .con{font-size:12px;white-space:nowrap}
 .marca-riga{display:inline-flex;flex-direction:row;align-items:center;gap:7px;white-space:nowrap}
 .dev-logo.in-riga{height:12px;max-width:90px;vertical-align:middle}
-.dev-logo.bianco,.logo-et.bianco{filter:brightness(0) invert(1)}
+.bianco{filter:brightness(0) invert(1)}
 .dev-marca{font-weight:700;font-size:15px;letter-spacing:.02em;padding:6px 10px;border-radius:10px;background:var(--card2);flex:none}
 .dev-st{display:grid;gap:4px;justify-items:end}
 .dev-gr{margin-top:12px}
 .dev-gr h3{margin:0 0 2px}
 .dev .riga b,.plg .riga b{max-width:68%;word-break:break-word;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
-.dev .riga b .val-c,.plg .riga b .val-c{font-variant-numeric:tabular-nums}
+.dev .riga b .val-c,.plg .riga b .val-c{font-variant-numeric:tabular-nums;text-wrap:balance}
+.dev .riga>span:first-child,.plg .riga>span:first-child{max-width:62%}
 .dev .riga,.plg .riga{align-items:flex-start}
-.nota-r{font-weight:400;font-size:12px;text-align:right}
+.dev .riga b{margin-left:auto}
+.dev .riga:has(>.matita){align-items:center}
+.nota-r{font-weight:400;font-size:12px;text-align:right;text-wrap:balance}
 .cv{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:4px 8px}
 .copia{font:inherit;font-size:11.5px;font-weight:600;color:var(--mut);background:var(--card2);border:1px solid var(--linea);border-radius:8px;padding:2px 9px;cursor:pointer}
 .copia:hover{color:var(--txt)}
@@ -1724,12 +1634,12 @@ a{color:var(--acs)}
 .sub-tabs a{padding:7px 16px;border-radius:9px;color:var(--mut);text-decoration:none;font-size:14px;font-weight:600}
 .sub-tabs a.on{background:var(--card2);color:var(--txt)}
 .fsv-gr{margin-bottom:14px}
-.fsv-gr>summary{display:flex;justify-content:space-between;gap:12px;align-items:baseline;cursor:pointer;list-style:none;font-weight:700}
+.fsv-gr:not([open]){padding-bottom:15px}
+.fsv-gr>summary{display:flex;justify-content:space-between;gap:12px;align-items:center;cursor:pointer;list-style:none;font-weight:700}
 .fsv-gr>summary::-webkit-details-marker{display:none}
-.fsv-gr>summary .d{font-weight:400;font-size:12.5px;color:var(--mut)}
+.fsv-gr>summary .d{font-weight:400;font-size:12.5px;color:var(--mut);white-space:nowrap}
 .fsv-gr[open]>summary{margin-bottom:6px}
 .fsv-id{display:inline-block;min-width:42px;margin-right:8px;font-style:normal;font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:var(--mut2)}
-.dev .riga>span:first-child,.plg .riga>span:first-child{max-width:62%}
 details.riq>summary .pill{margin-left:auto}
 .rosso{color:#ff6b6b}
 details.riq>summary::after,.fsv-gr>summary .d::after,.cl-vecchie>summary::before,.come-b::after,.tile[data-come] small::after{content:"";display:inline-block;flex:none;width:var(--chv,7px);height:var(--chv,7px);border:solid currentColor;border-width:0 var(--chw,2px) var(--chw,2px) 0;transform:rotate(-45deg);transition:transform .15s}
@@ -1743,13 +1653,13 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 .sw.bloccato{filter:grayscale(.4)}
 #cmd-lock .sbloccato{border-color:#ffc83d;color:#ffc83d}
 .pager{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:10px;color:var(--mut);font-size:13px}
-.pager button{width:34px;height:30px;border-radius:9px;border:1px solid var(--linea);background:var(--card);color:var(--testo,inherit);font-size:18px;line-height:1;cursor:pointer}
+.pager button{width:34px;height:30px;border-radius:9px;border:1px solid var(--linea);background:var(--card);color:inherit;font-size:18px;line-height:1;cursor:pointer}
 .pager button:disabled{opacity:.35;cursor:default}
-.vecchio-et{color:var(--warn,#ffb547)}
+.vecchio-et{color:var(--warn)}
 .nav a.mini{font-size:13px;padding:8px 12px;color:var(--mut);opacity:.8}
 .nav a.mini svg{width:17px;height:17px}
 .nav a.mini.on{opacity:1}
-.lnk{color:var(--acs,#4da3ff);text-decoration:none;font-weight:600}
+.lnk{color:var(--acs);text-decoration:none;font-weight:600}
 .changelog{display:flex;flex-direction:column;gap:22px;max-width:760px}
 .cl-breve{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--linea);border-radius:var(--r);padding:14px 18px;display:grid;gap:10px}
 .cl-bi{display:flex;align-items:flex-start;gap:12px;font-size:14px;color:var(--mut);line-height:1.4}
@@ -1780,19 +1690,18 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 .cl-vecchie>.cl-v:last-child{margin-bottom:0}
 .cl-vecchie>.eti{margin:0 0 20px}
 @media (max-width:700px){.cl-v li{display:block}.cl-v li .pill{display:inline-block;padding:1px 8px;margin-right:9px;vertical-align:1px}.cl-d{margin-left:0;flex-basis:100%}}
-@media (max-width:760px){.nav a.mini{display:none}}
 #dsp>article.card{margin-bottom:14px}#dsp>article.card:last-child{margin-bottom:0}
 .chips .conf-btn{margin-left:4px;border-left:1px solid var(--linea);border-radius:0 9px 9px 0;padding-left:16px}
 .conf-r{display:flex;justify-content:space-between;gap:10px;margin-top:8px;padding-top:8px;border-top:1px dashed var(--linea);font-size:13px;color:var(--mut)}
 .conf-r b{color:var(--txt);font-weight:600}
 .conf-d{font-weight:700;color:var(--mut)}
-.conf-d.buono{color:var(--ok,#62eba6)}.conf-d.cattivo{color:var(--casa,#ff6b57)}
+.conf-d.buono{color:var(--ok)}.conf-d.cattivo{color:var(--casa)}
 .nota.conf-nota{margin-top:0}
 .conf-t{display:block;margin-top:4px;color:var(--mut);font-size:12px}
 .azioni-t{display:flex;gap:8px}
 .azioni-t .sec{padding:6px 12px;font-size:13px}
 .reg-filtro{display:flex;align-items:center;gap:8px;margin:12px 0 8px;font-size:14px;color:var(--mut)}
-.reg-log{max-height:420px;overflow:auto;background:var(--card2,#0e1420);border:1px solid var(--linea);border-radius:10px;padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.reg-log{max-height:420px;overflow:auto;background:var(--card2);border:1px solid var(--linea);border-radius:10px;padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .rl{white-space:pre-wrap;word-break:break-word;color:var(--mut)}
 .rl.WARNING{color:#ffb547}.rl.ERROR,.rl.CRITICAL{color:#ff7a6b}
 
@@ -1802,7 +1711,6 @@ details.riq[open]>summary::after,.fsv-gr[open]>summary .d::after,.cl-vecchie[ope
 #imp-tabs .sub-tabs{margin-bottom:14px;display:flex;width:max-content;min-width:100%}
 #imp-tabs .sub-tabs a{white-space:nowrap;padding:7px 14px}
 .imp-tab[hidden]{display:none}
-.imp-tab>details.riq{margin-bottom:12px}
 details.riq{padding-block:12px}
 @media (max-width:760px){details.riq{padding-block:10.5px}}
 details.riq>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -1834,7 +1742,7 @@ details.riq .riq-c>.nota-sez:first-child,details.riq .riq-c>h2:first-child+.nota
 #c-um.um-rosso{color:var(--bad)}
 
 .fermo-t{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
-.fermo-q{font-size:14px;color:var(--mut,#8a93a6)}
+.fermo-q{font-size:14px;color:var(--mut)}
 .tile .t-txt{font-size:17px;font-weight:600}.tile .t-txt i{font-size:12px;font-style:normal;opacity:.7}
 .fermo-w{grid-column:1/-1}.fermo-g{display:flex;gap:10px;margin-top:10px}
 .fermo-w .tile .t-txt{font-size:15px;white-space:nowrap}
@@ -1842,9 +1750,9 @@ details.riq .riq-c>.nota-sez:first-child,details.riq .riq-c>h2:first-child+.nota
 p.nota-sez#prest-rit{display:flex;flex-wrap:wrap;gap:2px 16px}.nw{white-space:nowrap}
 #prest-rit .rt-t{flex-basis:100%}
 #prest-rit .rf{display:inline-flex;align-items:center;gap:7px}
-#prest-rit .rf i{width:7px;height:7px;border-radius:50%;flex:none}#prest-rit b{color:var(--fg,#e8ecf4);font-weight:650}
+#prest-rit .rf i{width:7px;height:7px;border-radius:50%;flex:none}#prest-rit b{color:var(--txt);font-weight:650}
 p.nota-sez#prest-rit>span:first-child{flex-basis:100%}
-.agg-corpo p{margin:10px 0 6px;line-height:1.5}.agg-ok b{color:var(--ok,#62eba6)}.agg-riavvio b{color:var(--warn,#ffc83d)}
+.agg-corpo p{margin:10px 0 6px;line-height:1.5}.agg-ok b{color:var(--ok)}.agg-riavvio b{color:var(--warn)}
 
 button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;color:#fff!important}button.pericolo.sec{background:transparent!important;color:#ff8a96!important}
 
@@ -1874,8 +1782,8 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 /* riquadri delle impostazioni: due colonne indipendenti su schermi larghi (nessun buco tra un riquadro e l'altro) */
 .imp-cols{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
 .imp-col{display:contents}
-#imp .imp-cols>details.riq,#imp .imp-col>details.riq,#imp .imp-tab>details.riq{margin-bottom:0}
-#imp .imp-tab>.imp-cols,#imp .imp-tab>details.riq{margin-bottom:12px}
+#imp .imp-cols>details.riq,#imp .imp-col>details.riq{margin-bottom:0}
+#imp .imp-tab>details.riq{margin-bottom:12px}
 @media (min-width:1100px){
   .imp-cols{flex-direction:row;align-items:flex-start;gap:14px}
   .imp-col{display:flex;flex-direction:column;gap:12px;flex:1 1 0;min-width:0}
@@ -1895,7 +1803,7 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 .come-b.on::after{vertical-align:2px}
 .come-b:hover{text-decoration:underline}
 .come-t{margin:6px 0 0 27px;color:var(--mut2);font-size:12px;line-height:1.45;text-wrap:pretty}
-.come-t[hidden]{display:none}
+.come-t[hidden]{display:none}.come-b[data-come^=eur]{color:inherit;font-size:inherit;margin-right:4px;text-decoration:underline dashed;text-decoration-thickness:1.5px;text-underline-offset:2px}.come-b[data-come^=eur]::after{vertical-align:.5px}.card>.come-t{margin:8px 0 0}.card>.come-t .nw{display:block}.card>.come-t b{margin-left:5px;color:var(--txt);font-variant-numeric:tabular-nums}
 .tile[data-come]{cursor:pointer}.tile[data-come] small::after{--chv:5px;--chw:1.5px;margin-left:5px;vertical-align:1px}.tile[data-come].on small::after{vertical-align:2px}.tile[data-come] i{vertical-align:3px}.tile i b{font-size:inherit;font-weight:600;color:var(--txt)}
 .come-t.sbr{margin:0;font-size:14px;color:var(--txt)}.come-t.sbr>:last-child{margin-top:10px;border:1px solid var(--linea);border-radius:12px;overflow:hidden}.come-t.sbr .tile{text-align:center}.sr{display:grid;grid-template-columns:100px 56px 56px 56px;justify-content:space-evenly;gap:6px;text-align:center;white-space:nowrap;padding:8px 12px;font-variant-numeric:tabular-nums}.sr:nth-child(even){background:var(--bg2)}.sr>:only-child{grid-column:1/-1}
 .nota-cv.alto{margin:0 2px 6px}.come-t.alto{margin:0 2px 14px 29px}
@@ -1912,6 +1820,26 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 .cl-filtro::-webkit-scrollbar{display:none}
 .cl-filtro button{white-space:nowrap;flex:none}
 .cl-v .cl-h .pill.up{align-self:center}
+
+/* impostazioni installatore: matita, editor, cronologia */
+.ch-b{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.dev .riga .matita{flex:none;width:34px;height:34px;border:0;border-radius:10px;background:rgba(255,255,255,.08);color:var(--txt);font-size:16px;cursor:pointer}
+.dev .riga .matita:disabled{opacity:.3;cursor:not-allowed}
+.dev .riga .matita:not(:disabled):hover{background:var(--acs);color:#06101d}
+.dev .riga b .in-attesa{color:#ffc83d;font-weight:650;text-align:right}
+.fsv-edit{margin:0 0 6px;padding:12px;border:1px solid var(--acs);border-radius:12px;background:rgba(255,255,255,.04);display:flex;flex-direction:column;gap:8px}
+.fsv-edit .fe-t{font-weight:700}
+.fsv-edit .fe-r{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;font-size:14px}
+.fsv-edit input,.fsv-edit select{font:inherit;color:var(--txt);background:rgba(255,255,255,.08);border:1px solid var(--linea);border-radius:8px;padding:6px 10px;max-width:100%}
+.fsv-edit input[type=number]{width:96px}
+.fsv-edit .fe-err{padding:8px 10px;border-radius:8px;background:rgba(255,77,94,.16);color:#ff8a95;font-size:13px;word-break:break-word}
+.fsv-edit .fe-b{display:flex;justify-content:flex-end;gap:8px}
+.fsv-edit button.cambia{font:inherit;font-weight:650;border:0;border-radius:10px;background:#ffc83d;color:#1a1200;cursor:pointer}
+.fsv-edit button.cambia:disabled,.fsv-edit button:disabled{opacity:.5;cursor:wait}
+#b-lock-fsv.sbloccato{border:1px solid #ffc83d;color:#ffc83d}
+.fsv-edit .fe-r>span:last-child{flex:1 1 200px;min-width:0;display:flex;align-items:center;gap:6px;justify-content:flex-end}
+.fsv-edit select{width:100%;min-width:0}
+.fsv-edit .avviso-reg{color:#ffc83d;font-size:13px}
 ''',
     'app.js': r'''// impronta di questa versione dello script: la prende dall'indirizzo con cui e' stato caricato (app.js?v=...)
 window.BUILD = (() => { try { return new URL(document.currentScript.src).searchParams.get('v') || ''; } catch { return ''; } })();
@@ -1978,6 +1906,7 @@ function costruisci() {
         <label>A<input type="datetime-local" id="c-a"></label>
         <button id="c-ok" type="button">Applica</button>
       </div>
+      <div class="custom" id="indietro" hidden><span id="i-t"></span><button id="c-adesso" type="button">↺ Adesso</button></div>
       <div id="avvisi"></div>
       <section id="pagina"></section>
     </main>
@@ -1986,13 +1915,14 @@ function costruisci() {
     if (e.target.dataset.conf) { S.confronto = !S.confronto; chips(); carica(); return; }  // non si ricorda: a ogni apertura e' spento
     const r = e.target.dataset.r; if (!r) return;
     if (S.pagina === 'efficienza') { S.rangeEff = r; ls.set('rangeEff', r); chips(); carica(); return; }
-    S.range = r; S.zoom = null; ls.set('range', r); chips();
+    S.range = r; S.zoom = null; S.fine = null; ls.set('range', r); ricordaFinestra(); chips();
     if (r === 'custom') apriCustom(); else { $('#custom').hidden = true; carica(); }
   });
+  $('#c-adesso').addEventListener('click', () => { S.fine = null; S.zoom = null; chips(); carica(); });
   $('#c-ok').addEventListener('click', () => {
     const da = new Date($('#c-da').value).getTime() / 1000, a = new Date($('#c-a').value).getTime() / 1000;
     if (!isFinite(da) || !isFinite(a) || a <= da) { alert('Controlla le date: "A" deve venire dopo "Da".'); return; }
-    S.custom = {da: Math.floor(da), a: Math.floor(a)}; S.zoom = null; ls.set('custom', S.custom); carica();
+    S.custom = {da: Math.floor(da), a: Math.floor(a)}; S.zoom = null; S.fine = null; ls.set('custom', S.custom); carica();
   });
 }
 
@@ -2002,14 +1932,17 @@ function apriCustom() {
   $('#c-da').value = loc(c.da); $('#c-a').value = loc(c.a); $('#custom').hidden = false;
   if (!S.custom) { S.custom = c; ls.set('custom', c); carica(); }
 }
-const RANGE_EFF = {'3g': 3, '7g': 7, '28g': 28};
+const RANGE_EFF = {'1g': 1, '3g': 3, '7g': 7, '28g': 28};
 function chips() {
   const el = $('#chips');
   el.hidden = S.pagina === 'impostazioni' || S.pagina === 'dispositivi' || S.pagina === 'changelog';
   const eff = S.pagina === 'efficienza';
-  const lista = eff ? [['3g', '3 giorni'], ['7g', '7 giorni'], ['28g', '28 giorni']]
+  const lista = eff ? [['1g', '1 giorno'], ['3g', '3 giorni'], ['7g', '7 giorni'], ['28g', '28 giorni']]
                     : [['6h', '6h'], ['24h', '24h'], ['custom', 'Personalizzato']];
   const sel = eff ? S.rangeEff : S.range;
+  const ind = $('#indietro'), dietro = !!S.fine && S.pagina === 'analisi';   // finestra spostata indietro: riga con l'intervallo e il tasto per tornare in diretta
+  ind.hidden = !dietro;
+  if (dietro) $('#i-t').innerHTML = `Stai guardando <b>${dm(S.fine - (S.range === '6h' ? 6 : 24) * 3600)} → ${dm(S.fine)}</b>`;
   el.innerHTML = lista.map(([r, t]) => `<button data-r="${r}" class="${sel === r ? 'on' : ''}">${t}</button>`).join('')
     + (eff ? `<button data-conf="1" class="conf-btn ${S.confronto ? 'on' : ''}" aria-pressed="${!!S.confronto}" title="Confronta con un periodo della stessa durata subito prima">Confronta</button>` : '');
 }
@@ -2017,7 +1950,7 @@ function chips() {
 function mostraPagina() {
   $('#titolo').textContent = TITOLI[S.pagina];
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.p === S.pagina));
-  chips(); S.dati = null; S.dpag = null; S.zoom = null;
+  S.fine = null; chips(); S.dati = null; S.dpag = null; S.zoom = null;
   { const st = document.querySelector('.stato'); if (st) st.hidden = S.pagina === 'changelog'; }
   $('#custom').hidden = !(S.pagina !== 'efficienza' && S.pagina !== 'impostazioni' && S.pagina !== 'dispositivi' && S.pagina !== 'changelog' && S.range === 'custom');
   S.sporco = false; S.mod = {};
@@ -2058,7 +1991,7 @@ function scheletro() {
       <article class="card"><div class="ch"><h2>Stato del sistema</h2><span id="cmd-lock"></span></div><div class="righe" id="sistema"></div></article>
       <article class="card"><div class="ch"><h2>Compressore e circuito</h2><span class="et" id="prest-et"></span></div><div class="tiles" id="prest"></div><p class="nota-sez" id="prest-rit"></p></article>
     </div>
-    <article class="card curva"><div class="ch"><h2>Curva climatica</h2><span class="et">Zona 1</span></div><div id="curva"></div></article>
+    <article class="card curva"><div class="ch"><h2>Curva climatica</h2><span class="et" id="curva-zona">Zona 1</span></div><div id="curva"></div></article>
   </div>`;
 }
 
@@ -2112,7 +2045,7 @@ function disegna() {
     : e.umidita != null ? `<span class="um-n" title="Umidità dell'aria esterna (stazione meteo vicina)">Umidità <b>${num(e.umidita, 0)}%</b></span>` : '');   // l'avviso, quando c'è, prende il posto dell'umidità
 
   set('w-t', num(w.kwh, w.kwh != null && w.kwh < 10 ? 2 : 1)); set('w-per', periodo(d)); set('w-pw', w.potenza_w == null ? '—' : num(w.potenza_w, 0) + ' W');
-  { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); } }
+  { const e = document.getElementById('w-eur-s'); if (e) { e.hidden = !(w.prezzo_kwh > 0 && w.kwh != null); set('w-eur', w.kwh != null ? euro(w.kwh * w.prezzo_kwh) : '—'); const dt = w.dettaglio; e.title = dt ? `Riscaldamento ${euro(dt.casa)} · Acqua calda ${euro(dt.acs)} · Standby ${euro(dt.riposo)}` : ''; } }
   badge('w-b', 'Consumo', 'tema', 'Energia elettrica consumata dalla pompa nel periodo scelto');
   html('w-sp', spark(w.spark));
 
@@ -2262,6 +2195,7 @@ function prestazioni(d) {
 function nice(a, b, step) { const o = []; for (let v = Math.ceil(a / step) * step; v <= b + 1e-9; v += step) o.push(v); return o; }
 function curva(c) {
   if (!c) { html('curva', '<div class="vuoto">Le impostazioni della curva non sono ancora state lette dalla PdC.</div>'); return; }
+  const zn = $('#curva-zona'); if (zn) { zn.textContent = c.zona === 2 ? 'Zona 2' : 'Zona 1 · pavimento'; zn.title = c.zona_fonte ? 'Zona dedotta da: ' + c.zona_fonte : ''; }
   const W = 480, H = 300, L = 46, R = 0, T = 16, B = 44;   // R = 0: la fine del grafico sta sul bordo dei riquadri sotto (l'ultimo numero dell'asse finisce sul bordo)
   const xs = [-10, 25, c.basso.esterna - 3, c.alto.esterna + 3, ...c.punti.map(p => p[0])];
   const ys = [20, 60, c.alto.mandata - 4, c.basso.mandata + 6, ...c.punti.map(p => p[1])];
@@ -2319,7 +2253,7 @@ function stato() {
 }
 
 // ---------- grafici (Analisi) ----------
-const COLS = {casa: '#ff6b57', acs: '#4da3ff', est: '#34d3b0', en: '#ffb547', amb: '#a78bfa', ritorno: '#f59ac7', umid: '#7dd3fc'};
+const COLS = {casa: COL.casa, acs: COL.acs, fin: '#3ddc97', est: '#34d3b0', en: '#ffb547', amb: '#a78bfa', ritorno: '#f59ac7', umid: '#7dd3fc'};
 const tz = () => -new Date().getTimezoneOffset() * 60;
 
 function scalaNice(lo, hi, nmax = 4) {
@@ -2365,11 +2299,34 @@ function fasceRichiesta(r, da, a, X, y0, h, op = .13) {
   return iv.map(([t0, t1]) => `<rect x="${X(Math.max(t0, da)).toFixed(1)}" y="${y0}" width="${Math.max(1.5, X(Math.min(t1, a)) - X(Math.max(t0, da))).toFixed(1)}" height="${h}" fill="${COLS.casa}" opacity="${op}"${op > .5 ? ' rx="2"' : ''}/>`).join('');
 }
 
+// finestre aperte: fascia dietro le linee (come le altre fasce) e iconcina in alto per toccarla; indice = posizione in d.finestre
+function fasceFinestre(fin, da, a, X, y0, h) {
+  return fin.filter(f => f.a > da && f.da < a).map(f => {      // confermata: piena; da confermare: tenue con i bordi tratteggiati
+    const x0 = X(Math.max(f.da, da)), x1 = X(Math.min(f.a, a)), ok = f.stato === 'si';
+    return `<rect x="${x0.toFixed(1)}" y="${y0}" width="${Math.max(2, x1 - x0).toFixed(1)}" height="${h}" fill="${COLS.fin}" opacity="${ok ? .2 : .08}"/>`
+      + (ok ? '' : [[f.da, x0], [f.a, x1]].filter(([t]) => t > da + 1 && t < a - 1).map(([, x]) => `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${y0}" y2="${y0 + h}" class="bordo-vuoto fin"/>`).join(''));
+  }).join('');
+}
+function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
+  if (S.tel || a - da > 7 * 86400) return '';      // su telefono solo le fasce (si guarda e basta); su periodi lunghi le icone si accavallano: restano le fasce
+  return fin.map((f, i) => {
+    if (f.a <= da || f.da >= a) return '';
+    const x = Math.min(Math.max(X((Math.max(f.da, da) + Math.min(f.a, a)) / 2), xmin), xmax), ok = f.stato === 'si';
+    return `<g data-fin="${i}" role="button" tabindex="0" aria-label="${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}" transform="translate(${x.toFixed(1)} ${y})"><circle r="13" fill="transparent"/><circle r="12" fill="${ok ? COLS.fin : 'var(--card)'}" stroke="${COLS.fin}" stroke-width="1.2"/><g transform="scale(1.2)" fill="none" stroke="${ok ? '#06101d' : COLS.fin}" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M-3.2 -4.7H3.2V4.7H-3.2zM-3.2 -4.7L-7.2 -5.8V5.8L-3.2 4.7M-7.2 0H-3.2M3.2 -4.7L7.2 -5.8V5.8L3.2 4.7M7.2 0H3.2"/></g></g>`;
+  }).join('');
+}
+
 function scheletroAnalisi() {
   return `<div class="card"><div class="ch"><h2>Modo di funzionamento</h2><div class="riep" id="tl-riep"></div></div>
     <div class="tlw" id="tlw"><div id="tl"></div><div class="tip" id="tip" hidden></div></div><div class="assi" id="assi"></div></div>
+    <div class="custom" id="fin-man" hidden>
+      <label>Da<input type="datetime-local" id="fin-da"></label>
+      <label>A<input type="datetime-local" id="fin-a"></label>
+      <button id="fin-ok" type="button">Segnala finestra</button>
+    </div>
     <div id="grafici"></div>
     <ul class="nota-cv lun"><li><i class="in"></i><span>Le zone colorate dietro le linee indicano quando la PdC scalda la casa (rosso) o l'acqua (blu); le righe oblique grigie, i periodi senza dati.</span></li>
+      <li><i class="in"></i><span>Fascia verde nel grafico della temperatura ambiente: una finestra aperta. Piena = confermata da te; tenue con i bordi tratteggiati = da confermare (da computer, toccando l’iconcina).</span></li>
       <li><i class="in"></i><span>Tocca o passa il mouse su un grafico per leggere i valori: i grafici sono sincronizzati.</span></li>
       <li class="tt"><i class="in"></i><span>Su telefono: pizzica con due dita per ingrandire il tempo, trascina con un dito per spostarti, doppio tocco per tornare alla vista intera.</span></li></ul>`;
 }
@@ -2390,10 +2347,11 @@ function disegnaAnalisi(p) {
   box.dataset.f = firma;
   const y0 = window.scrollY;
   const W = Math.max(280, box.clientWidth || 600), H = 168, tel = W < 480, Ws = tel ? W - 11 : W - 32;   // telefono: il grafico esce dal padding della card
+  S.tel = tel;
   box.innerHTML = d.grafici.filter(g => g.linee.length).map(g => `
     <article class="card gr" data-g="${g.id}">
       <div class="ch"><h2>${g.titolo}</h2><div class="legg" data-l="${g.id}"></div></div>
-      <div class="grw"${tel ? ' style="margin:0 -6px 0 -9px"' : ''}>${graficoLineare(g, d, Ws, H)}</div>
+      <div class="grw"${tel ? ' style="margin:0 -6px 0 -9px"' : ''}>${graficoLineare(g, d, Ws, H)}</div>${g.id === 'casa' && !tel ? '<div class="azioni"><button type="button" class="sec piccolo" id="fin-add" title="Segna a mano una finestra aperta">Segnala finestra</button></div>' : ''}
     </article>`).join('') || '<div class="card vuoto">Nessun dato in questo periodo.</div>';
   S.grafici = d.grafici; S.gW = Ws;
   d.grafici.forEach(g => legenda(g, null));
@@ -2437,6 +2395,9 @@ function largTesto(t) {   // larghezza vera di un testo dei grafici (11 px, stes
 }
 // colonna dei numeri dell'asse verticale, larga quanto serve. Telefono: stima (2 cifre ≈ 21 px); PC: misura vera col font della pagina,
 // cosi' la prima cifra cade sulla prima lettera del titolo
+// asse Y dei grafici di Efficienza: larghezza della colonna dei numeri e righe orizzontali con i valori (solo da zero in su)
+const larghezzaNumeriY = (sc, tel) => colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel);
+const grigliaY = (sc, Y, L, W, R) => sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
 function colonnaNumeri(et, tel) {
   return tel ? Math.ceil(Math.max(...et.map(t => t.length)) * 6.5) + 8 : Math.ceil(Math.max(...et.map(largTesto))) + 4;
 }
@@ -2480,6 +2441,7 @@ function graficoLineare(g, d, W, H) {
   s += `<defs><pattern id="tr-${g.id}" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#8793a8" stroke-opacity=".22" stroke-width="1"/></pattern></defs>`;
   s += vuoti.map(([s0, s1]) => `<rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="rgba(135,147,168,.05)"/><rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('')).join('');
   s += g.id === 'casa' ? fasceRichiesta(d.richiesta || [], d.da, d.a, X, T, ph) : fasce(d.modi.segmenti, d.da, d.a, X, T, ph);
+  if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph);
   if (g.id === 'casa') s += fasceRichiesta(d.richiesta || [], d.da, d.a, X, T + ph - 7, 7, .9);   // striscia piena in basso: quando lo Smarther chiede caldo
   s += sc.tick.map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, sc.passo < 1 ? 1 : 0)}</text>`).join('');
   if (doppio) s += sc1.tick.map(v => `<text x="${W - R + 4}" y="${(Y1(v) + 4).toFixed(1)}" text-anchor="start" fill="${colAsse1}">${num(v, sc1.passo < 1 ? 1 : 0)}</text>`).join('');
@@ -2498,7 +2460,7 @@ function graficoLineare(g, d, W, H) {
   s += g.linee.map((l, i) => `<circle class="cur-d" data-i="${i}" data-a="${l.asse || 0}" r="4.5" cx="0" cy="0" fill="${COLS[l.col]}" stroke="var(--card)" stroke-width="2" visibility="hidden"/>`).join('');
   s += `<line class="cur" x1="0" x2="0" y1="${T}" y2="${T + ph}" visibility="hidden"/>
     <g class="cur-t" visibility="hidden"><rect class="cur-bg" rx="6" height="19"/><text class="cur-tx"></text></g>
-    <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/></svg>`;
+    <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/>${g.id === 'casa' ? iconeFinestre(d.finestre || [], d.da, d.a, X, L + 13, W - R - 13, T + 14) : ''}</svg>`;
   return s;
 }
 
@@ -2641,6 +2603,34 @@ function muoviCursore(e) {
 }
 
 
+// ---------- spostarsi indietro nel tempo col mouse (6h / 24h): si trascina un grafico, al rilascio si caricano le ore di quel periodo ----------
+let sposta = null;
+function spostaGiu(e) {
+  if (e.pointerType !== 'mouse' || e.button !== 0 || S.pagina !== 'analisi' || !S.dati || S.range === 'custom' || S.zoom) return;
+  const el = e.target.closest && e.target.closest('#grafici, #tlw'); if (!el) return;
+  const svg = document.querySelector('#grafici svg'), pw = el.id === 'tlw' || !svg ? el.getBoundingClientRect().width : +svg.dataset.pw;
+  sposta = {x0: e.clientX, dx: 0, on: false, sec: (S.dati.a - S.dati.da) / Math.max(1, pw)};
+}
+function spostaMuovi(e) {
+  if (!sposta) return false;
+  if (!(e.buttons & 1)) { spostaSu(); return false; }   // tasto rilasciato fuori dalla finestra: si chiude qui
+  const dx = e.clientX - sposta.x0;
+  if (!sposta.on && Math.abs(dx) < 6) return false;
+  if (!sposta.on) { sposta.on = true; togliCursore(); const t = $('#tip'); if (t) t.hidden = true; document.body.style.userSelect = 'none'; }
+  sposta.dx = dx; document.querySelectorAll('#grafici svg, #tlw').forEach(x => { x.style.transform = `translateX(${dx}px)`; x.style.opacity = '.55'; });
+  return true;
+}
+function spostaSu() {
+  if (!sposta) return;
+  const s = sposta; sposta = null;
+  document.querySelectorAll('#grafici svg, #tlw').forEach(x => { x.style.transform = x.style.opacity = ''; }); document.body.style.userSelect = '';
+  if (!s.on) return;
+  // trascinare verso destra = andare indietro nel tempo
+  const adesso = ora(), fine = Math.min(adesso, Math.round((S.fine || adesso) - s.dx * s.sec));
+  S.fine = fine > adesso - 60 ? null : fine; S.zoom = null;
+  chips(); carica();
+}
+
 // ---------- zoom con due dita sui grafici di Analisi (telefono); doppio tocco = vista intera ----------
 const dita = new Map();
 let pizzico = null, tocco = null, mossoPizzico = false, trascina = null;
@@ -2720,8 +2710,7 @@ S.solo = S.solo || false;
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
   try {
-    const r = await fetch('/api/registro?righe=150', {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson('/api/registro?righe=150'); if (!r) return;
     S.reg = await r.json(); disegnaRegistro();
   } catch { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
 }
@@ -2758,10 +2747,12 @@ setInterval(() => { if (S.pagina === 'impostazioni' && S.sub === 'registro' && !
 
 // ---------- Meteo (riga nella scheda Esterna) ----------
 // Icone a tratto, 32x32, nello stesso stile del resto dell'app. Ogni colore e' una variabile CSS (vedi .mt-*).
+const NUV = 'd="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>';   // il contorno della nuvola, uguale in tutte le icone
+const NUV_PIOGGIA = '<path class="mt-n" transform="translate(5 1) scale(.8)" ' + NUV + '<path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>';
 const MT = {
-  nuvola: '<path class="mt-n" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
-  nuvolaP: '<path class="mt-n" transform="translate(6.5 7.5) scale(.72)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
-  nuvolaAlta: '<path class="mt-n" transform="translate(0 -3)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/>',
+  nuvola: '<path class="mt-n" ' + NUV,
+  nuvolaP: '<path class="mt-n" transform="translate(6.5 7.5) scale(.72)" ' + NUV,
+  nuvolaAlta: '<path class="mt-n" transform="translate(0 -3)" ' + NUV,
   sole: (cx, cy, r, ray) => `<circle class="mt-s" cx="${cx}" cy="${cy}" r="${r}"/>` + [0, 45, 90, 135, 180, 225, 270, 315].map(a => {
     const t = a * Math.PI / 180, c = Math.cos(t), n = Math.sin(t);
     return `<path class="mt-s" d="M${(cx + c * (r + 2.6)).toFixed(1)} ${(cy + n * (r + 2.6)).toFixed(1)}L${(cx + c * (r + 2.6 + ray)).toFixed(1)} ${(cy + n * (r + 2.6 + ray)).toFixed(1)}"/>`;
@@ -2777,20 +2768,19 @@ const ICONE_METEO = {
   'luna-nuvola': MT.luna('transform="translate(-2.6 -2.5) scale(.74)"') + MT.nuvolaP,
   nuvola: MT.nuvola,
   pioggia: MT.nuvolaAlta + MT.gocce,
-  'sole-pioggia': MT.sole(10, 9.5, 3.2, 2) + '<path class="mt-n" transform="translate(5 1) scale(.8)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/><path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>',
-  'luna-pioggia': MT.luna('transform="translate(-2 -3) scale(.68)"') + '<path class="mt-n" transform="translate(5 1) scale(.8)" d="M10 24a5 5 0 0 1-.5-9.97A7 7 0 0 1 23 13.2 5.4 5.4 0 0 1 22.4 24z"/><path class="mt-p" d="M14.4 24.4l-1.2 2.6M19 24.4l-1.2 2.6M23.6 24.4l-1.2 2.6"/>',
+  'sole-pioggia': MT.sole(10, 9.5, 3.2, 2) + NUV_PIOGGIA,
+  'luna-pioggia': MT.luna('transform="translate(-2 -3) scale(.68)"') + NUV_PIOGGIA,
   temporale: MT.nuvolaAlta + MT.fulmine,
   neve: MT.nuvolaAlta + '<path class="mt-v" d="M12 26.5v.01M16.5 28.5v.01M21 26.5v.01"/>',
   nebbia: '<path class="mt-n" d="M7 11h14M5 16h20M9 21h16M7 26h10"/>',
 };
 const iconaMeteo = (nome, px) => `<svg class="mt-i" viewBox="0 0 32 32" width="${px}" height="${px}" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONE_METEO[nome] || ICONE_METEO.nuvola}</svg>`;
 
-// Versione corta della frase per la scheda (nel pannello c'e' quella completa)
+// Versione corta della frase per la scheda (nel pannello c'e' quella completa): niente «pioggia» (c'e' l'icona) e niente «possibile»
+// (lo dice il colore: arancio = possibile, azzurro = certa)
 function meteoBreve(m) {
   if (m.livello !== 'certa' && m.livello !== 'possibile') return '';
-  const r = (m.testo || '').replace(/^(possibile )?pioggia\s*/, '').replace('per il resto della giornata', 'tutto il giorno');
-  if (m.livello === 'possibile') return 'possibile ' + r;
-  return /^(fino|tutto)/.test(r) ? r : 'pioggia ' + r;
+  return (m.testo || '').replace(/^(possibile )?pioggia\s*/, '').replace('per il resto della giornata', 'tutto il giorno').replace(/^(\d+)–(\d+)$/, 'dalle $1 alle $2');
 }
 function meteoRiga(m) {
   const el = document.getElementById('e-mt');
@@ -2799,6 +2789,7 @@ function meteoRiga(m) {
   const gradi = v => v == null ? '—' : Math.round(v) + '°';
   el.hidden = false;
   const breve = meteoBreve(m).replace(/(\d)–(\d)/g, '$1⁠–⁠$2');
+  el.title = m.testo ? m.testo.charAt(0).toUpperCase() + m.testo.slice(1) : '';
   html('e-mt', iconaMeteo(m.icona, 26) + `<b class="mt-g">${gradi(m.tmin)}–${gradi(m.tmax)}</b>` +
     (breve ? `<span class="mt-pi ${m.livello}">${esc(breve)}</span>` : ''));
   if (S.meteoAperto) disegnaPannelloMeteo(m);
@@ -2838,25 +2829,125 @@ document.addEventListener('click', ev => {
 document.addEventListener('keydown', ev => { if (ev.key === 'Escape') chiudiMeteo(); });
 window.addEventListener('scroll', () => { if (S.meteoAperto) chiudiMeteo(); }, {passive: true});
 
+// finestre aperte: tocco sull'icona -> pannellino per confermare; «＋ Finestra» per segnarne una a mano
+function finRidisegna() { const b = $('#grafici'); if (b) b.dataset.f = ''; carica(); }
+async function finInvia(url, corpo) {
+  const r = await inviaPost(url, corpo);
+  if (!r.ok) { toast(r.errore || 'Non sono riuscito a salvare.', true); return false; }
+  return true;
+}
+function finPannello(ic) {
+  const f = ((S.dati || {}).finestre || [])[+ic.dataset.fin]; if (!f) return;
+  const inf = (S.dati || {}).finestre_info || {}, ora2 = t => new Date(t * 1000).toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'});
+  const ok = f.stato === 'si', righe = (e, v) => `<div class="riga"><span>${e}</span><b>${v}</b></div>`;
+  const p = document.createElement('div'); p.id = 'fin-pan'; p.className = 'mt-pan';
+  p.innerHTML = `<div class="eti">${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}</div>
+    ${righe('Orario', `${ora2(f.da)}–${ora2(f.a)}`)}
+    ${f.calo != null ? righe('Calo di temperatura', `−${num(f.calo, 1)} °C`) : ''}
+    ${f.ah != null ? righe('Umidità assoluta', `${f.ah > 0 ? '+' : '−'}${num(Math.abs(f.ah), 1)} g/m³`) : ''}
+    <div class="sub">${ok ? (f.manuale ? 'Segnata da te.' : 'Confermata da te.') : 'Era una finestra aperta?'}</div>
+    <div class="azioni-t" id="fin-az">${ok ? `<button type="button" class="sec" data-az="annulla">${f.manuale ? 'Elimina' : 'Togli la conferma'}</button>`
+      : '<button type="button" class="sec" data-az="si">Sì</button><button type="button" class="sec" data-az="no">No</button>'}</div>
+    <div class="mt-fo">${inf.tarato ? `Soglie tarate su ${inf.n} risposte.` : `Risposte date: ${inf.risposte || 0} su 10 per tarare.`}</div>`;
+  document.body.appendChild(p);
+  const r = ic.getBoundingClientRect(), w = Math.min(280, window.innerWidth - 20); p.style.width = w + 'px';
+  p.style.left = Math.max(10, Math.min(window.innerWidth - w - 10, r.left + r.width / 2 - w / 2)) + 'px';
+  const h = p.offsetHeight, sotto = window.innerHeight - 70;      // 70: la barra in basso del telefono
+  p.style.top = Math.max(10, r.bottom + 8 + h > sotto ? r.top - h - 8 : r.bottom + 8) + 'px';
+  p.addEventListener('click', async ev => {
+    const az = ev.target.dataset && ev.target.dataset.az; if (!az) return;
+    const via = az === 'annulla' ? await finInvia('/api/finestre/annulla', {da: f.da})
+      : await finInvia('/api/finestre/giudica', {da: f.da, a: f.a, calo: f.calo, ah: f.ah, stato: az});
+    p.remove();
+    if (via) { finRidisegna(); toast(az === 'si' ? 'Segnata come finestra aperta.' : az === 'no' ? 'Ok, non era una finestra.' : 'Fatto.'); }
+  });
+}
+document.addEventListener('click', ev => {
+  const t = ev.target, vecchio = document.getElementById('fin-pan'), ic = t.closest && t.closest('[data-fin]');
+  if (t.id === 'fin-add') {
+    const b = $('#fin-man'), a = ora();
+    $('#fin-da').value = loc(a - 3600); $('#fin-a').value = loc(a); b.hidden = !b.hidden; if (!b.hidden) b.scrollIntoView({block: 'center', behavior: 'smooth'}); return;
+  }
+  if (t.id === 'fin-ok') {
+    const da = new Date($('#fin-da').value).getTime() / 1000, a = new Date($('#fin-a').value).getTime() / 1000;
+    if (!isFinite(da) || !isFinite(a) || a <= da || a - da > 86400) { toast('Controlla le date: "A" deve venire dopo "Da" (al massimo 24 ore).', true); return; }
+    finInvia('/api/finestre/manuale', {da: Math.floor(da), a: Math.floor(a)}).then(v => { if (v) { $('#fin-man').hidden = true; finRidisegna(); toast('Finestra segnata.'); } });
+    return;
+  }
+  if (vecchio && !(t.closest && t.closest('#fin-pan')) && !ic) vecchio.remove();
+  if (ic) { if (vecchio) vecchio.remove(); finPannello(ic); }
+});
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') { const v = document.getElementById('fin-pan'); if (v) v.remove(); } });
+window.addEventListener('scroll', () => { const v = document.getElementById('fin-pan'); if (v) v.remove(); }, {passive: true});
+
 // ---------- Changelog ----------
 // Una voce per ogni versione, la piu' recente in alto; le sotto-versioni stanno nella versione madre.
-// Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola: i dettagli tecnici stanno in PIANO.md.
+// Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
-  ['plugin', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», si accendono e si ricaricano senza riavviare.'],
-  ['alexa', 'Alexa', 'Il primo plugin: chiedi temperatura, umidità, PdC e acqua calda, o accendi e spegni lo Smarther, con le Routine di Alexa.'],
-  ['live', 'Stato in diretta', 'Stato e richieste dei plugin si aggiornano da soli, senza ricaricare la pagina.'],
+  ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
+  ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo da casa, con lucchetto e conferma.'],
+  ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
+  ['indietro', 'Grafici indietro nel tempo', 'Analisi, da computer: trascina un grafico verso destra per guardare le ore (o il giorno) prima; «Torna ad adesso» rimette la diretta.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', alexa: '🔊', live: '↻'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.1', quando: '8 novembre 2026', titolo: 'Avvisi finti e dati esterni', righe: [
+    ['s', 'Browser che si stacca', 'Se il browser chiudeva la connessione a metà risposta (ricaricando la pagina, per esempio), il registro mostrava un errore con tutta la traccia anche se non c’era niente da correggere: ora viene ignorato, come già succedeva per gli altri distacchi.'],
+    ['s', 'Meteo e stazione sempre aggiornati', 'La previsione e l’umidità della stazione vicina si leggono ora anche con la Dashboard chiusa, da un solo lavoro di fondo: niente buco alla riapertura (nemmeno per Alexa e il widget) e niente avvisi finti di «dato vecchio».'],
+    ['s', 'Lampo bianco all’apertura', 'Aprendo dall’icona nella Home non compare più il lampo bianco: subito lo sfondo scuro con il simbolo. Per vederlo togli l’icona dalla Home e rimettila.'],
+    ['m', 'Avviso «mandata lontana» più giusto', 'Ora ha due soglie: 12 °C sopra la curva, dove la PdC sta spesso, e 8 °C sotto, che di solito è un problema vero. Le cambi in Impostazioni → Avvisi, nel riquadro «Mandata lontana dalla curva».'],
+    ['m', 'MAC dei dispositivi', 'Un MAC trovato si ricorda per una settimana, invece di 10 minuti; se non c’è (dispositivo spento) si riprova dopo 2 minuti.'],
+    ['m', 'Apertura più veloce', 'I file restano nel browser senza ricontrolli e la Dashboard arriva già dentro la pagina: due richieste in meno all’apertura, soprattutto da fuori casa.'],
+  ]},
+  {v: '0.25', quando: '7 novembre 2026', titolo: 'Finestre aperte', righe: [
+    ['n', 'Finestre aperte sul grafico', 'In Analisi, nel grafico della temperatura ambiente, il pannello cerca i cali più rapidi di quelli naturali, guardando anche l’umidità assoluta, che con la finestra aperta scende. Li segna con una fascia verde, anche sui giorni già registrati.'],
+    ['n', 'Confermate e da confermare', 'La fascia piena è una finestra confermata da te; quella tenue, con i bordi tratteggiati, è ancora da confermare. Su computer c’è anche una iconcina (piena o vuota): toccala e rispondi Sì o No. I «No» spariscono, i «Sì» si possono togliere.'],
+    ['n', 'Segnala finestra', 'Il tasto sotto il grafico, da computer, segna a mano una finestra scegliendo da quando a quando. Da telefono le finestre si vedono soltanto, senza icone.'],
+    ['n', 'Impara dalle risposte', 'Dopo 10 risposte il pannello sceglie da solo le soglie (calo minimo e umidità) che sbagliano meno rispetto a quello che gli hai detto. Per ora le finestre le mostra soltanto: le statistiche non le escludono ancora.'],
+  ]},
+  {v: '0.24', quando: '5 novembre 2026', titolo: 'Grafici indietro nel tempo e «1 giorno»', righe: [
+    ['n', 'Costo diviso', 'In Efficienza, toccando «Costo stimato» compare il costo di riscaldamento, acqua calda e standby; nella scheda del mese lo stesso con «Dettaglio». In Dashboard, il mouse su «Costo» (card Energia) mostra lo stesso. La somma fa sempre il totale.'],
+    ['n', '«1 giorno» in Efficienza', 'Accanto a 3, 7 e 28 giorni c’è «1 giorno»: la giornata di oggi.'],
+    ['n', 'Trascina per tornare indietro', 'Analisi, da computer, con 6h o 24h: tieni premuto il mouse su un grafico (o sulla barra dei modi) e trascinalo verso destra per vedere le ore prima, verso sinistra per tornare avanti. Quando rilasci il pannello carica quel periodo; finché sei indietro non si aggiorna da solo, e «Torna ad adesso» in alto rimette la diretta. Da telefono resta lo zoom.'],
+  ]},
+  {v: '0.23', quando: '5 novembre 2026', titolo: 'Bollitore anche di giorno', righe: [
+    ['n', 'Perdita a riposo di giorno', 'Nella «Salute del bollitore» accanto alla perdita di notte c’è quella di giorno (dalle 6 alle 23): si guardano solo i tratti tranquilli di almeno un’ora, senza riscaldo dell’acqua e senza prelievi. Utile per confrontare le ore con e senza ricircolo.'],
+    ['m', 'Codice più snello', 'Tolti pezzi di codice e di stile duplicati o mai usati: a vista non cambia niente, ma il file è più corto e più facile da correggere.'],
+  ]},
+  {v: '0.22.2', quando: '5 novembre 2026', titolo: 'Gas di scarico', righe: [
+    ['m', 'Gas di scarico finalmente letto', 'La temperatura del gas di scarico del compressore stava in un byte diverso da quello che il pannello leggeva (sempre vuoto): ora viene letta e compare nella scheda Ciclo. Per averla anche nei giorni passati: python pdc_pannello.py ridecodifica.'],
+  ]},
+  {v: '0.22.1', quando: '5 novembre 2026', titolo: 'Limite del codice 4013', righe: [
+    ['m', 'FSV 4013 fino a 45 °C', 'La temperatura esterna oltre la quale il riscaldamento si ferma può arrivare a 45 °C: prima oltre 35 °C compariva «fuori limiti», anche se la pompa li accetta.'],
+  ]},
+  {v: '0.22', quando: '5 novembre 2026', titolo: 'Modifica delle impostazioni installatore', righe: [
+    ['n', 'Modifiche solo da casa', 'Tutte le modifiche della scheda Regolazioni (FSV, temperatura e modo dell’acqua calda, Boost, modo della pompa) si fanno solo dalla rete di casa: da fuori (tunnel Cloudflare) non compare nemmeno «Sblocca modifiche» e il pannello rifiuta la richiesta.'],
+    ['m', 'Testi degli FSV rivisti', 'Nomi e scelte dei codici FSV riscritti in modo più chiaro e controllati sul manuale Samsung: «mandata» per l’acqua dell’impianto, «Fuori casa» per le impostazioni di assenza, «Miscelatrice» davanti ai codici della valvola. Premendo la matita compare una spiegazione breve del codice.'],
+    ['m', 'Box chiusi centrati', 'Nei box chiusi del pannello Regolazioni il testo ora è centrato in verticale, e i valori stanno sempre a destra accanto alla matita.'],
+    ['n', 'Boost acqua calda', 'Nella scheda Regolazioni → Acqua calda: ⚡ avvia un boost come Dwellsee (setpoint all’obiettivo scelto, poi modo «Forzato»). Finisce quando l’acqua arriva all’obiettivo o dopo 2 ore, e rimette modo e setpoint di prima; se il pannello si riavvia, il ripristino riparte da solo. ■ lo ferma a mano.'],
+    ['n', 'Modifica degli FSV dal pannello', 'In Dispositivi → Installatore: «Sblocca modifiche» (30 secondi, come i comandi), la matita sulla riga, il nuovo valore e una conferma. Si accettano solo i codici e i limiti del manuale, e un valore alla volta.'],
+    ['n', 'Scheda «Regolazioni»', 'La scheda Installatore si chiama ora Regolazioni: in alto temperatura e modo dell’acqua calda e modo della pompa (Riscaldamento, Raffrescamento, Automatico), con lo stesso lucchetto e le stesse conferme; sotto, gli FSV.'],
+    ['n', 'Cronologia delle modifiche', 'In fondo alla scheda: ogni cambio visto, con il valore di prima e quello di dopo, e se l’ha fatto il pannello o è stato letto dalla pompa.'],
+    ['m', 'Zona della curva climatica', 'La scheda «Curva climatica» dice se è la zona 1 (pavimento) o la 2: la prende dal codice 2041 se SmartThings lo comunica, altrimenti assume la zona 1.'],
+    ['m', 'Rilettura con calma', 'Dopo una modifica la riga dice «in attesa» finché la pompa non conferma il valore nuovo: SmartThings può metterci un po’ ad aggiornarlo.'],
+    ['s', 'Prudenza', 'Il comando per scrivere un FSV lo chiede il pannello a SmartThings: se non lo capisce non scrive niente e mostra cosa ha trovato.'],
+  ]},
+  {v: '0.21.3', quando: '4 novembre 2026', titolo: 'Ripartenza più stabile', righe: [
+    ['m', 'Ripartenza prevista ferma', 'L’orario non salta più avanti e indietro a ogni decimo di grado del sensore: cambia solo se la stima si sposta davvero (oltre 30 minuti da lontano, sempre meno man mano che la ripartenza si avvicina).'],
+  ]},
+  {v: '0.21.2', quando: '4 novembre 2026', titolo: 'Ritocchi', righe: [
+    ['m', 'Icona della scheda', 'Nel browser (Safari, Chrome) l’icona è solo il simbolo, più grande e senza il quadrato scuro; quella della Home dell’iPhone non cambia.'],
+    ['m', 'Messaggi Telegram di sbrinamento', 'Anche gli avvisi di inizio e fine sbrinamento hanno la riga «Pompa di calore» in grassetto, come tutti gli altri messaggi.'],
+  ]},
   {v: '0.21.1', quando: '4 novembre 2026', titolo: 'Changelog dei plugin', righe: [
     ['n', 'Tab «Plugin» nel Changelog', 'Il Changelog ha due tab: Pannello (come prima) e Plugin, con la cronologia di ogni plugin, tutti insieme in ordine di data o uno alla volta con il filtro. La versione che hai installata è segnata «Installato».'],
     ['m', 'Pannello più veloce da fuori', 'Le pagine (app.js e app.css) si scaricano una volta sola e, se non cambiano, il browser riceve soltanto «invariato»: meno dati sul tunnel e caricamento più rapido, soprattutto da telefono.'],
-    ['m', 'Indirizzi dei plugin più protetti', 'Anche i tentativi su indirizzi sbagliati hanno un limite al minuto, come quelli giusti.'],
+    ['m', 'Indirizzi dei plugin più protetti', 'Anche gli indirizzi sbagliati hanno un limite di tentativi al minuto, come quelli giusti.'],
     ['m', 'Plugin nuovi senza lavoro in più', 'Ogni plugin porta la sua cronologia nel proprio file (lista CHANGELOG): un plugin nuovo compare da solo nella tab.'],
   ]},
   {v: '0.21', quando: '4 novembre 2026', titolo: 'Umidità esterna', righe: [
-    ['n', 'Umidità esterna', 'Nella card Esterna, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink). Sta nella riga degli avvisi: se appare «Dato delle… (PdC ferma)» prende il suo posto. Le dimensioni della Dashboard non cambiano. Si accende incollando l’indirizzo dei dati in Impostazioni → Collegamenti; senza indirizzo o senza dato non compare niente.'],
+    ['n', 'Umidità esterna', 'Nella card Esterna, sotto Min/Max, compare «Umidità 78%», letta da una stazione meteo vicina (WeatherLink). Sta nella riga degli avvisi: se appare «Dato delle… (PdC ferma)» prende il suo posto. Le dimensioni della Dashboard non cambiano. Si accende incollando l’indirizzo dei dati in Impostazioni → Collegamenti; senza indirizzo o senza dato la riga non compare.'],
   ]},
   {v: '0.20', quando: '4 novembre 2026', titolo: 'Integrazioni e Alexa', righe: [
     ['n', 'Integrazioni a plugin', 'Impostazioni → Integrazioni: i collegamenti opzionali sono file nella cartella «plugin», con interruttore, campi e stato. Un plugin nuovo parte spento, si ricarica con un tasto e, se si rompe, non ferma mai il pannello.'],
@@ -2867,18 +2958,18 @@ const CHANGELOG = [
   ]},
   {v: '0.19', quando: '3 novembre 2026', titolo: 'Ripartenza prevista e giorni tipici', righe: [
     ['n', 'Ripartenza prevista', 'Nella card Smarther: l’ora in cui il riscaldamento dovrebbe ripartire, stimata dallo storico della casa.'],
-    ['n', 'Giorni tipici', 'Efficienza → Confronta: sui grafici dei giorni compare il consumo e il COP normali per quel freddo, e un puntino sui giorni sopra il normale.'],
+    ['n', 'Giorni tipici', 'Efficienza → Confronta: nei grafici dei giorni compaiono consumo e COP normali per quel freddo, e un puntino sui giorni peggiori del normale.'],
     ['n', 'Avviso se il pannello non si apre da fuori', 'Telegram ti scrive se da internet il pannello non risponde per qualche minuto; quando torna tutto a posto lo chiude da solo.'],
-    ['n', 'Programma dello Smarther', 'In Dispositivi: il programma orario letto dal termostato, a fasce o fisso.'],
+    ['n', 'Programma dello Smarther', 'In Dispositivi: il programma orario che il termostato ha in memoria, a fasce oppure sempre fisso.'],
     ['n', 'Zoom sui grafici', 'Analisi, da telefono: pizzica con due dita per ingrandire il tempo (tutti i grafici insieme), trascina con un dito per spostarti, doppio tocco per tornare alla vista intera. In più i grafici sono più larghi, con i numeri degli assi in una colonna stretta.'],
     ['n', 'Elenco degli sbrinamenti', 'In Efficienza → Cicli di funzionamento: il riquadro «Sbrinamenti» dice anche quanta energia hanno usato; toccalo per l’elenco a scomparsa con ora, durata, consumo approssimato e temperatura esterna.'],
     ['n', 'Cursore nei grafici di Efficienza', 'Passando il mouse o toccando un grafico di Efficienza compare, come in Analisi, la linea con i puntini e l’etichetta in alto; i valori di quel giorno (o di quella fascia di temperatura) si leggono nella legenda.'],
     ['n', 'Avvisi Telegram di sbrinamento', 'Un messaggio senza suoneria quando la PdC entra in sbrinamento e uno quando finisce (durata e consumo). Si accendono e si spengono a parte in Impostazioni → Avvisi, e i testi si possono cambiare.'],
     ['m', 'Avvisi di Efficienza in alto', 'Dati incompleti e l’avviso di Confronta ora stanno subito sotto «Aggiornato», così li vedi appena premi il tasto.'],
     ['m', 'Note e legende più ordinate', 'In Analisi le note sono un elenco con icona e la legenda di «Modo di funzionamento» sta su una riga; l’icona «i» è la stessa dappertutto.'],
-    ['m', 'Riquadri di Impostazioni', 'Aperti, hanno meno spazio vuoto e tutti uguali, sopra e sotto.'],
+    ['m', 'Riquadri di Impostazioni', 'Quando sono aperti hanno meno spazio vuoto, uguale sopra e sotto.'],
     ['m', 'Avvisi nelle card', '«Smarther non collegato» in rosso, «Ultimo dato delle…» in giallo, nello stesso box della ripartenza (anche per la PdC ferma nella card Esterna).'],
-    ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra sempre 3 righe da 3 ore a partire da adesso, con la scritta «Oggi»: mai «Domani», nemmeno a sera tarda.'],
+    ['m', 'Meteo sempre di oggi', 'Il dettaglio mostra 3 righe da 3 ore a partire da adesso, sempre con «Oggi», mai «Domani».'],
     ['m', 'Card Smarther stabile', 'Su PC la card ha sempre la stessa altezza, con o senza la riga della ripartenza: niente più saltelli.'],
     ['s', 'Password chiesta a ogni apertura', 'Su iPhone, se l’icona della Home era stata salvata mentre eri sulla pagina di accesso, ogni apertura mostrava il modulo di login anche con la sessione ancora valida (30 giorni). Ora, se sei già dentro, «/login» ti porta subito alla dashboard. Il login, i tentativi massimi e la sicurezza dei cookie non sono cambiati.'],
   ]},
@@ -2892,7 +2983,7 @@ const CHANGELOG = [
     ['m', 'Ritocchi ai testi', 'Più coerenti in tutto il pannello e nei messaggi Telegram.'],
     ['m', 'Impostazioni rifatte', 'Campi corti in linea, aiuto sotto ogni campo, riquadri chiusi su due colonne che si ricordano come li hai lasciati.'],
     ['m', 'Più leggero e leggibile', 'Pagine e dati compressi (da 124 a circa 40 KB); nei grafici i periodi senza dati hanno le righe oblique.'],
-    ['s', 'Stato più pronto', '«A riposo» e «Riscaldamento» si aggiornano in 1–2 minuti. Tolto l’avviso «Resistenza elettrica»: l’impianto non ce l’ha.'],
+    ['s', 'Stato più pronto', '«A riposo» e «Riscaldamento» si aggiornano in 1–2 minuti. Tolto l’avviso «Resistenza elettrica»: non c’è nell’impianto.'],
   ]},
   {v: '0.17', quando: '3 novembre 2026', titolo: 'Aggiornare senza fermare i dati', righe: [
     ['n', 'Applica aggiornamento', 'Impostazioni → Stato: le parti di interfaccia entrano a caldo e la lettura dei dati non si ferma mai.'],
@@ -2907,26 +2998,26 @@ const CHANGELOG = [
   {v: '0.15', quando: '3 novembre 2026', titolo: 'Un solo grafico per compressore, portata e pompa', righe: [
     ['n', 'Grafico unico', 'Analisi: compressore, pompa e portata insieme, a gradini come arrivano i dati, con i valori al passaggio del mouse.'],
     ['n', 'Richiesta di caldo', 'Una striscia rossa sotto il grafico dello Smarther, con «sì/no» all’ora scelta.'],
-    ['m', 'Compressore da fermo', 'Dashboard: stato «Fermo» e tre riquadri sull’ultimo ciclo (per cosa, durata, energia).'],
+    ['m', 'Compressore da fermo', 'Dashboard: stato «Fermo» e tre riquadri sull’ultimo ciclo: per cosa, quanto dura, quanta energia.'],
     ['m', 'Nota sul ritardo', 'Su una riga ordinata, senza «min» rimasto a capo.'],
     ['s', 'Gas di scarico', 'Compare solo se la pompa lo manda davvero.'],
   ]},
   {v: '0.14', quando: '3 novembre 2026', titolo: 'Umidità in casa: soglie e avvisi', righe: [
     ['n', 'Avvisi sull’umidità', 'Telegram avvisa sopra il 60 % e il 70 %; soglie e attese si cambiano in Impostazioni → Avvisi.'],
-    ['n', 'Riepilogo con la notte', 'Il riepilogo del mattino racconta anche la notte, ma solo se è successo qualcosa.'],
+    ['n', 'Riepilogo con la notte', 'Il riepilogo del mattino racconta anche la notte, ma solo se è successo qualcosa di nuovo.'],
     ['m', 'Colori e soglie', 'L’umidità diventa gialla e rossa in Dashboard, e due linee tratteggiate la accompagnano nel grafico.'],
-    ['m', 'Grafici', 'La potenza è una linea continua a gradini, e al passaggio del mouse ogni linea ha il suo puntino.'],
+    ['m', 'Grafici', 'La potenza è una linea a gradini, e passando il mouse ogni linea ha il suo puntino.'],
   ]},
   {v: '0.13', quando: '3 novembre 2026', titolo: 'Impostazioni in tab', righe: [
-    ['n', 'Sei tab', 'Stato, Collegamenti, Avvisi, Accesso, Dati e Registro; i riquadri si ricordano come li hai lasciati.'],
+    ['n', 'Sei tab', 'Stato, Collegamenti, Avvisi, Accesso, Dati e Registro; i riquadri restano aperti o chiusi come li lasci.'],
     ['n', 'Nuovi riquadri', 'In Dati: litri del bollitore e backup. In Cloudflare: «Invia il link su Telegram».'],
-    ['m', 'Errori chiari', 'Un valore non valido apre il riquadro giusto e si segna in rosso.'],
+    ['m', 'Errori chiari', 'Un valore non valido apre il riquadro giusto, segnato in rosso.'],
     ['m', 'Telefono', 'Dispositivi più ordinato; grafici Smarther rinominati «Temperatura ambiente» e «Umidità»; «acceso da 2 minuti».'],
   ]},
   {v: '0.12', quando: '3 novembre 2026', titolo: 'Confronto, bollitore, registro e ripristino', righe: [
-    ['n', 'Confronta', 'Efficienza: il periodo accanto al precedente di pari durata (COP, energia, calore, cicli).'],
+    ['n', 'Confronta', 'Efficienza: il periodo accanto al precedente, di pari durata: COP, energia, calore e cicli di funzionamento.'],
     ['n', 'Salute del bollitore', 'Quanto calore perde di notte e quanto ci mette a scaldarsi.'],
-    ['n', 'Registro e ripristino', 'Impostazioni → Registro, e il comando «ripristina» per rimettere un backup.'],
+    ['n', 'Registro e ripristino', 'Impostazioni → Registro, e il comando «ripristina» per rimettere un backup salvato.'],
     ['s', 'Più robusto', 'Disco pieno o database non scrivibile non fermano più la raccolta: riprova da sola e lo scrive nel registro.'],
     ['s', 'Più sicuro', 'config.json leggibile solo dal proprietario, login che rifiuta richieste da altri siti, tempo reale di Safari che si ricollega.'],
   ]},
@@ -2942,14 +3033,14 @@ const CHANGELOG = [
   {v: '0.9', titolo: 'Pagina Dispositivi', righe: [
     ['n', 'Pompa e Smarther', 'Modello, versioni, identificativi con «Copia», IP e MAC, stato, storico delle firmware e loghi tuoi.'],
     ['m', 'Si aggiorna da sola', 'Dopo un aggiornamento le pagine rimaste aperte si ricaricano da sole.'],
-    ['s', 'Stato corretto', '«A riposo» non compare più a pompa in marcia per il ritardo dei dati.'],
+    ['s', 'Stato corretto', '«A riposo» non compare più a pompa in marcia, nemmeno per il ritardo dei dati.'],
   ]},
   {v: '0.8', titolo: 'Colori e dettagli', antico: true, righe: [
     ['m', 'Badge di stato', 'A colori pieni, sempre sotto il titolo delle schede.'],
     ['s', 'Acqua calda', 'Non va più in «Standby» durante un ciclo.'],
   ]},
   {v: '≤ 0.7', titolo: 'Come è nato', antico: true, righe: [
-    ['n', 'Il nucleo', 'Lettura della pompa (SmartThings) e dello Smarther (Netatmo), database, decodifica del ciclo.'],
+    ['n', 'Il nucleo', 'Lettura della pompa (SmartThings) e dello Smarther (Netatmo), database e decodifica del ciclo.'],
     ['n', 'Il sito', 'Server web con login, Dashboard con curva climatica, tempo reale, modalità demo.'],
     ['n', 'Analisi ed Efficienza', 'Grafici sincronizzati, COP stimato, energia al giorno, cicli.'],
     ['n', 'Telegram', 'Avvisi sulle anomalie e riepilogo del mattino.'],
@@ -2957,11 +3048,11 @@ const CHANGELOG = [
   ]},
 ];
 
+const clRiga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;   // una riga del Changelog (Pannello e Plugin)
 function disegnaChangelogPannello() {
-  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
   const voce = (c, attuale) => `<section class="cl-v${attuale ? ' att' : ''}"><div class="cl-h"><span class="cl-n">${esc(c.v)}</span>` +
     `${attuale ? '<span class="pill en">Attuale</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.quando ? `<span class="cl-d">${esc(c.quando)}</span>` : ''}</div>` +
-    `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+    `<ul>${c.righe.map(clRiga).join('')}</ul></section>`;
   const recenti = CHANGELOG.filter((c, k) => k < 3), prima = CHANGELOG.filter((c, k) => k >= 3 && !c.antico), antiche = CHANGELOG.filter(c => c.antico);
   const breve = `<div class="cl-breve"><div class="eti">In breve</div>${CL_BREVE.map(b => `<div class="cl-bi">${CL_IC[b[0]] ? `<span class="cl-ic">${CL_IC[b[0]]}</span>` : iconaMeteo(b[0], 22)}<span><b>${esc(b[1])}</b> ${esc(b[2])}</span></div>`).join('')}</div>`;
   return `${breve}<div class="cl-tl">${recenti.map((c, k) => voce(c, k === 0)).join('')}` +
@@ -2984,12 +3075,11 @@ function disegnaChangelogPlugin() {
   const voci = [];
   for (const p of plug) if (!filtro || p.nome === filtro) for (const c of p.changelog) voci.push({p, c});
   voci.sort((a, b) => (b.c.data || '').localeCompare(a.c.data || ''));   // stabile: a pari data resta l'ordine del plugin
-  const riga = r => `<li><span class="pill tg ${ {n: 'c-ok', m: 'c-acs', s: 'c-en'}[r[0]] }">${CL_TIPI[r[0]]}</span><span class="cl-tx"><b>${esc(r[1])}</b> ${esc(r[2])}</span></li>`;
   const corpo = voci.map(({p, c}) => {
     const att = c.v === p.versione;
     return `<section class="cl-v${att ? ' att' : ''}"><div class="cl-h">${filtro ? '' : `<span class="pill up">${esc(p.titolo)}</span>`}<span class="cl-n">${esc(c.v)}</span>` +
       `${att ? '<span class="pill en">Installato</span>' : ''}<span class="cl-ti">${esc(c.titolo)}</span>${c.data ? `<span class="cl-d">${esc(dataIt(c.data))}</span>` : ''}</div>` +
-      `<ul>${c.righe.map(riga).join('')}</ul></section>`;
+      `<ul>${c.righe.map(clRiga).join('')}</ul></section>`;
   }).join('');
   return `${chips}<div class="cl-tl">${corpo}</div>`;
 }
@@ -3002,8 +3092,7 @@ function vistaChangelog() {
 }
 async function caricaChangelogPlugin() {
   try {
-    const r = await fetch('/api/plugin/changelog', {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson('/api/plugin/changelog'); if (!r) return;
     clDati = r.ok ? await r.json() : {plugin: []};
   } catch (e) { clDati = {plugin: []}; }
   if (S.pagina === 'changelog' && S.sub === 'plugin') { const y = window.scrollY; vistaChangelog(); window.scrollTo(0, y); }
@@ -3049,24 +3138,25 @@ function cardBollitore(d) {
   const b = d.bollitore, pb = S.confronto && d.prec && d.prec.completo ? d.prec.bollitore : null;
   const conf = (v, fmtv) => pb === undefined || !S.confronto || !d.prec || !d.prec.completo ? '' : `<small class="conf-t">${v == null ? 'Prima: dati insufficienti' : 'Prima ' + fmtv(v)}</small>`;
   const t = (et, val, sub, cf) => `<div class="tile"><small>${et}</small><b>${val}</b>${sub ? `<small>${sub}</small>` : ''}${cf || ''}</div>`;
-  const p = b && b.perdita, sa = b && b.salita, pp_ = pb && pb.perdita, ps = pb && pb.salita;
-  const tiles = (p ? t('Perdita a riposo, di notte', num(p.gradi_ora, 2) + ' °C/h', `circa ${num(p.watt, 0)} W · ${p.notti} notti`,
-      conf(pp_ ? pp_.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita a riposo, di notte', '—', 'servono almeno 2 notti senza acqua calda'))
+  const p = b && b.perdita, sa = b && b.salita, g = b && b.giorno, pp_ = pb && pb.perdita, ps = pb && pb.salita, pg = pb && pb.giorno;
+  const tiles = (p ? t('Perdita di notte', num(p.gradi_ora, 2) + ' °C/h', `circa ${num(p.watt, 0)} W · ${p.notti} notti`,
+      conf(pp_ ? pp_.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita di notte', '—', 'servono almeno 2 notti senza acqua calda'))
+    + (g ? t('Perdita di giorno', num(g.gradi_ora, 2) + ' °C/h', `circa ${num(g.watt, 0)} W · ${num(g.ore, 1)} ore`,
+      conf(pg ? pg.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita di giorno', '—', 'servono almeno 2 ore tranquille'))
     + (sa ? t('Tempo per salire di 10 °C', durata(sa.min_per_10), `${num(sa.gradi_ora, 1)} °C/h · ${sa.cicli} cicli`,
       conf(ps ? ps.min_per_10 : null, v => durata(v))) : t('Tempo per salire di 10 °C', '—', 'servono almeno 2 cicli completi'))
     + (sa ? t('Ciclo tipico', '+' + num(sa.gradi, 1) + ' °C', `in ${durata(sa.minuti)}`, conf(ps ? ps.gradi : null, v => '+' + num(v, 1) + ' °C')) : '');
   return `<article class="card"><h2>Salute del bollitore</h2><div class="tiles tc c-acs">${tiles}</div>
     <ul class="nota-cv"><li><i class="in"></i><span>Stime dalla sonda dell'acqua calda (${b ? b.litri : 300} litri). Sono indicazioni, non diagnosi. <button type="button" class="come-b" data-come="boll" aria-expanded="false">Come leggerli</button></span></li></ul>
-    <p class="come-t" id="come-boll" hidden>La <b>perdita</b> dice quanto si raffredda l'acqua del bollitore di notte, quando non la usa nessuno e la pompa non la scalda (si guarda il tratto più lungo tra le 23 e le 6). Se col tempo aumenta, può esserci un problema di isolamento o di ricircolo. Il <b>tempo per salire di 10 °C</b> dice quanto ci mette la pompa a scaldare l'acqua di 10 gradi: se si allunga, la pompa rende meno oppure c'è più acqua da scaldare.</p></article>`;
+    <p class="come-t" id="come-boll" hidden>La <b>perdita</b> dice quanto si raffredda l'acqua del bollitore quando la pompa non la scalda: di notte si guarda il tratto più lungo tra le 23 e le 6, di giorno (6–23) solo i tratti tranquilli di almeno un’ora, senza docce o rubinetti aperti, quindi ce ne sono meno e il valore è meno preciso. Il confronto tra i due mostra quanto pesano i consumi e il ricircolo. Se col tempo aumenta, può esserci un problema di isolamento o di ricircolo. Il <b>tempo per salire di 10 °C</b> dice quanto ci mette la pompa a scaldare l'acqua di 10 gradi: se si allunga, la pompa rende meno oppure c'è più acqua da scaldare.</p></article>`;
 }
 // Costo del mese in corso (non dipende dal periodo scelto): stima a fine mese e confronto col mese scorso
 function meseCosto(m) {
   if (!m) return '';
-  const MES = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
-  return `<article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Costo di ${MES[m.mese - 1]}</span></div>
+  return `<article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Costo di ${MESI_IT[m.mese - 1]}</span></div>
       <div class="val"><div class="n"><span>${euro(m.euro)}</span></div></div>
-      <div class="sub">${m.stima_euro != null ? `<span>Stima a fine mese <b>${euro(m.stima_euro)}</b></span>` : ''}${m.scorso_euro != null ? `<span>${MES[m.mese_scorso - 1]} <b>${euro(m.scorso_euro)}</b></span>` : ''}</div>
-      <div class="nota">Stima: media dei giorni passati, indicativa.</div></article>`;
+      <div class="sub">${m.stima_euro != null ? `<span>Stima a fine mese <b>${euro(m.stima_euro)}</b></span>` : ''}${m.scorso_euro != null ? `<span>${MESI_IT[m.mese_scorso - 1]} <b>${euro(m.scorso_euro)}</b></span>` : ''}</div>
+      <div class="nota">Stima: media dei giorni passati, indicativa.${m.dettaglio ? ' <span class="come-b" data-come="eurm" role="button" tabindex="0" aria-expanded="false">Dettaglio</span>' : ''}</div>${m.dettaglio ? `<p class="come-t" id="come-eurm" hidden><span class="nw">Riscaldamento <b>${euro(m.dettaglio.casa)}</b></span><span class="nw">Acqua calda <b>${euro(m.dettaglio.acs)}</b></span><span class="nw">Standby <b>${euro(m.dettaglio.riposo)}</b></span></p>` : ''}</article>`;
 }
 const ICONA_SCARICA = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg>';
 function disegnaEfficienza(d) {
@@ -3084,7 +3174,7 @@ function disegnaEfficienza(d) {
       <div class="sub"><span>Risc. <b>${cop(t.cop_casa)}</b></span><span>Acqua <b>${cop(t.cop_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
     <article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Energia elettrica</span></div>
       <div class="val"><div class="n"><span>${fm(t.el_casa + t.el_acs + t.el_riposo)}</span><i>kWh</i></div></div>
-      <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span>Costo stimato <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
+      <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span><span class="come-b" data-come="eur" role="button" tabindex="0" aria-expanded="false">Costo stimato</span> <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${d.prezzo_kwh > 0 ? `<p class="come-t" id="come-eur" hidden><span class="nw">Riscaldamento <b>${euro(t.el_casa * d.prezzo_kwh)}</b></span><span class="nw">Acqua calda <b>${euro(t.el_acs * d.prezzo_kwh)}</b></span><span class="nw">Standby <b>${euro(t.el_riposo * d.prezzo_kwh)}</b></span></p>` : ''}${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
     ${meseCosto(d.mese)}
     <article class="card acc" style="--acc:var(--casa)"><div class="ch"><span class="et">Calore prodotto (stima)</span></div>
       <div class="val"><div class="n"><span>${fm(t.calore_casa + t.calore_acs)}</span><i>kWh</i></div></div>
@@ -3108,7 +3198,7 @@ function disegnaEfficienza(d) {
   </div>
   ${cardBollitore(d)}
   <article class="card"><h2>Esporta per Excel</h2><div class="exp">
-    <a href="/api/esporta.csv?tipo=giorni&giorni=${d.n_giorni}" download>${ICONA_SCARICA}<span><b>Riepilogo per giorno</b><small>${d.n_giorni} giorni, una riga al giorno</small></span></a>
+    <a href="/api/esporta.csv?tipo=giorni&giorni=${d.n_giorni}" download>${ICONA_SCARICA}<span><b>Riepilogo per giorno</b><small>${d.n_giorni === 1 ? 'oggi, una riga' : d.n_giorni + ' giorni, una riga al giorno'}</small></span></a>
     <a href="/api/esporta.csv?tipo=misure&giorni=7" download>${ICONA_SCARICA}<span><b>Dati grezzi</b><small>ultimi 7 giorni, ogni misura</small></span></a>
   </div></article>`;
   const box = $('#eff'); const f = JSON.stringify([d.ora, d.n_giorni, box.clientWidth]);
@@ -3165,7 +3255,7 @@ function barreGiorni(giorni, W, tip, tel) {
   let L = 34, pw = W - L - R;
   const tot = g => g.el_casa + g.el_acs + g.el_riposo, mx = Math.max(1, ...giorni.map(tot), ...(tip ? Object.values(tip).map(t => t.el) : []));
   const sc = scalaNice(0, mx, 4); sc.lo = 0;
-  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
+  L = larghezzaNumeriY(sc, tel); pw = W - L - R;
   const Y = v => T + ph - v / sc.hi * ph, bw = Math.min(46, pw / n * 0.7), cx = i => L + pw / n * (i + 0.5);
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="en">`;
   EF.en = {xs: giorni.map((_, i) => cx(i)), lab: giorni.map(giornoBreve), L, pw, T,
@@ -3173,7 +3263,7 @@ function barreGiorni(giorni, W, tip, tel) {
     seg: (i, yy) => { const g = giorni[i]; let y0 = Y(0);
       for (const [k, nome] of [['el_riposo', 'Standby'], ['el_acs', 'Acqua'], ['el_casa', 'Risc.']]) { const h = g[k] / sc.hi * ph; if (yy >= y0 - h || k === 'el_riposo' && yy >= y0) return `${nome} ${num(g[k], 1)} kWh`; y0 -= h; }
       return null; }};
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  s += grigliaY(sc, Y, L, W, R);
   giorni.forEach((g, i) => {
     let y = Y(0);
     [['el_riposo', '#3a4558'], ['el_acs', COLS.acs], ['el_casa', COLS.casa]].forEach(([k, c]) => {
@@ -3198,11 +3288,11 @@ function lineeGiorni(giorni, W, tip, tel) {
   let L = 34, pw = W - L - R;
   const vals = giorni.flatMap(g => [g.cop_casa, g.cop_acs, ...(tip && tip[g.giorno] ? [tip[g.giorno].cop_casa, tip[g.giorno].cop_acs] : [])]).filter(v => v != null);
   const sc = scalaNice(0, Math.max(5, ...(vals.length ? vals : [0])), 5); sc.lo = 0;
-  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
+  L = larghezzaNumeriY(sc, tel); pw = W - L - R;
   const Y = v => T + ph - v / sc.hi * ph, X = i => n === 1 ? L + pw / 2 : L + pw * i / (n - 1);
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="cop">`;
   EF.cop = {xs: giorni.map((_, i) => X(i)), lab: giorni.map(giornoBreve), L, pw, T, dots: i => ['cop_casa', 'cop_acs'].map(k => giorni[i][k] == null ? null : Y(giorni[i][k]))};
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  s += grigliaY(sc, Y, L, W, R);
   giorni.forEach((g, i) => { if (n <= 10 || i % Math.ceil(n / 7) === 0) s += `<text x="${X(i).toFixed(1)}" y="${H - 7}" text-anchor="${i === n - 1 && n > 1 ? 'end' : 'middle'}">${giornoBreve(g)}</text>`; });
   [['cop_casa', COLS.casa], ['cop_acs', COLS.acs]].forEach(([k, c]) => {
     let p = '', prec = false;
@@ -3226,13 +3316,13 @@ function curvaCop(bins, W, tel) {
   if (!tutti.length) return '<div class="vuoto">Servono più ore di funzionamento per questo grafico.</div>';
   const x0 = Math.min(...tutti.map(b => b.da)), x1 = Math.max(...tutti.map(b => b.a)), mx = Math.max(5, ...tutti.map(b => b.cop));
   const sc = scalaNice(0, mx, 5); sc.lo = 0;
-  L = colonnaNumeri(sc.tick.filter(v => v >= 0).map(v => num(v, 0)), tel); pw = W - L - R;
+  L = larghezzaNumeriY(sc, tel); pw = W - L - R;
   const X = t => L + (t - x0) / Math.max(1, x1 - x0) * pw, Y = v => T + ph - v / sc.hi * ph;
   let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-ef="bin">`;
   const das = [...new Set(tutti.map(b => b.da))].sort((a, b) => a - b);
   EF.bin = {bins: das, xs: das.map(t => X(t + 1)), lab: das.map(t => `${t}…${t + 2} °C`), L, pw, T,
     dots: i => ['casa', 'acs'].map(m => { const b = bins[m].find(x => x.da === das[i]); return b ? Y(b.cop) : null; })};
-  s += sc.tick.filter(v => v >= 0).map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, 0)}</text>`).join('');
+  s += grigliaY(sc, Y, L, W, R);
   for (let t = Math.ceil(x0 / 2) * 2; t <= x1; t += (x1 - x0 > 20 ? 5 : 2)) s += `<text x="${X(t).toFixed(1)}" y="${H - 16}" text-anchor="${X(t) > W - 14 ? 'end' : 'middle'}">${t}°</text>`;
   s += `<text x="${(L + pw / 2).toFixed(1)}" y="${H - 2}" text-anchor="middle" class="ass">Temperatura esterna</text>`;
   [['casa', COLS.casa], ['acs', COLS.acs]].forEach(([k, c]) => {
@@ -3313,34 +3403,240 @@ function schedaDisp(s, d) {
     ${s.gruppi.map(g => `<section class="dev-gr"><h3 class="eti">${esc(g.titolo)}</h3>${g.righe.map(r => rigaDisp(r, d)).join('')}</section>`).join('')}
   </article>`;
 }
-const TAB_DISP = [['', 'Dispositivi'], ['installatore', 'Installatore']];
+const TAB_DISP = [['', 'Dispositivi'], ['installatore', 'Regolazioni']];
 const tabsDisp = () => `<nav class="sub-tabs" aria-label="Sezioni">${TAB_DISP.map(([k, t]) => `<a href="#/dispositivi${k ? '/' + k : ''}" class="${S.sub === k || (k === '' && S.sub !== 'installatore') ? 'on' : ''}">${t}</a>`).join('')}</nav>`;
 S.fsvAperti = S.fsvAperti || new Set(['20']);
 document.addEventListener('toggle', e => {
   const g = e.target && e.target.dataset && e.target.dataset.fsv; if (!g) return;
   if (e.target.open) S.fsvAperti.add(g); else S.fsvAperti.delete(g);
 }, true);
+// ---- impostazioni installatore: lettura, cronologia e modifica (lucchetto di 30 s, poi matita, poi conferma) ----
+// la matita ✎ sulla riga: attiva solo con le modifiche sbloccate e da casa
+const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo da casa' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
+S.sbloccoFsv = S.sbloccoFsv || 0; S.fsvMod = S.fsvMod || null; S.fsvVal = S.fsvVal || ''; S.fsvErr = S.fsvErr || ''; S.fsvOcc = false;
+function armaSbloccoFsv() { clearTimeout(S.tLockFsv); S.sbloccoFsv = Date.now() + 30000; S.tLockFsv = setTimeout(() => { S.sbloccoFsv = 0; S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = false; S.boostErr = ''; ridisegnaInstallatore(); }, 30200); }
+function ridisegnaInstallatore() { if (S.dati && S.pagina === 'dispositivi' && S.sub === 'installatore') disegnaDispositivi(S.dati); }
+function trovaFsv(id) { const i = S.dati && S.dati.installatore; if (!i) return null; for (const g of i.gruppi) { const r = g.righe.find(x => x.id === id); if (r) return r; } return null; }
+function editorFsv(r) {
+  const campo = r.opzioni
+    ? `<select data-fsv-val aria-label="Nuovo valore di ${esc(r.id)}">${r.opzioni.map(([k, t]) => `<option value="${k}" ${String(k) === String(S.fsvVal) ? 'selected' : ''}>${esc(t)} · ${k}</option>`).join('')}</select>`
+    : `<input type="number" inputmode="numeric" step="1" min="${r.lo}" max="${r.hi}" data-fsv-val value="${esc(S.fsvVal)}" aria-label="Nuovo valore di ${esc(r.id)}"> <span class="mut">${esc(r.unita)}</span>`;
+  return `<div class="fsv-edit"><div class="fe-t">Modifica ${esc(r.id)} · ${esc(r.nome)}</div>
+    <div class="fe-r"><span class="mut">Ora</span><b>${esc(r.v)}</b></div>
+    <div class="fe-r"><span class="mut">Nuovo valore</span><span>${campo}</span></div>
+    ${r.nota ? `<small class="mut">${esc(r.nota)}</small>` : ''}
+    ${r.limiti ? `<small class="mut">Limiti del manuale: ${esc(r.limiti)}</small>` : ''}
+    <small class="mut">Il valore parte dal pannello alla pompa tramite SmartThings. Poi va riletto: finché la pompa non lo conferma, la riga dice «in attesa».</small>
+    ${S.fsvErr ? `<div class="fe-err">${esc(S.fsvErr)}</div>` : ''}
+    <div class="fe-b"><button type="button" class="sec piccolo" data-fsv-annulla ${S.fsvOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-fsv-conf ${S.fsvOcc ? 'disabled' : ''}>${S.fsvOcc ? 'Invio…' : 'Cambia nella pompa'}</button></div></div>`;
+}
 function rigaFsv(r) {
+  const sbl = Date.now() < S.sbloccoFsv;
   const fuori = r.fuori ? ' <span class="pill bad" title="Fuori dai limiti indicati dal manuale">fuori limiti</span>' : '';
   const note = [];
   if (r.limiti) note.push(esc(r.limiti));
-  const cambio = r.cambio ? `<small class="mut nota-r">cambiato il ${esc(dataLunga(r.cambio.ts))} (prima: ${esc(r.cambio.prima)})</small>` : '';
-  return `<div class="riga"><span><i class="fsv-id">${esc(r.id)}</i>${esc(r.nome)}</span><b><span class="val-c">${esc(r.v)}${fuori}</span>${note.length ? `<small class="mut nota-r">${note.join(' · ')}</small>` : ''}${cambio}</b></div>`;
+  const cambio = r.cambio ? `<small class="mut nota-r">visto cambiato il ${esc(dataLunga(r.cambio.ts))} (prima: ${esc(r.cambio.prima)})</small>` : '';
+  const attesa = r.attesa ? `<small class="nota-r in-attesa">in attesa: richiesto ${esc(r.attesa.dopo)} alle ${esc(hhmm(r.attesa.ts))}${r.attesa.vecchia ? ', la pompa non l’ha ancora confermato (controlla sul suo pannello)' : ''}</small>` : '';
+  const matita = r.modificabile && !S.fuori ? bottoneMatita(`data-fsv-mod="${esc(r.id)}"`, sbl, S.fsvOcc, `Modifica ${esc(r.id)}`, 'Modifica questa impostazione') : '';
+  const riga = `<div class="riga"><span><i class="fsv-id">${esc(r.id)}</i>${esc(r.nome)}</span><b><span class="val-c">${esc(r.v)}${fuori}</span>${note.length ? `<small class="mut nota-r nw">${note.join(' · ')}</small>` : ''}${cambio}${attesa}</b>${matita}</div>`;
+  return riga + (sbl && S.fsvMod === r.id ? editorFsv(r) : '');
+}
+const PER_PAG_FSV = 6;
+function cronologiaFsv(lista) {
+  if (!lista || !lista.length) return `<article class="card dev"><div class="ch"><h2>Cronologia modifiche</h2></div><p class="nota-sez">Nessun cambio visto da quando il pannello osserva.</p></article>`;
+  const pagine = Math.ceil(lista.length / PER_PAG_FSV);
+  S.pagFsv = Math.min(Math.max(S.pagFsv || 0, 0), pagine - 1);
+  const righe = lista.slice(S.pagFsv * PER_PAG_FSV, (S.pagFsv + 1) * PER_PAG_FSV).map(v => {
+    const fonte = v.fonte === 'pannello'
+      ? (v.stato === 'in attesa' ? `chiesto dal pannello, in attesa della pompa` : v.stato === 'non confermata' ? `chiesto dal pannello, la pompa non l’ha confermato` : v.stato ? 'chiesto dal pannello (già a quel valore)' : `cambiato dal pannello${v.ip ? ' (' + esc(v.ip) + ')' : ''}`)
+      : 'letto dalla pompa';
+    return `<div class="riga"><span>${esc(dataLunga(v.ts))}</span><b>${esc(v.id)} · ${esc(v.nome)}<small class="mut nota-r">${esc(v.prima)} → ${esc(v.dopo)}</small><small class="mut nota-r">${fonte}</small></b></div>`;
+  }).join('');
+  const nav = pagNav('pagFsv', pagine);
+  return `<article class="card dev"><div class="ch"><h2>Cronologia modifiche</h2></div>
+    <p class="nota-sez">I cambi che il pannello ha visto nelle impostazioni, con il valore di prima. La data è quella in cui il pannello ha visto il valore nuovo: SmartThings può essere in ritardo rispetto alla pompa.</p>${righe}${nav}</article>`;
 }
 function disegnaInstallatore(d) {
-  const i = d.installatore;
-  if (!i || !i.totale) return `<article class="card dev"><div class="vuoto">La pompa non ha ancora comunicato impostazioni installatore. Appena SmartThings le manda, compaiono qui (il pannello le legge ogni ora circa).</div></article>`;
+  S.fuori = d.da_casa === false;     // da fuori casa: FSV, temperatura/modo dell'acqua e boost restano bloccati
+  const i = d.installatore, testa = cardRegolazioni(d);
+  if (!i || !i.totale) return testa + `<article class="card dev"><div class="vuoto">La pompa non ha ancora comunicato impostazioni installatore. Appena SmartThings le manda, compaiono qui (il pannello le legge ogni ora circa).</div></article>`;
   const testo = i.gruppi.map(g => `${g.titolo}\n` + g.righe.map(r => `${r.id}  ${r.nome}: ${r.v}`).join('\n')).join('\n\n');
   const sommario = [`<b>${i.totale}</b> impostazioni`, i.cambiati ? `<b>${i.cambiati}</b> cambiate da quando il pannello osserva` : '', i.fuori ? `<b class="rosso">${i.fuori}</b> fuori limiti` : '', i.letto ? `lette ${esc(fa(i.letto))}` : ''].filter(Boolean).join(' · ');
-  return `<article class="card dev">
-    <div class="ch"><h2>Impostazioni installatore</h2><button type="button" class="copia" data-copia="${esc(testo)}" title="Copia tutto l'elenco">Copia elenco</button></div>
+  return testa + `<article class="card dev">
+    <div class="ch"><h2>Impostazioni installatore (FSV)</h2><span class="ch-b"><button type="button" class="copia" data-copia="${esc(testo)}" title="Copia tutto l'elenco">Copia elenco</button></span></div>
     <p class="nota-sez">${sommario}</p>
-    <p class="nota-sez">Sola lettura: da qui non si cambia nulla. Sono i valori che la pompa comunica tramite SmartThings (i codici FSV del manuale). L'intervallo sotto ogni valore è quello del manuale Samsung EHS Mono e può variare da modello a modello.</p>
-  </article>` + i.gruppi.map(g => `<details class="card dev fsv-gr" data-fsv="${esc(g.id)}" ${S.fsvAperti.has(g.id) ? 'open' : ''}><summary><span class="t">${esc(g.titolo)}</span><span class="d">${g.righe.length} impostazioni</span></summary>${g.righe.map(rigaFsv).join('')}</details>`).join('');
+    <p class="nota-sez">Sono i valori che la pompa comunica tramite SmartThings (i codici FSV del manuale). L'intervallo sotto ogni valore è quello del manuale Samsung EHS Mono e può variare da modello a modello. ${S.fuori ? '' : 'Per cambiarne uno: «Sblocca modifiche» in alto, la matita ✎ della riga, il nuovo valore e la conferma.'}</p>
+  </article>` + i.gruppi.map(g => `<details class="card dev fsv-gr" data-fsv="${esc(g.id)}" ${S.fsvAperti.has(g.id) || (S.fsvMod && g.righe.some(r => r.id === S.fsvMod)) ? 'open' : ''}><summary><span class="t">${esc(g.titolo)}</span><span class="d">${g.righe.length} impostazioni</span></summary>${g.righe.map(rigaFsv).join('')}</details>`).join('') + cronologiaFsv(i.cronologia);
 }
+// pagine «‹ 1 di N ›» (cronologia FSV e registro comandi): chiave = campo di S che tiene la pagina corrente
+const pagNav = (k, tot) => tot > 1 ? `<div class="pager"><button type="button" data-pag="${k}:-1" ${S[k] === 0 ? 'disabled' : ''} aria-label="Più recenti">‹</button><span>${S[k] + 1} di ${tot}</span><button type="button" data-pag="${k}:1" ${S[k] >= tot - 1 ? 'disabled' : ''} aria-label="Meno recenti">›</button></div>` : '';
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('[data-pag]'); if (!b || b.disabled) return;
+  const [k, d] = b.dataset.pag.split(':'); S[k] = (S[k] || 0) + Number(d);
+  disegna();
+});
+document.addEventListener('click', e => {
+  const t = e.target;
+  if (!t.closest) return;
+  if (t.closest('#b-lock-fsv')) {
+    clearTimeout(S.tLockFsv);
+    if (Date.now() < S.sbloccoFsv) { S.sbloccoFsv = 0; S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; } else armaSbloccoFsv();
+    ridisegnaInstallatore(); return;
+  }
+  const m = t.closest('[data-fsv-mod]');
+  if (m && !m.disabled) {
+    const r = trovaFsv(m.dataset.fsvMod); if (!r) return;
+    S.regMod = null; S.regErr = ''; S.fsvMod = r.id; S.fsvErr = ''; S.fsvVal = r.n == null ? '' : String(r.n);
+    armaSbloccoFsv(); ridisegnaInstallatore(); return;
+  }
+  if (t.closest('[data-fsv-annulla]')) { S.fsvMod = null; S.fsvErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+  if (t.closest('[data-fsv-conf]')) confermaFsv();
+});
+async function confermaFsv() {
+  const r = trovaFsv(S.fsvMod); if (!r || S.fsvOcc) return;
+  const nuovo = Number(String(S.fsvVal).replace(',', '.'));
+  const err = m => { S.fsvErr = m; armaSbloccoFsv(); ridisegnaInstallatore(); };
+  if (S.fsvVal === '' || !Number.isFinite(nuovo)) return err('Scrivi o scegli un valore.');
+  if (nuovo !== Math.round(nuovo)) return err('Queste impostazioni vanno a numeri interi.');
+  if (nuovo === r.n) return err('È già a questo valore.');
+  if (!r.opzioni && (nuovo < r.lo || nuovo > r.hi)) return err('Fuori dai limiti del manuale (' + r.limiti + ').');
+  const opz = r.opzioni && r.opzioni.find(o => Number(o[0]) === nuovo);
+  const descr = opz ? `${opz[1]} · ${nuovo}` : `${nuovo} ${r.unita}`.trim();
+  armaSbloccoFsv();
+  if (!window.confirm(`Stai per cambiare un'impostazione installatore della pompa di calore.\n\n${r.id} · ${r.nome}\nOra: ${r.v}\nNuovo: ${descr}\n\nUn valore sbagliato può far lavorare male la pompa. Confermi?`)) return;
+  inviaOp('fsv', '/api/fsv', {codice: r.id, valore: nuovo}, `${r.id}: modifica inviata, aspetto che la pompa la confermi`, () => { S.fsvMod = null; }, 'Modifica non riuscita', 'la modifica è partita, controlla la cronologia');
+}
+// invio di un cambio alla pompa (FSV, regolazione, boost): k = prefisso dello stato in S (fsv/reg/boost: Occ = in corso, Err = messaggio)
+async function inviaOp(k, url, corpo, okMsg, fine, erroreDef, partito) {
+  S[k + 'Occ'] = true; S[k + 'Err'] = ''; ridisegnaInstallatore();
+  try {
+    const x = await inviaPost(url, corpo);
+    if (x.ok) { toast(okMsg); fine(); carica(); }
+    else { S[k + 'Err'] = x.errore || erroreDef; toast(erroreDef, true); }
+  } catch { S[k + 'Err'] = `Il pannello non risponde: non so se ${partito}.`; toast('Il pannello non risponde', true); }
+  S[k + 'Occ'] = false; armaSbloccoFsv(); ridisegnaInstallatore();
+}
+// ---- regolazioni: temperatura e modo dell'acqua calda, modo della pompa (stesso lucchetto degli FSV) ----
+S.regMod = S.regMod || null; S.regVal = S.regVal || ''; S.regErr = S.regErr || ''; S.regOcc = false;
+function trovaReg(cosa) { return S.dati && S.dati.regolazioni ? S.dati.regolazioni[cosa] : null; }
+function editorReg(r) {
+  const opz = r.opzioni && r.opzioni.find(o => String(o[0]) === String(S.regVal));
+  const campo = r.opzioni
+    ? `<select data-reg-val aria-label="Nuovo valore: ${esc(r.nome)}">${r.opzioni.map(o => `<option value="${esc(o[0])}" ${String(o[0]) === String(S.regVal) ? 'selected' : ''}>${esc(o[1])}</option>`).join('')}</select>`
+    : `<input type="number" inputmode="numeric" step="1" min="${r.lo}" max="${r.hi}" data-reg-val value="${esc(S.regVal)}" aria-label="Nuovo valore: ${esc(r.nome)}"> <span class="mut">${esc(r.unita)}</span>`;
+  return `<div class="fsv-edit"><div class="fe-t">Modifica · ${esc(r.nome)}</div>
+    <div class="fe-r"><span class="mut">Ora</span><b>${esc(r.testo)}</b></div>
+    <div class="fe-r"><span class="mut">Nuovo valore</span><span>${campo}</span></div>
+    ${r.lo != null ? `<small class="mut">Limiti della pompa: da ${r.lo} a ${r.hi} ${esc(r.unita)}</small>` : ''}
+    ${opz && opz[2] ? `<small class="avviso-reg">${esc(opz[2])}</small>` : ''}
+    <small class="mut">Il comando parte dal pannello alla pompa tramite SmartThings. Poi va riletto: finché la pompa non lo conferma, la riga dice «in attesa».</small>
+    ${S.regErr ? `<div class="fe-err">${esc(S.regErr)}</div>` : ''}
+    <div class="fe-b"><button type="button" class="sec piccolo" data-reg-annulla ${S.regOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-reg-conf ${S.regOcc ? 'disabled' : ''}>${S.regOcc ? 'Invio…' : 'Cambia nella pompa'}</button></div></div>`;
+}
+function rigaReg(r) {
+  if (!r) return '';
+  const sbl = Date.now() < S.sbloccoFsv;
+  const attesa = r.attesa ? `<small class="nota-r in-attesa">in attesa: richiesto ${esc(r.attesa.dopo)} alle ${esc(hhmm(r.attesa.ts))}, la pompa non l’ha ancora confermato</small>` : '';
+  const matita = r.modificabile && !S.fuori ? bottoneMatita(`data-reg-mod="${esc(r.cosa)}"`, sbl, S.regOcc, `Modifica: ${esc(r.nome)}`, 'Modifica') : '';
+  return `<div class="riga"><span>${esc(r.nome)}</span><b><span class="val-c">${esc(r.testo)}</span>${attesa}</b>${matita}</div>` + (sbl && S.regMod === r.cosa ? editorReg(r) : '');
+}
+function cardRegolazioni(d) {
+  const g = d.regolazioni; if (!g) return '';
+  const sbl = Date.now() < S.sbloccoFsv;
+  const lock = S.fuori ? '' : `<span class="ch-b"><button type="button" class="sec piccolo ${sbl ? 'sbloccato' : ''}" id="b-lock-fsv">${sbl ? 'Modifiche sbloccate · Blocca' : 'Sblocca modifiche'}</button></span>`;
+  const testo = S.fuori ? 'Qui sotto i valori attuali della pompa.'
+    : 'Per cambiare un valore (qui sotto o negli FSV): «Sblocca modifiche» (restano sbloccate 30 secondi dall’ultima azione), la matita ✎, il nuovo valore e la conferma. La pompa deve poi comunicare il valore nuovo: SmartThings può metterci un po’, e finché non lo fa la riga dice «in attesa».';
+  const avviso = S.fuori ? '<div class="avviso warn"><span>⚠️</span><div>Sei collegato da fuori casa: le modifiche (FSV, acqua calda, Boost, modo della pompa) si fanno solo dalla rete di casa.</div></div>' : '';
+  return `<article class="card dev"><div class="ch"><h2>Regolazioni</h2>${lock}</div>
+    <p class="nota-sez">${testo}</p></article>${avviso}
+    <article class="card dev"><div class="ch"><h2>Acqua calda</h2></div>${rigaReg(g.acs_setpoint)}${rigaReg(g.acs_modo)}${rigaBoost(d.boost)}</article>
+    <article class="card dev"><div class="ch"><h2>Pompa</h2></div>${rigaReg(g.pompa_modo)}<p class="nota-sez">Il modo «Riscaldamento» è quello giusto d’inverno; «Raffrescamento» serve d’estate.</p></article>`;
+}
+async function confermaReg() {
+  const r = trovaReg(S.regMod); if (!r || S.regOcc) return;
+  const err = m => { S.regErr = m; armaSbloccoFsv(); ridisegnaInstallatore(); };
+  let valore = S.regVal, descr, avviso = '';
+  if (r.opzioni) {
+    const o = r.opzioni.find(x => String(x[0]) === String(valore)); if (!o) return err('Scegli un valore.');
+    descr = o[1]; avviso = o[2] || '';
+    if (String(o[0]) === String(r.valore)) return err('È già a questo valore.');
+  } else {
+    const n = Number(String(valore).replace(',', '.'));
+    if (valore === '' || !Number.isFinite(n)) return err('Scrivi un valore.');
+    if (n !== Math.round(n)) return err('La temperatura va a gradi interi.');
+    if (n < r.lo || n > r.hi) return err(`Fuori dai limiti della pompa (da ${r.lo} a ${r.hi} ${r.unita}).`);
+    if (n === Number(r.valore)) return err('È già a questo valore.');
+    valore = n; descr = `${n} ${r.unita}`;
+  }
+  armaSbloccoFsv();
+  if (!window.confirm(`Stai per cambiare una regolazione della pompa di calore.\n\n${r.nome}\nOra: ${r.testo}\nNuovo: ${descr}\n${avviso ? '\n' + avviso + '\n' : ''}\nConfermi?`)) return;
+  inviaOp('reg', '/api/regolazioni', {cosa: r.cosa, valore}, `${r.nome}: comando inviato, aspetto che la pompa lo confermi`, () => { S.regMod = null; }, 'Comando non riuscito', 'il comando è partito, controlla più tardi');
+}
+document.addEventListener('click', e => {
+  const t = e.target; if (!t.closest) return;
+  const m = t.closest('[data-reg-mod]');
+  if (m && !m.disabled) {
+    const r = trovaReg(m.dataset.regMod); if (!r) return;
+    S.fsvMod = null; S.fsvErr = ''; S.boostApri = false; S.regMod = r.cosa; S.regErr = '';
+    S.regVal = r.opzioni ? String(r.valore) : (r.valore == null ? '' : String(r.valore));
+    armaSbloccoFsv(); ridisegnaInstallatore(); return;
+  }
+  if (t.closest('[data-reg-annulla]')) { S.regMod = null; S.regErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+  if (t.closest('[data-reg-conf]')) confermaReg();
+});
+// il campo del valore nuovo (FSV, regolazione, boost): si tiene nello stato S mentre lo scrivi
+for (const ev of ['input', 'change']) document.addEventListener(ev, e => {
+  const t = e.target, k = t.matches && ['fsv', 'reg', 'boost'].find(x => t.matches(`[data-${x}-val]`)); if (!k) return;
+  S[k + 'Val'] = t.value; S[k + 'Err'] = ''; armaSbloccoFsv();
+  if (k === 'reg' && ev === 'change' && t.tagName === 'SELECT') ridisegnaInstallatore();
+});
+// ---- Boost acqua calda (come Dwellsee: setpoint più alto + modo «forzato»; a fine boost si rimette tutto com'era) ----
+S.boostApri = false; S.boostVal = ''; S.boostErr = ''; S.boostOcc = false;
+function rigaBoost(b) {
+  if (!b) return '';
+  const sbl = Date.now() < S.sbloccoFsv;
+  const fermaB = S.fuori ? '' : `<button type="button" class="matita" data-boost-ferma ${sbl && !S.boostOcc ? '' : 'disabled'} title="${sbl ? 'Ferma il boost' : 'Prima sblocca le modifiche'}" aria-label="Ferma il boost">■</button>`;
+  const avviaB = S.fuori ? '' : `<button type="button" class="matita" data-boost-apri ${sbl && !S.boostOcc ? '' : 'disabled'} title="${sbl ? 'Avvia un boost' : 'Prima sblocca le modifiche'}" aria-label="Avvia un boost">⚡</button>`;
+  if (b.attivo) {
+    const t = b.temperatura != null ? ` · ora ${(Math.round(b.temperatura * 10) / 10).toString().replace('.', ',')} °C` : '';
+    const err = b.errore ? `<small class="nota-r in-attesa">${esc(b.errore)}</small>` : '';
+    return `<div class="riga"><span>Boost</span><b><span class="val-c">attivo · obiettivo ${b.obiettivo} °C${t}</span><small class="nota-r">finisce quando l’acqua arriva all’obiettivo, al più tardi alle ${esc(hhmm(b.scade))}; poi torna a ${esc(String(b.sp_prima))} °C e al modo di prima</small>${err}</b>${fermaB}</div>${S.boostErr ? `<div class="fe-err">${esc(S.boostErr)}</div>` : ''}`;
+  }
+  const riga = `<div class="riga"><span>Boost</span><b><span class="val-c">spento</span></b>${avviaB}</div>`;
+  if (!(sbl && S.boostApri)) return riga;
+  return riga + `<div class="fsv-edit"><div class="fe-t">Boost acqua calda</div>
+    <div class="fe-r"><span class="mut">Temperatura obiettivo</span><span><input type="number" inputmode="numeric" step="1" data-boost-val value="${esc(S.boostVal)}" aria-label="Temperatura obiettivo del boost"> <span class="mut">°C</span></span></div>
+    <small class="mut">Come Dwellsee: il pannello alza il setpoint a questo valore e mette il modo «Forzato». Finito il boost (acqua arrivata all’obiettivo, o dopo ${b.massimo_min} minuti al massimo) rimette il modo e il setpoint di adesso. Il ripristino riparte anche se il pannello si riavvia.</small>
+    ${S.boostErr ? `<div class="fe-err">${esc(S.boostErr)}</div>` : ''}
+    <div class="fe-b"><button type="button" class="sec piccolo" data-boost-annulla ${S.boostOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-boost-conf ${S.boostOcc ? 'disabled' : ''}>${S.boostOcc ? 'Invio…' : 'Avvia il boost'}</button></div></div>`;
+}
+const inviaBoost = (corpo, okMsg) => inviaOp('boost', '/api/boost', corpo, okMsg, () => { S.boostApri = false; }, 'Comando non riuscito', 'il comando è partito, controlla più tardi');
+document.addEventListener('click', e => {
+  const t = e.target; if (!t.closest) return;
+  const b = S.dati && S.dati.boost;
+  if (t.closest('[data-boost-apri]')) {
+    S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = true; S.boostErr = '';
+    S.boostVal = String(b && b.predefinito != null ? b.predefinito : 50); armaSbloccoFsv(); ridisegnaInstallatore(); return;
+  }
+  if (t.closest('[data-boost-annulla]')) { S.boostApri = false; S.boostErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+  if (t.closest('[data-boost-conf]')) {
+    const n = Number(String(S.boostVal).replace(',', '.'));
+    if (S.boostVal === '' || !Number.isFinite(n) || n !== Math.round(n)) { S.boostErr = 'Scrivi una temperatura a gradi interi.'; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
+    armaSbloccoFsv();
+    if (!window.confirm(`Stai per avviare un BOOST dell’acqua calda.\n\nObiettivo: ${n} °C\nModo: Forzato (poi torna a quello di prima)\n\nConfermi?`)) return;
+    inviaBoost({azione: 'avvia', obiettivo: n}, 'Boost avviato: la pompa lo conferma tra poco');
+    return;
+  }
+  if (t.closest('[data-boost-ferma]')) {
+    armaSbloccoFsv();
+    if (!window.confirm('Fermo il boost e rimetto modo e setpoint di prima?')) return;
+    inviaBoost({azione: 'ferma'}, 'Boost fermato: rimetto le impostazioni di prima');
+  }
+});
 function disegnaDispositivi(d) {
   const box = $('#dsp'); if (!box) return;
   if (S.sub === 'installatore') {
+    if ((S.fsvMod || S.regMod || S.boostApri) && box.contains(document.activeElement) && document.activeElement.matches && document.activeElement.matches('[data-fsv-val],[data-reg-val],[data-boost-val]')) return;  // si sta scrivendo un valore
     const h2 = tabsDisp() + disegnaInstallatore(d);
     if (box.dataset.h !== h2) { box.dataset.h = h2; box.innerHTML = h2; }
     return;
@@ -3360,15 +3656,10 @@ function cardComandi(lista) {
   if (!lista || !lista.length) return '';
   const pagine = Math.ceil(lista.length / PER_PAG);
   S.pagCmd = Math.min(Math.max(S.pagCmd || 0, 0), pagine - 1);
-  const righe = lista.slice(S.pagCmd * PER_PAG, (S.pagCmd + 1) * PER_PAG).map(c => `<div class="riga"><span>${esc(dataLunga(c.ts))}</span><b>${esc(c.cosa)} · ${c.acceso ? 'acceso' : 'spento'}<small class="mut nota-r">da ${esc(c.ip)} · ${esc(c.esito)}</small></b></div>`).join('');
-  const nav = pagine > 1 ? `<div class="pager"><button type="button" data-pagcmd="-1" ${S.pagCmd === 0 ? 'disabled' : ''} aria-label="Più recenti">‹</button><span>${S.pagCmd + 1} di ${pagine}</span><button type="button" data-pagcmd="1" ${S.pagCmd >= pagine - 1 ? 'disabled' : ''} aria-label="Meno recenti">›</button></div>` : '';
+  const righe = lista.slice(S.pagCmd * PER_PAG, (S.pagCmd + 1) * PER_PAG).map(c => `<div class="riga"><span>${esc(dataLunga(c.ts))}</span><b>${esc(c.cosa)} · ${c.testo ? esc(c.testo) : c.acceso ? 'acceso' : 'spento'}<small class="mut nota-r">da ${esc(c.ip)} · ${esc(c.esito)}</small></b></div>`).join('');
+  const nav = pagNav('pagCmd', pagine);
   return `<article class="card dev"><div class="ch"><h2>Comandi dati dal pannello</h2></div>${righe}${nav}</article>`;
 }
-document.addEventListener('click', e => {
-  const b = e.target.closest && e.target.closest('[data-pagcmd]'); if (!b || b.disabled) return;
-  S.pagCmd = (S.pagCmd || 0) + Number(b.dataset.pagcmd);
-  disegna();
-});
 async function copiaTesto(t) {
   try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true; } } catch { /* si prova l'altro metodo */ }
   try {
@@ -3465,8 +3756,8 @@ async function plgAggiorna() {
   if (plgOccupato || document.hidden || S.pagina !== 'impostazioni' || S.sub !== 'integrazioni') return;
   plgOccupato = true;
   try {
-    const r = await fetch('/api/impostazioni', {credentials: 'same-origin', cache: 'no-store'});
-    if (!r.ok || S.sub !== 'integrazioni') return;
+    const r = await leggiJson('/api/impostazioni');
+    if (!r || !r.ok || S.sub !== 'integrazioni') return;
     const d = await r.json();
     d.sezioni.filter(x => x.tab === 'integrazioni' && x.plugin).forEach(x => {
       const det = document.querySelector(`#imp details.riq[data-id="s-${x.id}"]`); if (!det) return;
@@ -3545,6 +3836,11 @@ function toast(t, cattivo) {
   let el = $('#toast'); if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
   el.textContent = t; el.className = 'on' + (cattivo ? ' bad' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => el.className = '', cattivo ? 12000 : 4200);
 }
+async function leggiJson(url) {         // GET con sessione; se e' scaduta torna al login e ridà null
+  const r = await fetch(url, {credentials: 'same-origin', cache: 'no-store'});
+  if (r.status === 401) { location.href = '/login'; return null; }
+  return r;
+}
 async function inviaPost(url, corpo) {
   const r = await fetch(url, {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json', 'X-Pdc': '1'}, body: JSON.stringify(corpo)});
   if (r.status === 401) { location.href = '/login'; return {}; }
@@ -3554,8 +3850,7 @@ async function inviaPost(url, corpo) {
 async function aggCarica() {
   const box = $('#agg-corpo'); if (!box || box.dataset.occupato) return;
   try {
-    const r = await fetch('/api/aggiornamento', {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson('/api/aggiornamento'); if (!r) return;
     const a = await r.json(), cosa = (a.parti || []).map(p => esc(p.titolo)).join(', ');
     box.innerHTML = a.stato === 'applicabile'
       ? `<p class="agg-ok"><b>È pronta la versione ${esc(a.versione_disco)}</b> (cambiato: ${cosa}).<br>Si applica subito, <b>senza fermare la raccolta dei dati</b>.</p><div class="azioni"><button type="button" id="agg-applica">Applica aggiornamento</button></div>`
@@ -3566,6 +3861,8 @@ async function aggCarica() {
   } catch { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
 }
 setInterval(() => { if (S.pagina === 'impostazioni' && !S.sub && !document.hidden) aggCarica(); }, 20000);
+// bottone disattivato mentre lavora; se il pannello non risponde lo dice
+async function conBottone(b, f) { b.disabled = true; try { await f(); } catch { toast('Server non raggiungibile', true); } b.disabled = false; }
 async function azioniImpostazioni(e) {
   const id = e.target.id;
   if (id === 'agg-ricontrolla') { aggCarica(); return; }
@@ -3606,13 +3903,9 @@ async function azioniImpostazioni(e) {
     } catch { toast('Server non raggiungibile', true); }
     e.target.disabled = false;
   } else if (id === 'b-prova') {
-    e.target.disabled = true; try { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); } catch { toast('Server non raggiungibile', true); }
-    e.target.disabled = false;
+    await conBottone(e.target, async () => { const r = await inviaPost('/api/impostazioni/telegram-prova', {}); toast(r.messaggio || 'Fatto', !r.ok); });
   } else if (id === 'plg-ricarica') {
-    e.target.disabled = true;
-    try { const r = await inviaPost('/api/plugin/ricarica', {}); toast(r.ok ? `Plugin riletti: ${r.plugin}` : 'Non riuscito', !r.ok); S.sporco = false; S.ricarica = true; await carica(); }
-    catch { toast('Server non raggiungibile', true); }
-    e.target.disabled = false;
+    await conBottone(e.target, async () => { const r = await inviaPost('/api/plugin/ricarica', {}); toast(r.ok ? `Plugin riletti: ${r.plugin}` : 'Non riuscito', !r.ok); S.sporco = false; S.ricarica = true; await carica(); });
   } else if (id === 'b-pw') {
     const r = await inviaPost('/api/impostazioni/password', {utente: $('#p-ut').value, attuale: $('#p-at').value, nuova: $('#p-nu').value});
     $('#pw-msg').textContent = r.messaggio || ''; $('#pw-msg').className = 'msg ' + (r.ok ? 'ok' : 'bad');
@@ -3622,7 +3915,7 @@ async function azioniImpostazioni(e) {
 
 // ---------- Accesso da internet (Cloudflare) ----------
 const CFS = {zone: null, token: '', passi: null, occupato: false};
-async function cfLeggi() { const r = await fetch('/api/cloudflare', {credentials: 'same-origin', cache: 'no-store'}); if (r.status === 401) { location.href = '/login'; return null; } return r.json(); }
+async function cfLeggi() { const r = await leggiJson('/api/cloudflare'); return r && r.json(); }
 async function cfCarica(forza) {
   const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
   let st; try { st = await cfLeggi(); } catch { return; }
@@ -3740,10 +4033,10 @@ document.addEventListener('toggle', e => { if (e.target.id === 'cf-rim') { const
 // ---------- dati e tempo reale ----------
 function finestra() {
   if (S.pagina === 'impostazioni') return {da: 0, a: 0, live: false};
-  if (S.pagina === 'dispositivi') return {da: 0, a: 0, live: true};
-  if (S.pagina === 'efficienza') return {da: 0, a: 0, live: true};
+  if (S.pagina === 'dispositivi' || S.pagina === 'efficienza') return {da: 0, a: 0, live: true};
   if (S.range === 'custom' && S.custom) return {da: S.custom.da, a: S.custom.a, live: false};
-  return {da: ora() - (S.range === '6h' ? 6 : 24) * 3600, a: ora(), live: true};
+  const a = S.fine || ora();   // S.fine: fine della finestra quando ci si e' spostati indietro nel tempo (vuoto = in diretta)
+  return {da: a - (S.range === '6h' ? 6 : 24) * 3600, a, live: !S.fine};
 }
 function urlDati() {
   const w = finestra();
@@ -3753,6 +4046,20 @@ function urlDati() {
   if (S.pagina === 'analisi') return `/api/analisi?da=${w.da}&a=${w.a}&n=${Math.max(120, Math.min(400, Math.round(($('#pagina').clientWidth || 800) / 3)))}`;
   return `/api/dashboard?da=${w.da}&a=${w.a}`;
 }
+// La finestra della Dashboard (6h/24h) si scrive anche in un cookie: cosi' il server puo' mettere i dati giusti dentro la pagina.
+function ricordaFinestra() {
+  try { document.cookie = `pdc_r=${S.range};path=/;max-age=31536000;samesite=lax${location.protocol === 'https:' ? ';secure' : ''}`; } catch { /* niente */ }
+}
+// La Dashboard arriva gia' dentro la pagina (blocco #dati0): si disegna subito, senza aspettare il giro dei dati. Solo in diretta e sulla finestra salvata.
+function datiIniziali() {
+  const el = $('#dati0'); if (!el) return false;
+  let d = null; try { d = JSON.parse(el.textContent); } catch { /* niente */ }
+  el.remove();
+  if (!d || !d.dati || S.pagina !== 'dashboard' || S.fine || d.r !== S.range) return false;
+  S.dati = d.dati; S.dpag = 'dashboard'; S.off = S.dati.ora - Math.floor(Date.now() / 1000); S.fetchedAt = Date.now();
+  disegna();
+  return true;
+}
 let caricando = false;
 async function carica() {
   if (S.pagina === 'changelog') return;  // pagina fissa: niente da caricare
@@ -3760,8 +4067,7 @@ async function carica() {
   caricando = true;
   const pag = S.pagina;
   try {
-    const r = await fetch(urlDati(), {credentials: 'same-origin', cache: 'no-store'});
-    if (r.status === 401) { location.href = '/login'; return; }
+    const r = await leggiJson(urlDati()); if (!r) return;
     // se lo script del pannello e' stato aggiornato mentre la pagina era aperta, si ricarica da sola (una volta sola, per evitare giri a vuoto)
     const nuova = r.headers.get('X-Pdc-Build');
     if (nuova && window.BUILD && nuova !== window.BUILD) {
@@ -3819,7 +4125,7 @@ function avvia() {
     }
   });
   document.addEventListener('pointermove', e => {
-    if (zoomaMuovi(e) || dita.size > 1) return;
+    if (spostaMuovi(e) || zoomaMuovi(e) || dita.size > 1) return;
     if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e);
     else { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
   });
@@ -3828,10 +4134,12 @@ function avvia() {
   document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { if (e.target.id.startsWith('cf-')) cfAzione(e); else azioniImpostazioni(e); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
-  document.addEventListener('pointerdown', e => { zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
-  document.addEventListener('pointerup', zoomaSu); document.addEventListener('pointercancel', zoomaSu);
+  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
+  document.addEventListener('pointerup', e => { spostaSu(); zoomaSu(e); }); document.addEventListener('pointercancel', e => { spostaSu(); zoomaSu(e); });
   if (S.range === 'custom' && S.pagina !== 'efficienza') { $('#custom').hidden = false; if (S.custom) { $('#c-da').value = loc(S.custom.da); $('#c-a').value = loc(S.custom.a); } }
-  carica(); collega();
+  ricordaFinestra();
+  datiIniziali() || carica();
+  collega();
   setInterval(() => { if (finestra().live) carica(); }, 60000);
   setInterval(stato, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { controllaFlusso(); if (finestra().live) carica(); } });
@@ -3854,13 +4162,26 @@ avvia();
 <meta name="apple-mobile-web-app-title" content="PDC">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icona.png">
-<link rel="icon" href="/icona.png">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1320x2868.png">
+<link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1290x2796.png">
+<link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1284x2778.png">
+<link rel="apple-touch-startup-image" media="(device-width: 420px) and (device-height: 912px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1260x2736.png">
+<link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1242x2688.png">
+<link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/avvio/828x1792.png">
+<link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1242x2208.png">
+<link rel="apple-touch-startup-image" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1206x2622.png">
+<link rel="apple-touch-startup-image" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1179x2556.png">
+<link rel="apple-touch-startup-image" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1170x2532.png">
+<link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/avvio/1125x2436.png">
+<link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/avvio/750x1334.png">
 <title>Pompa di calore</title>
 <link rel="stylesheet" href="/app.css?v={{build}}">
 </head>
 <body>
 <div id="app"></div>
 <noscript>Per usare il pannello serve JavaScript.</noscript>
+<script type="application/json" id="dati0">{{dati0}}</script>
 <script src="/app.js?v={{build}}"></script>
 </body>
 </html>
@@ -3875,7 +4196,7 @@ avvia();
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="PDC">
 <link rel="apple-touch-icon" href="/icona.png">
-<link rel="icon" href="/icona.png">
+<link rel="icon" type="image/png" href="/favicon.png">
 <title>Accesso · Pompa di calore</title>
 <link rel="stylesheet" href="/app.css?v={{build}}">
 </head>
@@ -3914,7 +4235,12 @@ avvia();
 ''',
 }
 # impronta di pagina+stile+script: cambia a ogni modifica, anche senza cambiare numero di versione
-BUILD = hashlib.sha256((VERSIONE + "".join(WEB_ASSETS[k] for k in sorted(WEB_ASSETS))).encode("utf-8")).hexdigest()[:8]
+def _calcola_build(versione, assets):
+    """Impronta delle pagine: cambia con la versione e con ogni file web (le pagine aperte si ricaricano da sole)."""
+    return hashlib.sha256((versione + "".join(assets[k] for k in sorted(assets))).encode("utf-8")).hexdigest()[:8]
+
+
+BUILD = _calcola_build(VERSIONE, WEB_ASSETS)
 
 
 # --------------------------------------------------------------------------
@@ -4088,16 +4414,6 @@ def q_primo_ts(db):
     return r[0] if r and r[0] is not None else None
 
 
-def q_medie(db, serie, da, a, n=60):
-    """Serie ridotta a ~n punti (media per intervallo): per i grafici piccoli."""
-    da, a = int(da), int(a)
-    dim = max(1, (a - da) // n)
-    with closing(db._c()) as c:
-        righe = c.execute("SELECT (ts-?)/? AS b, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<=? "
-                          "GROUP BY b ORDER BY b", (da, dim, serie, da, a)).fetchall()
-    return [[da + b * dim + dim // 2, round(v, 2)] for b, v in righe]
-
-
 def q_valore_a(db, serie, t):
     with closing(db._c()) as c:
         r = c.execute("SELECT valore FROM misure WHERE serie=? AND ts<=? ORDER BY ts DESC LIMIT 1",
@@ -4234,8 +4550,20 @@ def _fsv(ult, codice):
         return None
 
 
+def zona_curva(ult):
+    """Quale curva climatica sta usando la pompa: (1 o 2, da dove lo so). Il codice 2041 la sceglie (1 = zona 1,
+    pavimento; 2 = zona 2, ventilconvettori), ma SmartThings non lo comunica per tutte le pompe: senza, si assume
+    la zona 1, che e' quella di default."""
+    z = _fsv(ult, "2041")
+    if z in (1.0, 2.0):
+        return int(z), "2041"
+    return 1, ("4061 = 0: la zona 2 non e' attiva" if _fsv(ult, "4061") == 0 else "ipotesi: 2041 non e' comunicato")
+
+
 def dati_curva(db, ult, da, a, esterna_ora):
-    t1, t2, m1, m2 = (_fsv(ult, c) for c in ("2011", "2012", "2021", "2022"))
+    zona, fonte = zona_curva(ult)
+    c2, c3 = ("2021", "2022") if zona == 1 else ("2031", "2032")
+    t1, t2, m1, m2 = (_fsv(ult, c) for c in ("2011", "2012", c2, c3))
     if None in (t1, t2, m1, m2) or t2 <= t1:
         return None
     es = dict(q_serie(db, "ciclo.esterna", da, a))
@@ -4249,7 +4577,7 @@ def dati_curva(db, ult, da, a, esterna_ora):
         punti = [punti[int(i * passo)] for i in range(300)]
     curva = (t1, m1, t2, m2)
     return {"basso": {"esterna": t1, "mandata": m1}, "alto": {"esterna": t2, "mandata": m2},
-            "punti": punti,
+            "zona": zona, "zona_fonte": fonte, "punti": punti,
             "ora": {"esterna": esterna_ora,
                     "mandata": mandata_calcolata(curva, esterna_ora) if esterna_ora is not None else None}}
 
@@ -4521,8 +4849,13 @@ def meteo_riassumi(raw, ora):
             "icona": icona, "testo": testo, "livello": lvl, "ore": dettaglio, "modelli": n}
 
 
+def _meteo_stato(app):
+    return app.__dict__.setdefault("meteo_st", {"raw": None, "ts": 0, "prossimo": 0, "modo": 0, "falliti": 0})
+
+
 def _meteo_lavoro(app, lat, lon):
-    st = app.meteo_st
+    """Una lettura di Open-Meteo (la chiama il thread di fondo «esterni»)."""
+    st = _meteo_stato(app)
     try:
         dati, modo = meteo_scarica(lat, lon, st["modo"])
         st.update(raw=dati, ts=int(time.time()), modo=modo, falliti=0, prossimo=int(time.time()) + METEO_OGNI)
@@ -4532,8 +4865,6 @@ def _meteo_lavoro(app, lat, lon):
         st["falliti"] += 1
         st["prossimo"] = int(time.time()) + min(300 * st["falliti"], METEO_OGNI)
         (log.warning if st["falliti"] == 1 else log.debug)("Meteo: lettura non riuscita (%s)", e)
-    finally:
-        st["occupato"] = False
 
 
 def meteo_demo(ora):
@@ -4552,7 +4883,7 @@ def meteo_demo(ora):
 
 
 def meteo_info(app):
-    """Riassunto del meteo per la Dashboard, o None. La lettura di Open-Meteo parte in un thread (mai nella richiesta della pagina)."""
+    """Riassunto del meteo per la Dashboard, o None. Legge solo l'ultima lettura di Open-Meteo, fatta dal thread di fondo."""
     cfg = meteo_config(app)
     if not cfg:
         return None
@@ -4560,10 +4891,8 @@ def meteo_info(app):
     if app.demo:
         r = meteo_riassumi(meteo_demo(ora), ora)
         return dict(r, agg=ora, modelli_nomi=list(METEO_MODELLI)) if r else None
-    st = app.__dict__.setdefault("meteo_st", {"raw": None, "ts": 0, "prossimo": 0, "occupato": False, "modo": 0, "falliti": 0})
-    if ora >= st["prossimo"] and not st["occupato"]:
-        st["occupato"], st["prossimo"] = True, ora + 60
-        threading.Thread(target=_meteo_lavoro, args=(app, *cfg), daemon=True, name="meteo").start()
+    st = _meteo_stato(app)
+    esterni_assicura(app)
     if not st["raw"] or ora - st["ts"] > METEO_VECCHIO:
         return None
     r = meteo_riassumi(st["raw"], ora)
@@ -4607,8 +4936,16 @@ def stazione_leggi(js):
     return round(um, 1), ts
 
 
+def _stazione_stato(app, url):
+    st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "vecchio": False})
+    if st["url"] != url:
+        st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0, vecchio=False)
+    return st
+
+
 def _stazione_lavoro(app, url):
-    st = app.stazione_st
+    """Una lettura della stazione (la chiama il thread di fondo «esterni»). Il «dato vecchio» si giudica sul dato appena letto."""
+    st = _stazione_stato(app, url)
     try:
         code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=STAZIONE_ATTESA)
         if code != 200:
@@ -4616,33 +4953,91 @@ def _stazione_lavoro(app, url):
         um, ts = stazione_leggi(js)
         ora = int(time.time())
         if st["url"] == url:                                  # nel frattempo l'indirizzo e' cambiato: scarto
-            st.update(um=um, ts=ts or ora, errore=None, falliti=0, prossimo=ora + STAZIONE_OGNI)
+            vecchio = ora - (ts or ora) > STAZIONE_VECCHIO
+            if vecchio and not st["vecchio"]:
+                log.warning("Stazione meteo: il sito risponde ma l'ultimo dato della stazione è delle %s, non lo mostro", time.strftime("%H:%M", time.localtime(ts)))
+            elif not vecchio and (st["falliti"] or st["vecchio"]):
+                log.info("Stazione meteo: di nuovo disponibile")
+            st.update(um=um, ts=ts or ora, errore=None, falliti=0, vecchio=vecchio, prossimo=ora + STAZIONE_OGNI)
     except Exception as e:
         st["falliti"] += 1
         st["errore"] = str(e)[:120]
         st["prossimo"] = int(time.time()) + min(300 * st["falliti"], STAZIONE_OGNI)
         (log.warning if st["falliti"] == 1 else log.debug)("Stazione meteo: lettura non riuscita (%s)", e)
-    finally:
-        st["occupato"] = False
 
 
 def stazione_info(app):
     """None se la funzione è spenta, altrimenti {'umidita': % o None, 'ts': ultimo dato della stazione, 'errore': testo o None}.
-    La lettura parte in un thread (mai nella richiesta della pagina); il valore più vecchio di un'ora non si mostra."""
+    Legge solo l'ultima lettura, fatta dal thread di fondo; il valore più vecchio di un'ora non si mostra."""
     ora = int(time.time())
     if app.demo:                                              # nella demo si vede sempre, come il meteo
         return {"umidita": 78.0, "ts": ora - 120, "errore": None}
     url = stazione_url(app)
     if not url:
         return None
-    st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "occupato": False})
-    if st["url"] != url:
-        st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0)
-    if ora >= st["prossimo"] and not st["occupato"]:
-        st["occupato"], st["prossimo"] = True, ora + 60
-        threading.Thread(target=_stazione_lavoro, args=(app, url), daemon=True, name="stazione").start()
-    um = st["um"] if st["um"] is not None and ora - st["ts"] <= STAZIONE_VECCHIO else None
+    st = _stazione_stato(app, url)
+    esterni_assicura(app)
+    vecchio = st["um"] is not None and ora - st["ts"] > STAZIONE_VECCHIO
+    um = None if vecchio else st["um"]
     return {"umidita": um, "ts": st["ts"] or None, "errore": st["errore"]}
+
+
+# --------------------------------------------------------------------------
+# Un solo thread di fondo per i dati esterni: stazione meteo vicina e previsione Open-Meteo restano sempre freschi,
+# anche quando nessuno ha la pagina aperta (prima la lettura partiva solo con la Dashboard, e Alexa o il widget trovavano il buco)
+# --------------------------------------------------------------------------
+
+_lock_esterni = threading.Lock()
+
+
+def esterni_giro(app):
+    """Un giro: fa le letture scadute. -> fra quanti secondi guardare di nuovo (tra 15 e 60)."""
+    if app.demo:
+        return 60
+    prossimi = []
+    url = stazione_url(app)
+    if url:
+        st = _stazione_stato(app, url)
+        if time.time() >= st["prossimo"]:
+            _stazione_lavoro(app, url)
+        prossimi.append(st["prossimo"])
+    cfg = meteo_config(app)
+    if cfg:
+        st = _meteo_stato(app)
+        if time.time() >= st["prossimo"]:
+            _meteo_lavoro(app, *cfg)
+        prossimi.append(st["prossimo"])
+    return max(15, min(60, min(prossimi) - int(time.time()))) if prossimi else 60
+
+
+class Esterni(threading.Thread):
+    def __init__(self, app):
+        super().__init__(daemon=True, name="esterni")
+        self.app, self.fermo = app, threading.Event()
+
+    def run(self):
+        self.fermo.wait(3)                # lascia partire il resto
+        while not self.fermo.is_set():
+            try:
+                attesa = esterni_giro(self.app)
+            except Exception:
+                log.exception("errore nella lettura dei dati esterni (stazione, meteo)")
+                attesa = 60
+            self.fermo.wait(attesa)
+
+
+def esterni_assicura(app):
+    """Avvia il thread se non c'e'. All'avvio lo fa il programma; dopo un aggiornamento a caldo (che non riavvia i thread) basta la prima richiesta."""
+    if app.demo:
+        return
+    t = app.__dict__.get("esterni")
+    if t is not None and t.is_alive():
+        return
+    with _lock_esterni:
+        t = app.__dict__.get("esterni")
+        if t is None or not t.is_alive():
+            t = app.__dict__["esterni"] = Esterni(app)
+            t.start()
 
 
 # --------------------------------------------------------------------------
@@ -4899,7 +5294,20 @@ def stima_ripartenza(app, ora, t_casa, ts_casa, richiesta, esterna, target, diag
     if eta is None:
         return no((ed or {}).get("motivo") or "stima non calcolabile")
     q15 = 900
-    return int(round(eta / q15) * q15)
+    nuova = int(round(eta / q15) * q15)
+    if diag is not None:
+        return nuova
+    # Orario stabile: il sensore da' la casa a passi di 0.1 gradi e, con la casa che scende piano, un passo vale anche mezz'ora o piu'.
+    # Si tiene l'orario gia' mostrato finche' la nuova stima non si sposta di piu' di una soglia (il 40% del tempo che manca, tra 5 e 30 minuti:
+    # piu' la ripartenza e' vicina, piu' l'orario segue la realta'). Si riparte da zero a ogni nuova pausa o dopo 30 minuti senza stima.
+    ciclo = r[0] if r else None
+    m = app.__dict__.get("rip_mostrata")
+    if m and m["ciclo"] == ciclo and ora - m["ts"] <= 1800 and m["eta"] > ora - 600:
+        soglia = min(1800, max(300, 0.4 * (m["eta"] - ora)))
+        if abs(nuova - m["eta"]) <= soglia:
+            nuova = m["eta"]
+    app.rip_mostrata = {"ciclo": ciclo, "eta": nuova, "ts": ora}
+    return nuova
 
 
 @api("/api/dashboard")
@@ -4907,7 +5315,7 @@ def api_dashboard(app, q):
     ora = int(time.time())
     da, a = finestra(q, ora)
     db = app.db
-    ult = {r[0]: r for r in db.ultimi()}
+    ult = db.ultimi_dict()
     tol = max(150, int(app.intervallo_pdc() * 1.5))
 
     def num(s):
@@ -4938,6 +5346,7 @@ def api_dashboard(app, q):
     stato_acs = "spento" if not pdc_acc else ("attivo" if modo == "acs" else "standby")
     curva = dati_curva(db, ult, da, a, num("ciclo.esterna"))
     stz = stazione_info(app)
+    kwh_per = energia_kwh(db, da, a)
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     return {
@@ -4949,22 +5358,23 @@ def api_dashboard(app, q):
         "riscaldamento": {
             "stato": stato_risc, "temp": acqua, "target": num("risc.setpoint"), "ritorno": ritorno,
             "delta": round(acqua - ritorno, 1) if acqua is not None and ritorno is not None else None,
-            "spark": q_medie(db, "risc.acqua", da, a)},
+            "spark": q_griglia(db, "risc.acqua", da, a, 60)[0]},
         "acs": {
             "stato": stato_acs, "temp": num("acs.temperatura"), "target": num("acs.setpoint"),
             "modo": NOMI_MODO_ACS.get(txt("pdc.modo"), txt("pdc.modo")),
-            "spark": q_medie(db, "acs.temperatura", da, a)},
+            "spark": q_griglia(db, "acs.temperatura", da, a, 60)[0]},
         "esterna": {"temp": num("ciclo.esterna"), "ts": ts_("ciclo.esterna"), "min": es_min, "max": es_max,
                     "umidita": (stz or {}).get("umidita"), "umidita_attiva": stz is not None,
-                    "spark": q_medie(db, "ciclo.esterna", da, a)},
-        "energia": {"kwh": energia_kwh(db, da, a), "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
-                    "spark": q_medie(db, "pot.watt", da, a)},
+                    "spark": q_griglia(db, "ciclo.esterna", da, a, 60)[0]},
+        "energia": {"kwh": kwh_per, "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
+                    "dettaglio": dettaglio_costo(app, da, a, kwh_per, prezzo_kwh(app), ora),
+                    "spark": q_griglia(db, "pot.watt", da, a, 60)[0]},
         "casa": {"temp": num("casa.temperatura"), "umidita": num("casa.umidita"), "soglie_umidita": soglie_umidita(app), "target": num("casa.setpoint"),
                  "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
                                              num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
                  "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
-                 "ts": ts_("casa.temperatura"), "spark": q_medie(db, "casa.temperatura", da, a),
-                 "spark_um": q_medie(db, "casa.umidita", da, a)},
+                 "ts": ts_("casa.temperatura"), "spark": q_griglia(db, "casa.temperatura", da, a, 60)[0],
+                 "spark_um": q_griglia(db, "casa.umidita", da, a, 60)[0]},
         "prestazioni": {k: num(f"ciclo.{k}") for k in ("freq_compressore", "freq_target", "vel_pompa", "portata",
                                                        "scarico")},
         "prestazioni_ts": ts_("ciclo.freq_compressore"),
@@ -5040,6 +5450,33 @@ def prezzo_kwh(app):
         return 0.0
 
 
+def dettaglio_costo(app, da, a, kwh, prezzo, ora):
+    """Costo del periodo diviso in riscaldamento, acqua calda e standby (euro), stesse proporzioni di Efficienza applicate
+    al totale del contatore. None se manca il prezzo o i dati. Calcolo tenuto in memoria 5 minuti per periodo."""
+    if prezzo <= 0 or not kwh or kwh <= 0:
+        return None
+    cache = app.__dict__.setdefault("det_cache", {})
+    voce = cache.get(round(da))
+    if voce and ora - voce["ts"] < 300:
+        tot = voce["tot"]
+    else:
+        try:
+            tol = max(150, int(app.intervallo_pdc() * 1.5))
+            tot = calcola_efficienza(app.db, da, a, tol, ora)["tot"]
+        except Exception:
+            tot = None
+        if len(cache) > 8:
+            cache.clear()
+        cache[round(da)] = {"ts": ora, "tot": tot}
+    if not tot:
+        return None
+    parti = {k: max(0.0, tot.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
+    somma = sum(parti.values())
+    if somma <= 0:
+        return None
+    return {k: round(kwh * prezzo * v / somma, 2) for k, v in parti.items()}
+
+
 def costo_mese(app, ora):
     """Costo del mese in corso, stima a fine mese e confronto col mese scorso (None se manca il prezzo o i dati).
     La stima e' lineare (consumo medio per giorno trascorso x giorni del mese): vale solo come ordine di grandezza."""
@@ -5066,7 +5503,26 @@ def costo_mese(app, ora):
     if primo <= t_in and trascorso >= 1.0:
         stima = kwh / trascorso * durata
     scorso = energia_kwh(db, t_prec, t_in) if primo <= t_prec + 3600 else None
-    return {"kwh": kwh, "euro": round(kwh * prezzo, 2),
+    # divisione tra riscaldamento, acqua calda e standby: stesse proporzioni della stima di Efficienza, applicate al
+    # totale del contatore, cosi' la somma torna sempre con il costo del mese. Calcolo tenuto in memoria 5 minuti.
+    det = None
+    cache = app.__dict__.get("mese_cache")
+    if cache and cache["mese"] == t_in and ora - cache["ts"] < 300:
+        det = cache["tot"]
+    else:
+        try:
+            tol = max(150, int(app.intervallo_pdc() * 1.5))
+            det = calcola_efficienza(db, max(t_in, primo), ora, tol, ora)["tot"]
+            app.__dict__["mese_cache"] = {"mese": t_in, "ts": ora, "tot": det}
+        except Exception:
+            det = None
+    dettaglio = None
+    if det:
+        parti = {k: max(0.0, det.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
+        somma = sum(parti.values())
+        if somma > 0:
+            dettaglio = {k: round(kwh * prezzo * v / somma, 2) for k, v in parti.items()}
+    return {"kwh": kwh, "euro": round(kwh * prezzo, 2), "dettaglio": dettaglio,
             "stima_euro": None if stima is None else round(stima * prezzo, 2),
             "scorso_euro": None if scorso is None else round(scorso * prezzo, 2),
             "mese": inizio.month, "mese_scorso": prec.month}
@@ -5074,7 +5530,7 @@ def costo_mese(app, ora):
 
 def cornice(app, ora):
     """Parti comuni a tutte le risposte: stato collegamenti e avvisi (per il pallino in alto e il banner)."""
-    ult = {r[0]: r for r in app.db.ultimi()}
+    ult = app.db.ultimi_dict()
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     r = ult.get("acs.temperatura")
@@ -5148,6 +5604,172 @@ def dirada_richiesta(punti, passo_max=600):
     return out
 
 
+# ---------- Finestre aperte (riconosciute dai dati) ----------
+FIN_BASE = {"calo": 0.5, "ah": None}     # calo minimo in gradi; variazione minima (negativa) dell'umidita' assoluta, None = non richiesta
+
+
+def fin_tabella(db):
+    """La tabella nasce all'avvio; se il pannello e' stato aggiornato a caldo si crea qui, una volta sola."""
+    if not getattr(db, "_fin_ok", False):
+        with db.lock, closing(db._c()) as c, c:
+            c.execute("CREATE TABLE IF NOT EXISTS finestre(da INTEGER PRIMARY KEY, a INTEGER NOT NULL, calo REAL, ah REAL,"
+                      " stato TEXT NOT NULL, manuale INTEGER NOT NULL DEFAULT 0)")
+        db._fin_ok = True
+
+
+def fin_soglie(db):
+    try:
+        v = json.loads(db.meta_get("fin_soglie") or "{}")
+    except ValueError:
+        v = {}
+    return {"calo": float(v.get("calo", FIN_BASE["calo"])), "ah": v.get("ah", FIN_BASE["ah"]), "n": int(v.get("n", 0))}
+
+
+def umidita_assoluta(t, u):
+    """g/m3 a partire da temperatura (gradi) e umidita' relativa (%)."""
+    return 6.112 * math.exp(17.62 * t / (243.12 + t)) * u * 2.1674 / (273.15 + t)
+
+
+def _ah_vicina(U, Uts, tt, ini_ts):
+    """Variazione dell'umidita' assoluta tra l'inizio e il punto piu' freddo, o None se mancano i dati."""
+    def umid(x):
+        k = bisect.bisect_left(Uts, x - 150)
+        return U[k][1] if k < len(U) else None
+    u0, u1 = umid(ini_ts[0]), umid(tt[0])
+    return None if u0 is None or u1 is None else round(umidita_assoluta(tt[1], u1) - umidita_assoluta(ini_ts[1], u0), 1)
+
+
+def fin_rileva(db, da, a, soglie=None):
+    """Finestre aperte probabili: la temperatura di casa scende piu' in fretta e piu' in basso di come farebbe da sola.
+    Lavora su tutto lo storico (e' retroattivo): un solo passaggio sui campioni."""
+    s = soglie or fin_soglie(db)
+    T = q_serie(db, "casa.temperatura", da - 3600, a)
+    U = q_serie(db, "casa.umidita", da - 3600, a)
+    Uts = [x[0] for x in U]
+    n, ev, i, p, coda = len(T), [], 0, 0, collections.deque()     # coda: massimi degli ultimi 25 minuti, dal piu' vecchio
+    inneschi = max(0.3, s["calo"] * 0.8)
+    while i < n:
+        while p <= i:
+            while coda and coda[-1][1] < T[p][1]:
+                coda.pop()
+            coda.append(T[p])
+            p += 1
+        t, v = T[i]
+        while coda[0][0] < t - 1500:
+            coda.popleft()
+        pic = coda[0]
+        if pic[1] - v >= inneschi:
+            vmin, tmin, j = v, t, i
+            while j + 1 < n:
+                j += 1
+                tj, vj = T[j]
+                if vj < vmin:
+                    vmin, tmin = vj, tj
+                if vj - vmin >= 0.25 or tj - pic[0] > 10800:
+                    break
+            calo = pic[1] - vmin
+            if calo >= s["calo"] and tmin - pic[0] <= 10800:
+                dah = _ah_vicina(U, Uts, (tmin, vmin), pic)
+                if s["ah"] is None or dah is None or dah <= s["ah"]:
+                    ev.append({"da": pic[0], "a": tmin + 300, "calo": round(calo, 1), "ah": dah})
+            i = j + 1
+        else:
+            i += 1
+    return [e for e in ev if e["a"] > da and e["da"] < a]
+
+
+def fin_eventi(db, da, a):
+    """Quello che il grafico mostra: le finestre confermate (anche a mano) e quelle ancora da confermare.
+    Le risposte «no» spariscono, e con loro i rilevamenti che si sovrappongono."""
+    fin_tabella(db)
+    with closing(db._c()) as c:
+        reg = c.execute("SELECT da, a, calo, ah, stato, manuale FROM finestre WHERE a > ? AND da < ? ORDER BY da", (int(da), int(a))).fetchall()
+        tot = c.execute("SELECT COUNT(*) FROM finestre WHERE manuale=0").fetchone()[0]
+    out = [{"da": r[0], "a": r[1], "calo": r[2], "ah": r[3], "stato": "si", "manuale": r[5]} for r in reg if r[4] == "si"]
+    for e in fin_rileva(db, da, a):
+        if not any(r[0] < e["a"] and r[1] > e["da"] for r in reg):
+            out.append({**e, "stato": "da confermare", "manuale": 0})
+    out.sort(key=lambda e: e["da"])
+    s = fin_soglie(db)
+    return out, {"risposte": tot, "tarato": s["n"] >= 10, "n": s["n"]}
+
+
+def fin_calibra(db):
+    """Dopo almeno 10 risposte (con almeno 2 si' e 2 no) sceglie le soglie che sbagliano meno sulle risposte date."""
+    with closing(db._c()) as c:
+        righe = c.execute("SELECT calo, ah, stato FROM finestre WHERE calo IS NOT NULL").fetchall()
+    si = [r for r in righe if r[2] == "si"]
+    no = [r for r in righe if r[2] == "no"]
+    if len(righe) < 10 or len(si) < 2 or len(no) < 2:
+        return
+    def passa(r, c, h):
+        return r[0] >= c - 1e-9 and (h is None or r[1] is None or r[1] <= h)
+    migliori = None
+    for c in [round(0.3 + 0.1 * k, 1) for k in range(13)]:
+        for h in (None, 0.0, -0.3, -0.6, -1.0, -1.5):
+            giusti = sum(passa(r, c, h) for r in si) + sum(not passa(r, c, h) for r in no)
+            chiave = (-giusti, abs(c - FIN_BASE["calo"]), 0 if h is None else 1)
+            if migliori is None or chiave < migliori[0]:
+                migliori = (chiave, c, h)
+    db.meta_set("fin_soglie", json.dumps({"calo": migliori[1], "ah": migliori[2], "n": len(righe)}))
+
+
+def _num_fin(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+@api_post("/api/finestre/giudica")
+def api_fin_giudica(app, corpo, h):
+    fin_tabella(app.db)
+    da, a, calo, ah = _num_fin(corpo.get("da")), _num_fin(corpo.get("a")), _num_fin(corpo.get("calo")), _num_fin(corpo.get("ah"))
+    stato = corpo.get("stato")
+    if da is None or a is None or a <= da or a - da > 86400 or stato not in ("si", "no"):
+        return {"ok": False, "errore": "Dati non validi."}
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
+        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?,?,0)", (int(da), int(a), calo, ah, stato))
+    fin_calibra(app.db)
+    return {"ok": True}
+
+
+@api_post("/api/finestre/manuale")
+def api_fin_manuale(app, corpo, h):
+    fin_tabella(app.db)
+    da, a = _num_fin(corpo.get("da")), _num_fin(corpo.get("a"))
+    if da is None or a is None or a <= da or a - da > 86400:
+        return {"ok": False, "errore": "L'intervallo non è valido (max 24 ore)."}
+    T = q_serie(app.db, "casa.temperatura", da - 1500, a)
+    U = q_serie(app.db, "casa.umidita", da - 1500, a)
+    calo = ah = None
+    if len(T) >= 2:
+        dentro = [x for x in T if x[0] >= da] or T
+        pic = max((x for x in T if x[0] <= da + 1500), key=lambda x: (x[1], -x[0]), default=T[0])
+        minimo = min(dentro, key=lambda x: x[1])
+        calo = round(max(0.0, pic[1] - minimo[1]), 1)
+        ah = _ah_vicina(U, [x[0] for x in U], minimo, pic)
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
+        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?, 'si', 1)", (int(da), int(a), calo, ah))
+    fin_calibra(app.db)
+    return {"ok": True}
+
+
+@api_post("/api/finestre/annulla")
+def api_fin_annulla(app, corpo, h):
+    fin_tabella(app.db)
+    da = _num_fin(corpo.get("da"))
+    if da is None:
+        return {"ok": False, "errore": "Dati non validi."}
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE da=?", (int(da),))
+    fin_calibra(app.db)
+    return {"ok": True}
+
+
 @api("/api/analisi")
 def api_analisi(app, q):
     ora = int(time.time())
@@ -5175,6 +5797,7 @@ def api_analisi(app, q):
     richiesta = dirada_richiesta(q_serie(app.db, "casa.richiesta_calore", da, a))
     out.update({"da": da, "a": a, "passo": dim, "grafici": grafici, "richiesta": richiesta, "soglie_umidita": soglie_umidita(app),
                 "modi": calcola_modi(app.db, da, a, tol, ora)})
+    out["finestre"], out["finestre_info"] = fin_eventi(app.db, da, a)
     return out
 
 
@@ -5224,9 +5847,63 @@ def _mediana(v):
     return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
 
 
+def _tratti_calmi(temp, tts, cicli, w0, w1):
+    """[(inizio, fine)] dei tratti tranquilli tra w0 e w1, lunghi almeno 1 ora: senza riscaldo dell'acqua (piu' 20 minuti di rimescolamento dopo)
+    e senza prelievi (calo di 1 grado o piu' in 15 minuti) ne' rimescolamenti (salita di 0,3 gradi o piu'). Dopo un evento si aspettano 10 minuti."""
+    occ = sorted((i, f + 1200) for i, f in cicli if f + 1200 > w0 and i < w1)
+    liberi, cur = [], w0
+    for i, f in occ:
+        if i > cur:
+            liberi.append((cur, i))
+        cur = max(cur, f)
+    if cur < w1:
+        liberi.append((cur, w1))
+    out = []
+    for g0, g1 in liberi:
+        pts = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
+        ini = g0
+        for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+            if tb - ta <= 900 and (va - vb >= 1.0 or vb - va >= 0.3):
+                if ta - ini >= 3600:
+                    out.append((ini, ta))
+                ini = tb + 600
+        if g1 - ini >= 3600:
+            out.append((ini, g1))
+    return out
+
+
+def perdita_giorno(temp, tts, cicli, t_at, da, a, litri, ore_da=6, ore_a=23):
+    """Perdita a riposo di giorno (6-23): i gradi persi per ora nei tratti tranquilli, tutti insieme (somma dei gradi / somma delle ore).
+    None se in tutto ci sono meno di 2 ore tranquille."""
+    lt = time.localtime(da)
+    gradi = ore = 0.0
+    n = 0
+    for k in range(0, (a - da) // 86400 + 3):
+        w0 = max(da, _ore_locali(lt, ore=ore_da, giorni=k - 1))
+        w1 = min(a, _ore_locali(lt, ore=ore_a, giorni=k - 1))
+        if w1 - w0 < 3600:
+            continue
+        for g0, g1 in _tratti_calmi(temp, tts, cicli, w0, w1):
+            v0, v1 = t_at(g0, 900), t_at(g1, 900)
+            if v0 is None or v1 is None:
+                continue
+            dentro = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
+            h = (g1 - g0) / 3600.0
+            if (dentro and max(v for _, v in dentro) > v0 + 0.5) or not 0 <= (v0 - v1) / h <= 3:
+                continue
+            gradi += v0 - v1
+            ore += h
+            n += 1
+    if ore < 2:
+        return None
+    r = gradi / ore
+    return {"gradi_ora": round(r, 2), "watt": round(r * litri * 1.163), "ore": round(ore, 1), "tratti": n}
+
+
 def calcola_bollitore(db, da, a, ora, litri=300):
     """Salute del bollitore (stime dalla sonda dell'acqua calda):
     - perdita a riposo: di notte (23-06), nel tratto piu' lungo (>=3 h) senza riscaldo dell'acqua, di quanto scende la temperatura (gradi/ora);
+    - perdita di giorno (6-23): come sopra ma sui tratti tranquilli di almeno 1 ora, senza prelievi (vedi perdita_giorno);
     - salita: nei cicli di riscaldo dell'acqua, di quanto sale la temperatura e in quanto tempo.
     None se i dati non bastano."""
     da, a = int(da), min(int(a), int(ora))
@@ -5251,8 +5928,8 @@ def calcola_bollitore(db, da, a, ora, litri=300):
     perd = []
     lt = time.localtime(da)
     for k in range(0, (a - da) // 86400 + 3):
-        w0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + k - 1, 23, 0, 0, 0, 0, -1)))
-        w1 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + k, 6, 0, 0, 0, 0, -1)))
+        w0 = _ore_locali(lt, ore=23, giorni=k - 1)
+        w1 = _ore_locali(lt, ore=6, giorni=k)
         if w0 < da or w1 > a:
             continue
         occ = sorted((max(i, w0), min(f + 300, w1)) for i, f in cicli if f + 300 > w0 and i < w1)
@@ -5276,7 +5953,7 @@ def calcola_bollitore(db, da, a, ora, litri=300):
         r = (v0 - v1) / ((g1 - g0) / 3600.0)
         if 0 <= r <= 3:
             perd.append(r)
-    out = {"perdita": None, "salita": None, "litri": litri}
+    out = {"perdita": None, "salita": None, "giorno": perdita_giorno(temp, tts, cicli, t_at, da, a, litri), "litri": litri}
     if len(perd) >= 2:
         r = _mediana(perd)
         out["perdita"] = {"gradi_ora": round(r, 2), "watt": round(r * litri * 1.163), "notti": len(perd)}
@@ -5285,7 +5962,7 @@ def calcola_bollitore(db, da, a, ora, litri=300):
         out["salita"] = {"gradi_ora": round(rate, 1), "min_per_10": round(600.0 / rate) if rate > 0 else None,
                          "minuti": round(_mediana([d for d, _ in sal]) / 60), "gradi": round(_mediana([g for _, g in sal]), 1),
                          "cicli": len(sal)}
-    return out if (out["perdita"] or out["salita"]) else None
+    return out if (out["perdita"] or out["salita"] or out["giorno"]) else None
 
 
 SBR_MAX_ELENCO = 50
@@ -5350,7 +6027,7 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         lt = time.localtime(t)
         chiave = time.strftime("%Y-%m-%d", lt)
         g = giorni.setdefault(chiave, {
-            "giorno": chiave, "ts": int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))),
+            "giorno": chiave, "ts": _ore_locali(lt),
             "el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
             "el_cop": {"casa": 0.0, "acs": 0.0}, "min": {"casa": 0, "acs": 0}, "est": [], "nodati_min": 0})
         if m == "nodati":
@@ -5473,7 +6150,7 @@ def api_efficienza(app, q):
         giorni = 7
     giorni = max(1, min(90, giorni))
     lt = time.localtime(ora)
-    oggi0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    oggi0 = _ore_locali(lt)
     da = oggi0 - (giorni - 1) * 86400
     # i confini dei giorni cadono su mezzanotte locale: la griglia da 5 minuti parte da li'
     tol = max(150, int(app.intervallo_pdc() * 1.5))
@@ -5510,7 +6187,7 @@ def csv_esporta(app, q):
     out = io.StringIO()
     w = csv.writer(out, delimiter=";", lineterminator="\r\n")
     lt = time.localtime(ora)
-    oggi0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    oggi0 = _ore_locali(lt)
     if tipo == "misure":
         giorni = max(1, min(7, giorni))
         da = oggi0 - (giorni - 1) * 86400
@@ -5545,9 +6222,21 @@ def csv_esporta(app, q):
 # Icona dell'app (PNG disegnato a mano: serve a iPhone per la schermata Home)
 # --------------------------------------------------------------------------
 
+def _liscio(d, bordo):
+    """1 dentro, 0 fuori, con bordo morbido (d = distanza dal bordo in pixel)."""
+    return max(0.0, min(1.0, 0.5 - d / bordo))
+
+
+def _png(n, tipo_colore, righe, alto=None):
+    """PNG n x alto (quadrato se manca alto) a 8 bit da righe gia' pronte (ciascuna col byte di filtro iniziale); tipo_colore 2 = RGB, 6 = RGBA."""
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, alto or n, 8, tipo_colore, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(righe), 9)) + chunk(b"IEND", b""))
+
+
 def png_icona(n=180):
-    def liscio(d, bordo):  # 1 dentro, 0 fuori, con bordo morbido
-        return max(0.0, min(1.0, 0.5 - d / bordo))
     righe = []
     for y in range(n):
         r = bytearray([0])
@@ -5556,33 +6245,95 @@ def png_icona(n=180):
             d = math.hypot(dx, dy)
             t = y / n
             col = [11 + 12 * t, 15 + 14 * t, 23 + 30 * t]
-            anello = liscio(abs(d - n * .27) - n * .055, 1.4)
+            anello = _liscio(abs(d - n * .27) - n * .055, 1.4)
             if anello:
                 k = (dx / n + .5)
                 c2 = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
                 col = [col[i] * (1 - anello) + c2[i] * anello for i in range(3)]
-            punto = liscio(d - n * .095, 1.4)
+            punto = _liscio(d - n * .095, 1.4)
             if punto:
                 c3 = [52, 211, 176]
                 col = [col[i] * (1 - punto) + c3[i] * punto for i in range(3)]
             r += bytes(int(max(0, min(255, v))) for v in col)
         righe.append(bytes(r))
-    raw = zlib.compress(b"".join(righe), 9)
+    return _png(n, 2, righe)
 
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", raw) + chunk(b"IEND", b""))
+
+def png_favicon(n=64):
+    """Icona della scheda del browser: solo il simbolo (anello e punto), sfondo trasparente e piu' grande di quella della Home."""
+    righe = []
+    for y in range(n):
+        r = bytearray([0])
+        for x in range(n):
+            dx, dy = x + .5 - n / 2, y + .5 - n / 2
+            d = math.hypot(dx, dy)
+            a = _liscio(abs(d - n * .37) - n * .075, 1.1)
+            k = dx / n + .5
+            col = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
+            p = _liscio(d - n * .13, 1.1)
+            if p:
+                col = [col[i] * (1 - p) + (52, 211, 176)[i] * p for i in range(3)]
+                a = max(a, p)
+            r += bytes(int(max(0, min(255, v))) for v in col) + bytes([int(a * 255)])
+        righe.append(bytes(r))
+    return _png(n, 6, righe)
+
+
+# Schermate di avvio per l'iPhone (apple-touch-startup-image): senza, all'apertura dalla Home si vede un lampo bianco.
+# Fondo scuro come la pagina e solo anello e punto al centro; i formati sono i pixel reali dei vari iPhone.
+AVVIO_FORMATI = [  # (larghezza pt, altezza pt, densita')
+    (440, 956, 3), (430, 932, 3), (428, 926, 3), (420, 912, 3), (414, 896, 3), (414, 896, 2), (414, 736, 3),
+    (402, 874, 3), (393, 852, 3), (390, 844, 3), (375, 812, 3), (375, 667, 2)]
+AVVIO_PIXEL = {f"{w * d}x{h * d}": (w * d, h * d) for w, h, d in AVVIO_FORMATI}
+
+
+def png_avvio(w, h):
+    fondo = bytes((11, 15, 23))
+    vuota = b"\x00" + fondo * w
+    n = round(w * .28)          # lato del riquadro con anello e punto
+    x0, y0 = (w - n) // 2, (h - n) // 2
+    righe = [vuota] * h
+    for y in range(n):
+        r = bytearray(b"\x00" + fondo * x0)
+        for x in range(n):
+            dx, dy = x + .5 - n / 2, y + .5 - n / 2
+            d = math.hypot(dx, dy)
+            a = _liscio(abs(d - n * .37) - n * .075, 1.1)
+            k = dx / n + .5
+            col = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
+            pt = _liscio(d - n * .13, 1.1)
+            if pt:
+                col = [col[i] * (1 - pt) + (52, 211, 176)[i] * pt for i in range(3)]
+                a = max(a, pt)
+            r += bytes(int(max(0, min(255, fondo[i] * (1 - a) + col[i] * a))) for i in range(3))
+        r += fondo * (w - x0 - n)
+        righe[y0 + y] = bytes(r)
+    return _png(w, 2, righe, h)
+
+
+_AVVIO = {}
+
+
+def avvio(chiave):
+    if chiave not in _AVVIO:
+        _AVVIO[chiave] = png_avvio(*AVVIO_PIXEL[chiave])
+    return _AVVIO[chiave]
 
 
 _ICONA = []
+_FAVICON = []
 
 
 def icona():
     if not _ICONA:
         _ICONA.append(png_icona())
     return _ICONA[0]
+
+
+def favicon():
+    if not _FAVICON:
+        _FAVICON.append(png_favicon())
+    return _FAVICON[0]
 
 
 MANIFEST = {"name": "Pompa di calore", "short_name": "PDC", "start_url": "/", "display": "standalone",
@@ -5605,6 +6356,20 @@ def ip_client(h):
     if ip in ("127.0.0.1", "::1"):  # dietro cloudflared: l'indirizzo vero sta nell'intestazione
         return h.headers.get("CF-Connecting-IP") or ip
     return ip
+
+
+def da_casa(h):
+    """True solo se la richiesta arriva dalla rete di casa: niente intestazioni del tunnel Cloudflare (le mette sempre
+    lui) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno."""
+    if any(h.headers.get(x) for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "Cf-Visitor")):
+        return False
+    try:
+        ip = ipaddress.ip_address(h.client_address[0].split("%")[0])
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
 def e_https(h):
@@ -5671,6 +6436,21 @@ class Gestore(BaseHTTPRequestHandler):
             t = t.replace("{{" + k + "}}", v)
         return t.replace("{{versione}}", VERSIONE.split()[0]).replace("{{build}}", BUILD)
 
+    def _dati_iniziali(self, app):
+        """La Dashboard gia' pronta dentro la pagina: il browser la disegna subito, senza il giro in piu' per i dati.
+        Vale per la finestra salvata dal browser (cookie pdc_r: 6 o 24 ore); se il browser ne usa un'altra, la ignora."""
+        if self.command == "HEAD":
+            return "null"
+        r = "6h" if self._cookie("pdc_r") == "6h" else "24h"
+        ora = int(time.time())
+        try:
+            q = {"da": [str(ora - (6 if r == "6h" else 24) * 3600)], "a": [str(ora)], "_casa": ["1" if da_casa(self) else "0"]}
+            dati = API["/api/dashboard"](app, q)
+        except Exception:
+            log.exception("dati iniziali della Dashboard")
+            return "null"
+        return json.dumps({"r": r, "dati": dati}, separators=(",", ":"), ensure_ascii=False).replace("<", "\\u003c")
+
     def _cookie(self, nome):
         for parte in self.headers.get("Cookie", "").split(";"):
             k, _, v = parte.strip().partition("=")
@@ -5698,12 +6478,18 @@ class Gestore(BaseHTTPRequestHandler):
             pubbliche = {"/app.css": "text/css; charset=utf-8", "/app.js": "text/javascript; charset=utf-8"}
             if p in pubbliche and p[1:] in WEB_ASSETS:
                 etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta via tunnel)
-                extra = [("Cache-Control", "no-cache"), ("ETag", etag)]
+                # con ?v= uguale alla versione in corso il file non cambia mai: il browser lo tiene senza nemmeno chiedere (un giro in meno)
+                fisso = q.get("v") == [BUILD]
+                extra = [("Cache-Control", "public, max-age=31536000, immutable" if fisso else "no-cache"), ("ETag", etag)]
                 if self.headers.get("If-None-Match") == etag:
                     return self._invia(304, b"", pubbliche[p], extra)
                 return self._invia(200, WEB_ASSETS[p[1:]], pubbliche[p], extra, gz_chiave=p)
             if p == "/icona.png":
                 return self._invia(200, icona(), "image/png", [("Cache-Control", "max-age=86400")])
+            if p.startswith("/avvio/") and p.endswith(".png") and p[7:-4] in AVVIO_PIXEL:
+                return self._invia(200, avvio(p[7:-4]), "image/png", [("Cache-Control", "max-age=86400")])
+            if p == "/favicon.png":
+                return self._invia(200, favicon(), "image/png", [("Cache-Control", "max-age=86400")])
             if p == "/manifest.webmanifest":
                 return self._invia(200, json.dumps(MANIFEST), "application/manifest+json")
             if p == "/login":
@@ -5723,7 +6509,7 @@ class Gestore(BaseHTTPRequestHandler):
                     return self._json({"errore": "non autenticato"}, 401)
                 return self._vai("/login")
             if p == "/":
-                return self._invia(200, self._pagina("index.html"))
+                return self._invia(200, self._pagina("index.html", dati0=self._dati_iniziali(app)))
             if p.startswith("/loghi/") and self.command in ("GET", "HEAD"):
                 return self._logo(app, p[7:])
             if p == "/api/flusso":
@@ -5733,11 +6519,12 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(200, dati, "text/csv; charset=utf-8",
                                    [("Content-Disposition", f'attachment; filename="{nome}"')])
             if p in API and self.command in ("GET", "HEAD"):
+                q["_casa"] = ["1" if da_casa(self) else "0"]
                 return self._json(API[p](app, q))
             if p in API_POST and self.command == "POST":
                 return self._post_api(app, p)
             self._invia(404, "Non trovato", "text/plain; charset=utf-8")
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        except (ConnectionError, TimeoutError):     # il browser se n'e' andato a meta' (pipe rotta, reset, abort 10053 di Windows)
             pass
         except Exception:
             log.exception("errore nella richiesta web %s", self.path)
@@ -5747,10 +6534,10 @@ class Gestore(BaseHTTPRequestHandler):
                 pass
 
     def _logo(self, app, nome):
-        """File dalla cartella dati/loghi (o dalla vecchia 'loghi'). Solo nomi e estensioni previsti: niente percorsi liberi."""
+        """File dalla cartella dati/loghi. Solo nomi e estensioni previsti: niente percorsi liberi."""
         m = re.fullmatch(r"(smarther|samsung|netatmo|bticino)\.(svg|png|webp|jpe?g)", nome)
-        f = next((c / nome for c in cartelle_loghi(app.base) if m and (c / nome).is_file()), None)
-        if not m or f is None or f.stat().st_size > 2_000_000:
+        f = app.base / "dati" / "loghi" / nome
+        if not m or not f.is_file() or f.stat().st_size > 2_000_000:
             return self._invia(404, "Non trovato", "text/plain; charset=utf-8")
         tipo = {"svg": "image/svg+xml", "png": "image/png", "webp": "image/webp", "jpg": "image/jpeg",
                 "jpeg": "image/jpeg"}[m.group(2)]
@@ -6063,8 +6850,8 @@ MESSAGGI_DEFAULT = {
                  "🔥 Riscaldamento {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli)\n"
                  "🏠 In casa {casa_min}–{casa_max} °C · fuori {esterna} °C\n{anomalie}",
     "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
-    "sbrinamento_inizio": "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}.",
-    "sbrinamento_fine": "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}.",
+    "sbrinamento_inizio": "🧊 <b>{impianto}</b>\nSbrinamento iniziato: esterna {esterna}\n<i>dalle {ora}</i>",
+    "sbrinamento_fine": "✅ <b>{impianto}</b>\nSbrinamento finito\n<i>dopo {durata}, {consumo}</i>",
     "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
     "per_codice": {},
 }
@@ -6080,7 +6867,8 @@ ALLARMI_DEFAULT = {
     "umidita_molto_alta": {"attivo": True},
     "cicli_brevi": {"attivo": True, "durata_minima_min": 10, "quanti": 4, "ore": 3},
     "portata_bassa": {"attivo": True, "sotto_lmin": 6.0, "minuti": 15},
-    "mandata_lontana": {"attivo": True, "scarto_gradi": 8.0, "minuti": 40},
+    # sopra la curva la PdC ci sta spesso (il compressore resta a bassa frequenza: mediana +8 °C sui dati reali), sotto e' raro e vero
+    "mandata_lontana": {"attivo": True, "scarto_sopra_gradi": 12.0, "scarto_gradi": 8.0, "minuti": 40},
     "acs_bassa": {"attivo": True, "sotto_gradi": 35.0, "minuti": 30},
     "cop_basso": {"attivo": True, "sotto": 2.0, "ore_minime": 3},
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
@@ -6461,7 +7249,7 @@ class Sentinella(threading.Thread):
         app, ora = self.app, int(time.time())
         al = app.cfg.leggi()["allarmi"]
         db = app.db
-        ult = {r[0]: r for r in db.ultimi()}
+        ult = db.ultimi_dict()
 
         def num(s, max_eta=900):
             r = ult.get(s)
@@ -6540,11 +7328,14 @@ class Sentinella(threading.Thread):
             att = curva["ora"]["mandata"] if curva else None
             man = num("ciclo.mandata", 900)
             in_casa = self.durata("casa_run", modo == "casa", ora) >= 20
-            fuori = in_casa and att is not None and man is not None and abs(man - att) > float(r["scarto_gradi"])
+            sotto = float(r["scarto_gradi"])
+            sopra = float(r.get("scarto_sopra_gradi", sotto))
+            lim = sopra if (man is not None and att is not None and man > att) else sotto
+            fuori = in_casa and att is not None and man is not None and abs(man - att) > lim
             m = self.durata("mandata", fuori, ora)
             self.imposta("mandata_lontana", m >= float(r["minuti"]),
                          f"La mandata è {num_it(man)} °C, la curva prevede {num_it(att)} °C (scarto oltre "
-                         f"{num_it(r['scarto_gradi'])} °C).")
+                         f"{num_it(lim)} °C).")
 
         if on("acs_bassa") and pdc_on:
             r = al["acs_bassa"]
@@ -6582,7 +7373,7 @@ class Sentinella(threading.Thread):
         non si riannuncia l'inizio, ma la fine si'. Non sono anomalie: niente eventi, niente promemoria."""
         db, tg = self.app.db, self.app.telegram
         ora = int(time.time())
-        r = {x[0]: x for x in db.ultimi()}.get("pdc.sbrinamento")
+        r = db.ultimi_dict().get("pdc.sbrinamento")
         primo, self.sbr_primo = self.sbr_primo, False
         if not r or r[3] not in ("on", "off") or ora - r[1] > 900:
             return
@@ -6598,7 +7389,7 @@ class Sentinella(threading.Thread):
             inizio = on_ts[-1] if on_ts else ora
             db.meta_set("tg_sbr_inizio", str(inizio))
             if not primo and tg.allarme_attivo("sbrinamento_inizio"):
-                est = {x[0]: x for x in db.ultimi()}.get("ciclo.esterna")
+                est = db.ultimi_dict().get("ciclo.esterna")
                 est_t = f"{num_it(est[2], 0)} °C" if est and est[2] is not None and ora - est[1] <= 1800 else "n.d."
                 tg.accoda("sbrinamento_inizio", "sbrinamento_inizio", "info", "", extra={"esterna": est_t,
                           "ora": time.strftime("%H:%M", time.localtime(inizio))}, muto=True)
@@ -6624,7 +7415,7 @@ class Sentinella(threading.Thread):
         except (ValueError, KeyError):
             return None
         lt = time.localtime(ora)
-        g0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+        g0 = _ore_locali(lt)
         fine = g0 + a * 60
         inizio = (g0 if da < a else g0 - 86400) + da * 60
         if ora < fine:  # riepilogo prima della fine del silenzio: si racconta la notte fino a ora
@@ -6653,7 +7444,7 @@ class Sentinella(threading.Thread):
         hm = lambda x: time.strftime("%H:%M", time.localtime(x))
         for ts, cod, liv, testo, chiuso in reversed(db.eventi_recenti(100)):
             if ini <= ts < fin:
-                fino = f"alle {hm(chiuso)}" if chiuso and chiuso < fin else ("ancora aperto" if not chiuso else f"alle {hm(chiuso)}")
+                fino = f"alle {hm(chiuso)}" if chiuso else "ancora aperto"
                 righe.append(f"⚠️ {esc_html(TITOLI.get(cod, cod))}: dalle {hm(ts)} {fino}")
         return "\n".join(righe)
 
@@ -6672,7 +7463,7 @@ class Sentinella(threading.Thread):
         if self.app.db.meta_get("tg_riepilogo_giorno") == oggi:
             return
         self.app.db.meta_set("tg_riepilogo_giorno", oggi)
-        oggi0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+        oggi0 = _ore_locali(lt)
         ieri0 = oggi0 - 86400
         ora = int(time.time())
         tol = max(150, int(self.app.intervallo_pdc() * 1.5))
@@ -6729,7 +7520,8 @@ ETICHETTE_ALLARME = {
     "minuti": ("Per quanti minuti di fila", "int", 1, 1440),
     "sotto_gradi": ("Avvisa sotto (°C)", "float", -30, 90),
     "sotto_lmin": ("Avvisa sotto (L/min)", "float", 0, 60),
-    "scarto_gradi": ("Scarto massimo dalla curva (°C)", "float", 1, 40),
+    "scarto_sopra_gradi": ("Scarto sopra la curva (°C)", "float", 1, 40),
+    "scarto_gradi": ("Scarto sotto la curva (°C)", "float", 1, 40),
     "durata_minima_min": ("Un ciclo è 'breve' se dura meno di (minuti)", "int", 1, 120),
     "quanti": ("Quanti eventi fanno scattare l'avviso", "int", 1, 100),
     "ore": ("Periodo controllato (ore)", "float", 0.5, 48),
@@ -6746,7 +7538,7 @@ DESCRIZIONI_ALLARME = {
     "umidita_molto_alta": "L'umidità in casa è molto alta (rosso nella Dashboard).",
     "cicli_brevi": "La pompa parte e si ferma troppo spesso.",
     "portata_bassa": "Poca acqua nel circuito (filtro, aria, valvole).",
-    "mandata_lontana": "La mandata è lontana da quella prevista dalla curva climatica.",
+    "mandata_lontana": "La mandata è lontana da quella prevista dalla curva climatica, con una soglia per sopra e una per sotto.",
     "acs_bassa": "L'acqua calda sanitaria è troppo fredda.",
     "cop_basso": "L'efficienza stimata (COP) è bassa.",
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
@@ -6805,8 +7597,8 @@ def schema_impostazioni():
             _c("telegram.messaggi.ripristino", "lungo", "Tutto risolto"),
             _c("telegram.messaggi.promemoria", "lungo", "Promemoria"),
             _c("telegram.messaggi.riepilogo", "lungo", "Riepilogo del mattino"),
-            _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {esterna} {ora}."),
-            _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {durata} {consumo}."),
+            _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {impianto} {esterna} {ora}."),
+            _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {impianto} {durata} {consumo}."),
         ]},
         {"id": "collegamenti", "titolo": "SmartThings (pompa di calore)", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
          "campi": [
@@ -6944,6 +7736,8 @@ def stato_stazione(app):
     i = stazione_info(app)
     if i is None:
         return ""
+    if i["umidita"] is None and i["ts"] and not i["errore"]:
+        return "La stazione non manda dati nuovi dalle " + datetime.fromtimestamp(i["ts"]).strftime("%H:%M")
     if i["umidita"] is None:
         return "In attesa del primo dato…" if not i["errore"] else "Non riesco a leggere la stazione: " + i["errore"]
     quando = datetime.fromtimestamp(i["ts"]).strftime("%H:%M") if i["ts"] else "?"
@@ -7109,8 +7903,8 @@ def cambia_password(app, corpo, h):
         time.sleep(1.0)
         return {"ok": False, "messaggio": "La password attuale non è corretta."}
     nuova = str(corpo.get("nuova", ""))
-    if len(nuova) < 10:
-        return {"ok": False, "messaggio": "La nuova password deve avere almeno 10 caratteri."}
+    if len(nuova) < PASSWORD_MIN:
+        return {"ok": False, "messaggio": f"La nuova password deve avere almeno {PASSWORD_MIN} caratteri."}
     nuovo_hash = hash_password(nuova)
     utente = str(corpo.get("utente", "")).strip() or acc.get("utente")
     app.cfg.aggiorna(lambda raw: raw.setdefault("accesso", {}).update(password_hash=nuovo_hash, utente=utente, password=""))
@@ -7172,8 +7966,7 @@ def api_registro(app, q):
             return 0
     dbp = str(app.db.path)
     cfg_b = app.cfg.leggi().get("backup") or {}
-    cart = Path(cfg_b.get("cartella") or "dati/backup")
-    cart = cart if cart.is_absolute() else base / cart
+    cart = cartella_backup(app)
     copie = sorted(cart.glob("pdc-*.db")) if cart.is_dir() else []
     return {
         "righe": leggi_coda_log(base / "log" / "pdc_pannello.log", n),
@@ -7200,8 +7993,7 @@ def reset_database(app, corpo, h):
         app.limite.fallito(ip)
         time.sleep(1.0)
         return {"ok": False, "messaggio": "La password non è corretta: non ho cancellato niente."}
-    cart = Path((app.cfg.leggi().get("backup") or {}).get("cartella") or "dati/backup")
-    cart = cart if cart.is_absolute() else app.base / cart
+    cart = cartella_backup(app)
     copia = cart / f"prima-del-reset-{time.strftime('%Y%m%d-%H%M%S')}.db"
     try:
         cart.mkdir(parents=True, exist_ok=True)
@@ -7214,9 +8006,9 @@ def reset_database(app, corpo, h):
         log.error("Reset database annullato: copia non riuscita (%s)", e)
         return {"ok": False, "messaggio": f"Non sono riuscito a fare la copia di sicurezza ({e}): non ho cancellato niente."}
     with app.db.lock, closing(app.db._c()) as c, c:
-        for tab in ("misure", "stati", "ultimo", "ciclo", "eventi"):
+        for tab in ("misure", "stati", "ultimo", "ciclo", "eventi", "finestre"):
             c.execute(f"DELETE FROM {tab}")
-        c.execute("DELETE FROM meta WHERE k IN ('ciclo_ultimo_ts', 'tg_notificati')")
+        c.execute("DELETE FROM meta WHERE k IN ('ciclo_ultimo_ts', 'tg_notificati', 'fin_soglie')")
     try:
         vacuum(app.db)
     except Exception:
@@ -7448,8 +8240,6 @@ class TunnelCF:
         except OSError as e:
             logf.close()
             raise ErroreCF(f"Non riesco ad avviare cloudflared: {e}")
-        finally:
-            pass
         logf.close()
         self.partito_il = time.time()
         try:
@@ -7885,11 +8675,16 @@ def compatta_storico(db, giorni, minuti, ora=None, elimina_blob=True, blocco_gio
     return {"prima": prima, "tolti": dopo_cancellati, "blob": blob, "limite": limite}
 
 
+def cartella_backup(app):
+    """La cartella dei backup (config backup.cartella, di solito dati/backup), come percorso assoluto."""
+    cart = Path((app.cfg.leggi().get("backup") or BACKUP_DEFAULT).get("cartella") or "dati/backup")
+    return cart if cart.is_absolute() else app.base / cart
+
+
 def fai_backup(app):
     """Copia coerente del database (anche mentre il pannello lavora) + config.json. -> (cartella, [file creati])."""
     c = app.cfg.leggi().get("backup") or BACKUP_DEFAULT
-    cart = Path(c.get("cartella") or "dati/backup")
-    cart = cart if cart.is_absolute() else app.base / cart
+    cart = cartella_backup(app)
     cart.mkdir(parents=True, exist_ok=True)
     giorno = time.strftime("%Y-%m-%d")
     creati = []
@@ -8005,9 +8800,7 @@ def cmd_ripristina(app, leggi=input):
         print("Il pannello e' acceso (o c'e' un'altra copia in esecuzione): fermalo, poi rilancia questo comando.")
         return 1
     try:
-        c = app.cfg.leggi().get("backup") or BACKUP_DEFAULT
-        cart = Path(c.get("cartella") or "dati/backup")
-        cart = cart if cart.is_absolute() else app.base / cart
+        cart = cartella_backup(app)
         copie = (sorted(list(cart.glob("pdc-*.db")) + list(cart.glob("prima-del-reset-*.db")),
                         key=lambda f: f.stat().st_mtime, reverse=True) if cart.is_dir() else [])
         if not copie:
@@ -8121,9 +8914,9 @@ def elenco_loghi(app):
     out = {}
     for nome in LOGHI_NOMI:
         for est in LOGHI_ESTENSIONI:
-            f = next((c / f"{nome}.{est}" for c in cartelle_loghi(app.base) if (c / f"{nome}.{est}").is_file()), None)
+            f = app.base / "dati" / "loghi" / f"{nome}.{est}"
             try:
-                if f is not None:
+                if f.is_file():
                     out[nome] = f"/loghi/{nome}.{est}?v={int(f.stat().st_mtime)}"
                     break
             except OSError:
@@ -8137,6 +8930,8 @@ def elenco_loghi(app):
 
 _RE_MAC = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}[0-9a-fA-F]{2})(?![0-9a-fA-F])")
 _cache_mac = {}
+MAC_RICORDO = 7 * 86400     # un MAC trovato non cambia quasi mai: si ricorda una settimana (cambiando l'IP in Impostazioni si rilegge subito)
+MAC_RIPROVA = 120           # se non c'e' (dispositivo spento) si riprova presto
 
 
 def _mac_normale(testo):
@@ -8166,7 +8961,7 @@ def mac_da_ip(ip):
     """MAC di un dispositivo della rete locale, oppure None. Nessuna libreria esterna: 'arp' del sistema."""
     ora = time.time()
     c = _cache_mac.get(ip)
-    if c and ora - c[0] < 600:
+    if c and ora - c[0] < (MAC_RICORDO if c[1] else MAC_RIPROVA):
         return c[1]
     mac = None
     try:
@@ -8476,127 +9271,156 @@ FSV_MENU = {
     "50": "Altro",
 }
 FSV_CATALOGO = {
-    "1011": ("Raffrescamento: limite massimo temperatura acqua", "°C", 25, 18, 25),
-    "1012": ("Raffrescamento: limite minimo temperatura acqua", "°C", 16, 5, 18),
-    "1021": ("Raffrescamento: limite massimo temperatura ambiente", "°C", 30, 28, 30),
-    "1022": ("Raffrescamento: limite minimo temperatura ambiente", "°C", 18, 18, 28),
-    "1031": ("Riscaldamento: limite massimo temperatura acqua", "°C", 70, 37, 70),
-    "1032": ("Riscaldamento: limite minimo temperatura acqua", "°C", 25, 15, 37),
-    "1041": ("Riscaldamento: limite massimo temperatura ambiente", "°C", 30, 18, 30),
-    "1042": ("Riscaldamento: limite minimo temperatura ambiente", "°C", 16, 16, 18),
-    "1051": ("Acqua calda: limite massimo temperatura bollitore", "°C", 55, 50, 70),
-    "1052": ("Acqua calda: limite minimo temperatura bollitore", "°C", 40, 30, 40),
+    "1011": ("Raffrescamento: massima temperatura dell'acqua impostabile", "°C", 25, 18, 25),
+    "1012": ("Raffrescamento: minima temperatura dell'acqua impostabile", "°C", 16, 5, 18),
+    "1021": ("Raffrescamento: massima temperatura ambiente impostabile", "°C", 30, 28, 30),
+    "1022": ("Raffrescamento: minima temperatura ambiente impostabile", "°C", 18, 18, 28),
+    "1031": ("Riscaldamento: massima temperatura dell'acqua impostabile", "°C", 70, 37, 70),
+    "1032": ("Riscaldamento: minima temperatura dell'acqua impostabile", "°C", 25, 15, 37),
+    "1041": ("Riscaldamento: massima temperatura ambiente impostabile", "°C", 30, 18, 30),
+    "1042": ("Riscaldamento: minima temperatura ambiente impostabile", "°C", 16, 16, 18),
+    "1051": ("Acqua calda: massima temperatura impostabile", "°C", 55, 50, 70),
+    "1052": ("Acqua calda: minima temperatura impostabile", "°C", 40, 30, 40),
     "2011": ("Curva riscaldamento: temperatura esterna, punto freddo", "°C", -10, -20, 5),
     "2012": ("Curva riscaldamento: temperatura esterna, punto caldo", "°C", 15, 10, 20),
-    "2021": ("Curva riscaldamento zona 1: temperatura acqua al punto freddo", "°C", 40, 17, 65),
-    "2022": ("Curva riscaldamento zona 1: temperatura acqua al punto caldo", "°C", 25, 17, 65),
-    "2031": ("Curva riscaldamento zona 2: temperatura acqua al punto freddo", "°C", 50, 17, 65),
-    "2032": ("Curva riscaldamento zona 2: temperatura acqua al punto caldo", "°C", 35, 17, 65),
-    "2041": ("Tipo di emissione per il riscaldamento", "", 1, 1, 2),
+    "2021": ("Curva riscaldamento zona 1: temperatura di mandata al punto freddo", "°C", 40, 17, 65),
+    "2022": ("Curva riscaldamento zona 1: temperatura di mandata al punto caldo", "°C", 25, 17, 65),
+    "2031": ("Curva riscaldamento zona 2: temperatura di mandata al punto freddo", "°C", 50, 17, 65),
+    "2032": ("Curva riscaldamento zona 2: temperatura di mandata al punto caldo", "°C", 35, 17, 65),
+    "2041": ("Curva climatica del riscaldamento: tipo di impianto", "", 1, 1, 2),
     "2051": ("Curva raffrescamento: temperatura esterna, punto freddo", "°C", 30, 25, 35),
     "2052": ("Curva raffrescamento: temperatura esterna, punto caldo", "°C", 40, 35, 45),
-    "2061": ("Curva raffrescamento zona 1: temperatura acqua al punto caldo", "°C", 25, 5, 25),
-    "2062": ("Curva raffrescamento zona 1: temperatura acqua al punto freddo", "°C", 18, 5, 25),
-    "2071": ("Curva raffrescamento zona 2: temperatura acqua al punto caldo", "°C", 18, 5, 25),
-    "2072": ("Curva raffrescamento zona 2: temperatura acqua al punto freddo", "°C", 5, 5, 25),
-    "2081": ("Tipo di emissione per il raffrescamento", "", 1, 1, 2),
-    "2091": ("Termostato esterno 1 (zona a pavimento)", "", 0, 0, 4),
-    "2092": ("Termostato esterno 2 (zona ventilconvettori)", "", 0, 0, 4),
-    "2093": ("Controllo con il sensore di temperatura ambiente del telecomando", "", 4, 1, 4),
-    "3011": ("Acqua calda: avvio in base alla temperatura del bollitore", "", 1, 0, 2),
-    "3021": ("Acqua calda: temperatura massima con la sola pompa di calore", "°C", 55, 45, 55),
-    "3022": ("Acqua calda: differenziale di temperatura per lo spegnimento della pompa", "°C", 0, 0, 10),
-    "3023": ("Acqua calda: differenziale di temperatura per l'accensione della pompa", "°C", 5, 5, 30),
-    "3024": ("Tempo minimo di riscaldamento tra due cicli acqua calda", "min", 5, 1, 20),
-    "3025": ("Tempo massimo di un ciclo acqua calda", "min", 30, 5, 95),
-    "3026": ("Tempo massimo di riscaldamento dopo l'acqua calda", "ore", 3, 0.5, 10),
-    "3031": ("Resistenza del bollitore (BSH) per l'acqua calda", "", 1, 0, 1),
-    "3032": ("Ritardo di avvio della resistenza del bollitore", "min", 20, 20, 95),
-    "3033": ("Scarto di temperatura per lo spegnimento della resistenza del bollitore", "°C", 0, 0, 4),
+    "2061": ("Curva raffrescamento zona 1: temperatura di mandata più alta", "°C", 25, 5, 25),
+    "2062": ("Curva raffrescamento zona 1: temperatura di mandata più bassa", "°C", 18, 5, 25),
+    "2071": ("Curva raffrescamento zona 2: temperatura di mandata più alta", "°C", 18, 5, 25),
+    "2072": ("Curva raffrescamento zona 2: temperatura di mandata più bassa", "°C", 5, 5, 25),
+    "2081": ("Curva climatica del raffrescamento: tipo di impianto", "", 1, 1, 2),
+    "2091": ("Termostato esterno 1 (zona 1, pavimento)", "", 0, 0, 4),
+    "2092": ("Termostato esterno 2 (zona 2, ventilconvettori)", "", 0, 0, 4),
+    "2093": ("Sensore ambiente del telecomando", "", 4, 1, 4),
+    "3011": ("Acqua calda: bollitore e criterio di avvio", "", 1, 0, 2),
+    "3021": ("Acqua calda: temperatura massima raggiunta dalla sola pompa di calore", "°C", 55, 45, 55),
+    "3022": ("Acqua calda: spegnimento della pompa sotto il massimo", "°C", 0, 0, 10),
+    "3023": ("Acqua calda: scarto tra spegnimento e riaccensione della pompa", "°C", 5, 5, 30),
+    "3024": ("Riscaldamento: tempo minimo di funzionamento tra due cicli acqua calda", "min", 5, 1, 20),
+    "3025": ("Acqua calda: durata massima di un ciclo prima di tornare al riscaldamento", "min", 30, 5, 95),
+    "3026": ("Riscaldamento: durata massima dopo un ciclo acqua calda", "ore", 3, 0.5, 10),
+    "3031": ("Acqua calda: resistenza nel bollitore (BSH)", "", 1, 0, 1),
+    "3032": ("Acqua calda: ritardo prima che parta la resistenza del bollitore", "min", 20, 20, 95),
+    "3033": ("Acqua calda: spegnimento della resistenza del bollitore sopra l'obiettivo", "°C", 0, 0, 4),
     "3041": ("Disinfezione anti-legionella", "", 1, 0, 1),
     "3042": ("Disinfezione: giorno della settimana", "", 5, 0, 7),
     "3043": ("Disinfezione: ora di avvio", "ore", 23, 0, 23),
     "3044": ("Disinfezione: temperatura da raggiungere", "°C", 70, 40, 70),
     "3045": ("Disinfezione: tempo di mantenimento", "min", 10, 5, 60),
     "3046": ("Disinfezione: durata massima del ciclo", "ore", 8, 1, 24),
-    "3051": ("Spegnimento forzato dell'acqua calda a tempo", "", 0, 0, 1),
-    "3052": ("Durata dello spegnimento forzato dell'acqua calda", "×10 min", 6, 3, 30),
-    "3061": ("Pannello solare per l'acqua calda", "", 0, 0, 2),
-    "3071": ("Posizione di riposo della valvola a 3 vie", "", 0, 0, 1),
-    "3081": ("Potenza resistenza di integrazione (BUH), primo stadio", "kW", 2, 1, 6),
-    "3082": ("Potenza resistenza di integrazione (BUH), secondo stadio", "kW", 2, 0, 6),
-    "3083": ("Potenza resistenza del bollitore (BSH)", "kW", 3, 1, 6),
+    "3051": ("Acqua calda: modo Forzato a tempo", "", 0, 0, 1),
+    "3052": ("Acqua calda: durata del modo Forzato", "×10 min", 6, 3, 30),
+    "3061": ("Acqua calda: pannello solare", "", 0, 0, 2),
+    "3071": ("Valvola a 3 vie: posizione a riposo", "", 0, 0, 1),
+    "3081": ("Potenza della resistenza di integrazione (BUH), primo stadio", "kW", 2, 1, 6),
+    "3082": ("Potenza della resistenza di integrazione (BUH), secondo stadio", "kW", 2, 0, 6),
+    "3083": ("Potenza della resistenza del bollitore (BSH)", "kW", 3, 1, 6),
     "4011": ("Priorità tra riscaldamento e acqua calda", "", 0, 0, 1),
-    "4012": ("Temperatura esterna sotto la quale vale la priorità al riscaldamento", "°C", 0, -15, 20),
-    "4013": ("Temperatura esterna oltre la quale il riscaldamento si ferma", "°C", 35, 14, 35),
+    "4012": ("Priorità al riscaldamento: temperatura esterna sotto la quale vale", "°C", 0, -15, 20),
+    "4013": ("Riscaldamento: temperatura esterna oltre la quale si ferma", "°C", 35, 14, 45),
     "4021": ("Resistenza di integrazione (BUH) per il riscaldamento", "", 0, 0, 2),
-    "4022": ("Priorità tra resistenza di integrazione e resistenza del bollitore", "", 2, 0, 2),
-    "4023": ("Compensazione per clima freddo", "", 1, 0, 1),
-    "4024": ("Temperatura esterna sotto la quale entra la resistenza di integrazione", "°C", 0, -25, 35),
-    "4025": ("Temperatura acqua a cui interviene la resistenza durante lo sbrinamento", "°C", 15, 10, 55),
+    "4022": ("Se ci sono due resistenze: quale parte per prima", "", 2, 0, 2),
+    "4023": ("Resistenza di integrazione: usata solo con temperatura esterna bassa", "", 1, 0, 1),
+    "4024": ("Resistenza di integrazione: temperatura esterna sotto la quale può partire", "°C", 0, -25, 35),
+    "4025": ("Sbrinamento: temperatura dell'acqua sotto la quale parte la resistenza", "°C", 15, 10, 55),
     "4031": ("Caldaia di supporto", "", 0, 0, 1),
-    "4032": ("Priorità della caldaia di supporto", "", 0, 0, 1),
-    "4033": ("Temperatura esterna sotto la quale entra la caldaia", "°C", -15, -20, 5),
+    "4032": ("Caldaia di supporto: priorità", "", 0, 0, 1),
+    "4033": ("Caldaia di supporto: temperatura esterna sotto la quale entra", "°C", -15, -20, 5),
     "4041": ("Valvola miscelatrice", "", 0, 0, 2),
-    "4042": ("Salto di temperatura obiettivo (ΔT) in riscaldamento", "°C", 10, 5, 15),
-    "4043": ("Salto di temperatura obiettivo (ΔT) in raffrescamento", "°C", 10, 5, 15),
-    "4044": ("Fattore di controllo della miscelatrice", "", 2, 1, 5),
-    "4045": ("Intervallo di controllo della miscelatrice", "min", 2, 1, 30),
-    "4046": ("Tempo di corsa della miscelatrice", "×10 s", 9, 6, 24),
+    "4042": ("Miscelatrice: salto di temperatura (ΔT) obiettivo in riscaldamento", "°C", 10, 5, 15),
+    "4043": ("Miscelatrice: salto di temperatura (ΔT) obiettivo in raffrescamento", "°C", 10, 5, 15),
+    "4044": ("Miscelatrice: fattore di controllo (più alto = più reattiva)", "", 2, 1, 5),
+    "4045": ("Miscelatrice: intervallo di controllo (più basso = più reattiva)", "min", 2, 1, 30),
+    "4046": ("Miscelatrice: tempo di corsa", "×10 s", 9, 6, 24),
     "4051": ("Pompa di circolazione a velocità variabile", "", 1, 0, 2),
-    "4052": ("Salto di temperatura obiettivo (ΔT) della pompa a velocità variabile", "°C", 5, 2, 8),
-    "4053": ("Fattore di controllo della pompa a velocità variabile", "", 2, 1, 3),
-    "4061": ("Controllo a due zone", "", 0, 0, 1),
-    "5011": ("Assenza: temperatura acqua in raffrescamento", "°C", 25, 5, 25),
-    "5012": ("Assenza: temperatura ambiente in raffrescamento", "°C", 30, 18, 30),
-    "5013": ("Assenza: temperatura acqua in riscaldamento", "°C", 15, 15, 55),
-    "5014": ("Assenza: temperatura ambiente in riscaldamento", "°C", 16, 16, 30),
-    "5015": ("Assenza: temperatura acqua, raffrescamento automatico zona 1", "°C", 25, 5, 25),
-    "5016": ("Assenza: temperatura acqua, raffrescamento automatico zona 2", "°C", 25, 5, 25),
-    "5017": ("Assenza: temperatura acqua, riscaldamento automatico zona 1", "°C", 15, 15, 55),
-    "5018": ("Assenza: temperatura acqua, riscaldamento automatico zona 2", "°C", 15, 15, 55),
-    "5019": ("Assenza: temperatura obiettivo del bollitore", "°C", 30, 30, 70),
-    "5021": ("Risparmio: riduzione della temperatura dell'acqua calda", "°C", 5, 0, 40),
-    "5022": ("Risparmio: modalità economica per l'acqua calda", "", 0, 0, 1),
-    "5023": ("Risparmio: temperatura di accensione", "°C", 25, 0, 40),
-    "5041": ("Controllo dei picchi di rete", "", 0, 0, 1),
-    "5042": ("Componenti spenti a forza durante un picco", "", 0, 0, 3),
-    "5043": ("Livello di tensione del segnale di ingresso", "", 1, 0, 1),
-    "5051": ("Controllo del rapporto di frequenza", "", 0, 0, 1),
-    "5061": ("Rapporto di capacità tra riscaldamento e acqua calda", "", None, None, None),
+    "4052": ("Pompa a velocità variabile: salto di temperatura (ΔT) obiettivo tra mandata e ritorno", "°C", 5, 2, 8),
+    "4053": ("Pompa a velocità variabile: fattore di controllo", "", 2, 1, 3),
+    "4061": ("Controllo a due zone (telecomando cablato Samsung)", "", 0, 0, 1),
+    "5011": ("Fuori casa: temperatura dell'acqua in raffrescamento", "°C", 25, 5, 25),
+    "5012": ("Fuori casa: temperatura ambiente in raffrescamento", "°C", 30, 18, 30),
+    "5013": ("Fuori casa: temperatura dell'acqua in riscaldamento", "°C", 15, 15, 55),
+    "5014": ("Fuori casa: temperatura ambiente in riscaldamento", "°C", 16, 16, 30),
+    "5015": ("Fuori casa: temperatura dell'acqua, raffrescamento con curva climatica zona 1", "°C", 25, 5, 25),
+    "5016": ("Fuori casa: temperatura dell'acqua, raffrescamento con curva climatica zona 2", "°C", 25, 5, 25),
+    "5017": ("Fuori casa: temperatura dell'acqua, riscaldamento con curva climatica zona 1", "°C", 15, 15, 55),
+    "5018": ("Fuori casa: temperatura dell'acqua, riscaldamento con curva climatica zona 2", "°C", 15, 15, 55),
+    "5019": ("Fuori casa: temperatura del bollitore", "°C", 30, 30, 70),
+    "5021": ("Acqua calda in modo Eco: di quanto si abbassa la temperatura", "°C", 5, 0, 40),
+    "5022": ("Acqua calda in modo Eco: funzione risparmio", "", 0, 0, 1),
+    "5023": ("Acqua calda in modo Eco: temperatura di riaccensione", "°C", 25, 0, 40),
+    "5041": ("Limitazione nei picchi di consumo", "", 0, 0, 1),
+    "5042": ("Componenti spenti durante un picco", "", 0, 0, 3),
+    "5043": ("Segnale di picco: livello che lo attiva", "", 1, 0, 1),
+    "5051": ("Controllo del rapporto di frequenza (0–10 V o Modbus)", "", 0, 0, 1),
+    "5061": ("Ripartizione della capacità tra riscaldamento e acqua calda", "", None, None, None),
     "5081": ("Controllo con fotovoltaico", "", 0, 0, 1),
     "5082": ("Fotovoltaico: scarto di temperatura in raffrescamento", "°C", 1, 0, 5),
     "5083": ("Fotovoltaico: scarto di temperatura in riscaldamento", "°C", 1, 0, 5),
     "5091": ("Rete intelligente (smart grid)", "", 0, 0, 1),
-    "5092": ("Rete intelligente: aumento temperatura riscaldamento", "°C", 2, 2, 5),
-    "5093": ("Rete intelligente: aumento temperatura acqua calda", "°C", 5, 2, 5),
-    "5094": ("Rete intelligente: modalità acqua calda", "", 0, 0, 1),
+    "5092": ("Rete intelligente: aumento della temperatura di riscaldamento", "°C", 2, 2, 5),
+    "5093": ("Rete intelligente: aumento della temperatura dell'acqua calda", "°C", 5, 2, 5),
+    "5094": ("Rete intelligente: temperatura massima dell'acqua calda", "", 0, 0, 1),
+}
+
+# Spiegazioni brevi sotto il nome (dal manuale Samsung EHS Mono / Gen 6 e dalla guida FSV di Dwellsee)
+FSV_NOTE = {
+    "2041": "Quale curva climatica vale per il riscaldamento: la 1 (pavimento) o la 2 (ventilconvettori).",
+    "2091": "Con 0 comanda il telecomando della pompa (metti a 0 sia 2091 sia 2092). Con 1 il compressore segue solo il "
+            "termostato; da 2 a 4 segue il termostato o la curva climatica, il primo che scatta, e il numero decide la pompa di "
+            "circolo a richiesta finita: ferma (2), accesa (3), 7 minuti ferma e 3 accesa (4).",
+    "2092": "Come 2091, per la seconda zona.",
+    "2093": "Con 1 il compressore segue solo il sensore ambiente del telecomando; da 2 a 4 segue il sensore o la curva climatica, e la pompa di circolo a richiesta finita fa come in 2091.",
+    "3011": "0 = nessun bollitore. 1 = l'acqua calda riparte quando scende alla temperatura di accensione, 2 = a quella di spegnimento.",
+    "3021": "Oltre questa temperatura il bollitore si scalda solo con la resistenza, se c'è.",
+    "3022": "La pompa si ferma a: massimo (o obiettivo) meno questo valore.",
+    "3023": "Isteresi: la pompa riparte quando l'acqua scende di questo valore sotto la temperatura di spegnimento.",
+    "3024": "Vale solo quando riscaldamento e acqua calda sono richiesti insieme.",
+    "3025": "Vale solo quando riscaldamento e acqua calda sono richiesti insieme: poi si torna al riscaldamento.",
+    "3026": "Vale solo quando riscaldamento e acqua calda sono richiesti insieme.",
+    "3031": "Serve la resistenza elettrica dentro il bollitore.",
+    "3032": "Non conta nei modi Potenza e Forzato. In modo Eco la resistenza non si usa. Tienilo sotto il valore di 3025.",
+    "3033": "La resistenza si spegne a: obiettivo più questo valore.",
+    "3041": "Richiede la resistenza nel bollitore: riscalda il bollitore ad alta temperatura contro la legionella.",
+    "3051": "Con 1 il modo Forzato dell'acqua calda finisce da solo dopo la durata di 3052.",
+    "3071": "Dove sta la valvola a 3 vie quando nessuno la comanda: 0 = riscaldamento, 1 = bollitore.",
+    "4011": "Con 1 il riscaldamento ha la precedenza solo se fuori fa meno di 4012.",
+    "4012": "Conta solo se 4011 = 1.",
+    "4023": "Con 1 la resistenza di integrazione parte solo sotto la temperatura esterna di 4024.",
+    "4041": "Solo se c'è una valvola miscelatrice nell'impianto.",
+    "4051": "Con 2 la pompa di circolazione non supera il 70% della velocità.",
+    "4061": "Serve il telecomando cablato Samsung. Non serve con un termostato di terzi e vuole 2091 e 2092 a 0.",
+    "5021": "Si toglie dalla temperatura impostata per l'acqua calda quando il modo è Eco.",
+    "5041": "Non può essere attivo insieme al controllo con fotovoltaico (5081).",
 }
 _FSV_SINO = {"3031", "3041", "3051", "4023", "4031", "4061", "5022", "5041", "5051", "5081", "5091"}
-_TERM = {0: "Non usato", 1: "Il compressore segue solo il termostato",
-         2: "Termostato o temperatura di mandata · pompa ferma a termostato spento",
-         3: "Termostato o temperatura di mandata · pompa accesa a termostato spento",
-         4: "Termostato o temperatura di mandata · pompa 7 min ferma e 3 accesa"}
+_TERM = {0: "Non usato", 1: "Solo il termostato", 2: "Termostato o curva, pompa ferma",
+         3: "Termostato o curva, pompa accesa", 4: "Termostato o curva, pompa 7 min ferma e 3 accesa"}
 _FSV_VALORI = {
     "2091": _TERM,
     "2092": _TERM,
-    "2093": {1: "Il compressore segue solo il sensore ambiente",
-             2: _TERM[2].replace("Termostato", "Sensore ambiente").replace("a termostato spento", "a sensore soddisfatto"),
-             3: _TERM[3].replace("Termostato", "Sensore ambiente").replace("a termostato spento", "a sensore soddisfatto"),
-             4: _TERM[4].replace("Termostato", "Sensore ambiente")},
-    "3011": {1: "Avvio alla soglia di accensione", 2: "Avvio alla soglia di spegnimento"},
-    "4011": {0: "Priorità all'acqua calda", 1: "Priorità al riscaldamento (sotto la temperatura di 4012)"},
+    "2093": {1: "Solo il sensore ambiente", 2: "Sensore o curva, pompa ferma", 3: "Sensore o curva, pompa accesa",
+             4: "Sensore o curva, pompa 7 min ferma e 3 accesa"},
+    "3011": {0: "Bollitore non usato", 1: "Parte quando scende alla temperatura di accensione",
+             2: "Parte quando scende alla temperatura di spegnimento"},
+    "4011": {0: "Priorità all'acqua calda", 1: "Priorità al riscaldamento sotto la temperatura esterna di 4012"},
     "4021": {0: "Nessuna resistenza di integrazione", 1: "Resistenza a due stadi", 2: "Resistenza a uno stadio"},
-    "4022": {0: "Entrambe", 1: "Priorità alla resistenza di integrazione", 2: "Priorità alla resistenza del bollitore"},
-    "4041": {0: "Non installata", 1: "Controllo sulla differenza di temperatura", 2: "Controllo sulla differenza del valore della curva"},
-    "4051": {0: "Non usata", 1: "Uscita al 100%", 2: "Uscita al 70%"},
-    "2041": {1: "Pavimento radiante", 2: "Ventilconvettori o radiatori"},
-    "2081": {1: "Pavimento radiante", 2: "Ventilconvettori"},
+    "4022": {0: "Partono insieme", 1: "Prima la resistenza di integrazione", 2: "Prima la resistenza del bollitore"},
+    "4041": {0: "Non installata", 1: "Controllo con salto di temperatura fisso (4042 e 4043)",
+             2: "Controllo con il salto di temperatura della curva climatica"},
+    "4051": {0: "Non usata", 1: "Fino al 100% della velocità", 2: "Fino al 70% della velocità"},
+    "2041": {1: "Zona 1: pavimento radiante", 2: "Zona 2: ventilconvettori o radiatori"},
+    "2081": {1: "Zona 1: pavimento radiante", 2: "Zona 2: ventilconvettori"},
     "3042": {0: "Domenica", 1: "Lunedì", 2: "Martedì", 3: "Mercoledì", 4: "Giovedì", 5: "Venerdì", 6: "Sabato",
              7: "Ogni giorno"},
     "3071": {0: "Verso il riscaldamento", 1: "Verso il bollitore"},
-    "5043": {0: "Bassa", 1: "Alta"},
-    "5094": {0: "Solo pompa di calore (55 °C)", 1: "Pompa e resistenza (70 °C)"},
+    "5043": {0: "Segnale basso", 1: "Segnale alto"},
+    "5094": {0: "Solo pompa di calore (55 °C)", 1: "Pompa e resistenza del bollitore (70 °C)"},
 }
 _FSV_MOLT = {"×10 min": (10, "min"), "×10 s": (10, "s")}
 
@@ -8614,45 +9438,131 @@ def _fsv_numero(txt):
         return None
 
 
+def _fsv_t(codice, grezzo, unita):
+    """_fsv_testo per un valore grezzo (il numero lo ricava da solo)."""
+    return _fsv_testo(codice, _fsv_numero(grezzo), grezzo, unita)
+
+
 def _fsv_testo(codice, n, grezzo, unita):
     """Il valore come lo leggerebbe una persona: testo dove il codice e' una scelta, unita' dove c'e'."""
     if n is None:
         return str(grezzo)
     k = int(n) if n == int(n) else None
     if codice in _FSV_VALORI and k in _FSV_VALORI[codice]:
-        return f"{_FSV_VALORI[codice][k]} · {_num_it(n)}"
+        return f"{_num_it(n)}\u00a0· {_FSV_VALORI[codice][k]}"      # prima il numero: non resta mai solo a capo
     if codice in _FSV_SINO and k in (0, 1):
-        return f"{'Sì' if k else 'No'} · {k}"
+        return f"{k}\u00a0· {'Sì' if k else 'No'}"
     if unita in _FSV_MOLT:
         m, u = _FSV_MOLT[unita]
         return f"{_num_it(n)} ({_num_it(n * m)} {u})"
     return f"{_num_it(n)} {unita}".strip()
 
 
+def fsv_opzioni(cod):
+    """Se il codice e' una scelta (non un numero libero): [[valore, testo], ...]; altrimenti None."""
+    if cod in _FSV_VALORI:
+        return [[k, t] for k, t in sorted(_FSV_VALORI[cod].items())]
+    if cod in _FSV_SINO:
+        return [[0, "No"], [1, "Sì"]]
+    return None
+
+
+def fsv_valore_valido(cod, valore):
+    """-> (numero, errore). Si accetta solo cio' che il manuale prevede per quel codice: niente codici ignoti,
+    niente valori fuori dai limiti, niente decimali (le impostazioni installatore vanno a passi di 1)."""
+    cat = FSV_CATALOGO.get(cod)
+    if not cat or cat[3] is None:
+        return None, "Questo codice non e' nell'elenco del manuale: da qui non lo modifico."
+    try:
+        n = float(str(valore).replace(",", "."))
+    except (TypeError, ValueError):
+        return None, "Il valore non e' un numero."
+    if n != int(n):
+        return None, "Queste impostazioni vanno a numeri interi."
+    n = int(n)
+    opz = fsv_opzioni(cod)
+    if opz is not None and n not in [o[0] for o in opz]:
+        return None, "Valore non previsto per questo codice."
+    if not (cat[3] <= n <= cat[4]):
+        return None, f"Fuori dai limiti del manuale (da {_num_it(cat[3])} a {_num_it(cat[4])})."
+    return n, None
+
+
+def _cronologia_fsv(storia, richieste, nomi, unita, adesso):
+    """Elenco dei cambi: quelli letti dalla pompa (prima -> dopo) e le richieste fatte dal pannello. Una richiesta
+    seguita dalla lettura del valore chiesto diventa una sola voce 'dal pannello'; se la lettura non e' ancora
+    arrivata resta 'in attesa'. Dal piu' recente."""
+    voci, usate = [], set()
+    for cod, st in storia.items():
+        for i in range(1, len(st)):
+            if st[i][1] == st[i - 1][1]:
+                continue
+            ts, dopo, prima = st[i][0], st[i][1], st[i - 1][1]
+            fonte, ip, chiesta = "letto", "", None
+            for k, (rts, rprima, rdopo, rip, _) in enumerate(richieste.get(cod, [])):
+                if (cod, k) not in usate and rts <= ts <= rts + 172800 and _fsv_numero(rdopo) == _fsv_numero(dopo):
+                    usate.add((cod, k))
+                    fonte, ip, chiesta = "pannello", rip, rts
+                    break
+            voci.append({"ts": ts, "id": cod, "nome": nomi.get(cod, "Codice non in elenco"),
+                         "prima": _fsv_t(cod, prima, unita.get(cod, "")),
+                         "dopo": _fsv_t(cod, dopo, unita.get(cod, "")),
+                         "fonte": fonte, "ip": ip, "chiesta": chiesta})
+    for cod, lista in richieste.items():
+        for k, (rts, rprima, rdopo, rip, _) in enumerate(lista):
+            if (cod, k) in usate:
+                continue
+            attuale = storia.get(cod, [(0, "")])[-1][1]
+            fatto = _fsv_numero(attuale) == _fsv_numero(rdopo)
+            voci.append({"ts": rts, "id": cod, "nome": nomi.get(cod, "Codice non in elenco"),
+                         "prima": _fsv_t(cod, rprima, unita.get(cod, "")),
+                         "dopo": _fsv_t(cod, rdopo, unita.get(cod, "")),
+                         "fonte": "pannello", "ip": rip, "chiesta": rts,
+                         "stato": "gia' uguale" if fatto else ("in attesa" if adesso - rts < 7200 else "non confermata")})
+    voci.sort(key=lambda v: -v["ts"])
+    return voci[:60]
+
+
 def impostazioni_installatore(app, ult):
-    """Tutti i parametri FSV letti dalla pompa, raggruppati per menu. Solo lettura."""
+    """Tutti i parametri FSV letti dalla pompa, raggruppati per menu, con la cronologia dei cambi.
+    Le modifiche partono da /api/fsv (8_controlli.py); qui si legge soltanto."""
     codici = sorted(k[4:] for k in ult if k.startswith("fsv."))
     with closing(app.db._c()) as c:
         righe = c.execute("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'fsv.%' ORDER BY serie, ts").fetchall()
+        mod = c.execute("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'fsvmod.%' ORDER BY ts").fetchall()
     storia = {}
     for serie, ts, v in righe:
         storia.setdefault(serie[4:], []).append((ts, v))
-    gruppi, letto = {}, 0
+    richieste = {}
+    for serie, ts, v in mod:
+        parti = (v.split("|") + ["", "", "", ""])[:4]
+        if parti[3].startswith("inviato"):   # le richieste rifiutate non sono modifiche: stanno nel registro dei comandi
+            richieste.setdefault(serie[7:], []).append((ts, parti[0], parti[1], parti[2], parti[3]))
+    gruppi, letto, nomi, unita = {}, 0, {}, {}
+    adesso = int(time.time())
     for cod in codici:
         r = ult["fsv." + cod]
         grezzo = r[3] if r[3] not in (None, "") else (_num_it(r[2]) if r[2] is not None else "")
         n = _fsv_numero(grezzo) if grezzo != "" else None
         cat = FSV_CATALOGO.get(cod)
-        nome, unita, rif, lo, hi = cat if cat else ("Codice non in elenco", "", None, None, None)
-        riga = {"id": cod, "nome": nome, "v": _fsv_testo(cod, n, grezzo, unita), "noto": bool(cat),
-                "rif": _fsv_testo(cod, float(rif), rif, unita) if rif is not None else None,
+        nome, un, rif, lo, hi = cat if cat else ("Codice non in elenco", "", None, None, None)
+        nomi[cod], unita[cod] = nome, un
+        riga = {"id": cod, "nome": nome, "nota": FSV_NOTE.get(cod), "v": _fsv_testo(cod, n, grezzo, un), "noto": bool(cat),
+                "rif": _fsv_testo(cod, float(rif), rif, un) if rif is not None else None,
                 "diverso": bool(rif is not None and n is not None and abs(n - rif) > 1e-9),
-                "limiti": f"da {_num_it(lo)} a {_num_it(hi)} {unita}".strip() if lo is not None else None,
+                "limiti": f"da {_num_it(lo)} a {_num_it(hi)} {un}".strip().replace(" ", "\u00a0") if lo is not None else None,
                 "fuori": bool(lo is not None and n is not None and not (lo - 1e-9 <= n <= hi + 1e-9)),
-                "cambio": None}
+                "cambio": None, "n": n, "lo": lo, "hi": hi, "unita": un, "opzioni": fsv_opzioni(cod),
+                "modificabile": bool(cat and lo is not None and n is not None), "attesa": None}
         st = storia.get(cod, [])
         if len(st) >= 2:
-            riga["cambio"] = {"ts": st[-1][0], "prima": _fsv_testo(cod, _fsv_numero(st[-2][1]), st[-2][1], unita)}
+            riga["cambio"] = {"ts": st[-1][0], "prima": _fsv_t(cod, st[-2][1], un)}
+        rq = richieste.get(cod, [])
+        if rq:   # chiesto dal pannello ma la pompa non l'ha ancora riletto
+            rts, rprima, rdopo, rip, _ = rq[-1]
+            if n is not None and _fsv_numero(rdopo) != n and (not st or st[-1][0] <= rts) and adesso - rts < 172800:
+                riga["attesa"] = {"ts": rts, "dopo": _fsv_t(cod, rdopo, un),
+                                  "vecchia": adesso - rts >= 7200}
         letto = max(letto, r[1] or 0)
         menu = cod[:2] if cat else "altri"
         gruppi.setdefault(menu, []).append(riga)
@@ -8662,7 +9572,89 @@ def impostazioni_installatore(app, ult):
     tutte = [r for g in out for r in g["righe"]]
     return {"gruppi": out, "totale": len(tutte), "diversi": sum(1 for r in tutte if r["diverso"]),
             "cambiati": sum(1 for r in tutte if r["cambio"]), "fuori": sum(1 for r in tutte if r["fuori"]),
-            "letto": letto}
+            "letto": letto,
+            "cronologia": sorted(_cronologia_fsv(storia, richieste, nomi, unita, adesso)
+                                 + regolazioni_dati(app, ult, adesso)[1], key=lambda v: -v["ts"])[:60]}
+
+
+# --------------------------------------------------------------------------
+# Regolazioni: temperatura e modo dell'acqua calda, modo della pompa (comandi standard di SmartThings)
+# --------------------------------------------------------------------------
+REGOLAZIONI = {
+    "acs_setpoint": {"nome": "Temperatura obiettivo acqua calda", "gruppo": "Acqua calda", "comp": "main",
+                     "cap": "thermostatCoolingSetpoint", "cmd": "setCoolingSetpoint", "serie": "acs.setpoint",
+                     "tipo": "num", "unita": "°C"},
+    "acs_modo": {"nome": "Modo acqua calda", "gruppo": "Acqua calda", "comp": "main", "cap": "airConditionerMode",
+                 "cmd": "setAirConditionerMode", "serie": "pdc.modo", "tipo": "txt", "unita": ""},
+    "pompa_modo": {"nome": "Modo della pompa", "gruppo": "Pompa", "comp": "INDOOR", "cap": "airConditionerMode",
+                   "cmd": "setAirConditionerMode", "serie": "risc.modo", "tipo": "txt", "unita": ""},
+}
+REG_MODI = {   # valore SmartThings, nome, avviso da mostrare nella conferma
+    "acs_modo": [("eco", "Eco", "Scalda con la sola pompa di calore e tiene l'acqua un po' più fredda (vedi FSV 5021)."),
+                 ("std", "Standard", ""),
+                 ("power", "Potenza", "Scalda più in fretta: la resistenza del bollitore, se c'è, parte subito."),
+                 ("force", "Forzato", "Scalda subito al massimo dello sforzo (lo usa anche il Boost). Se l'FSV 3051 è "
+                                      "attivo si ferma da solo dopo la durata di 3052.")],
+    "pompa_modo": [("heat", "Riscaldamento", ""),
+                   ("cool", "Raffrescamento", "Manda acqua FREDDA nel circuito: d'inverno la casa si raffredda."),
+                   ("auto", "Automatico", "La pompa sceglie da sola tra caldo e freddo.")],
+}
+
+
+def reg_limiti_acs(ult):
+    """Limiti del setpoint dell'acqua calda: sono gli FSV 1052 (minimo) e 1051 (massimo); senza, 40-55."""
+    lo, hi = _fsv(ult, "1052"), _fsv(ult, "1051")
+    return (int(lo) if lo is not None else 40), (int(hi) if hi is not None else 55)
+
+
+def reg_testo(cosa, v):
+    d = REGOLAZIONI[cosa]
+    if v is None or v == "":
+        return "—"
+    if d["tipo"] == "num":
+        try:
+            return f"{_num_it(round(float(v), 1))} {d['unita']}".strip()
+        except (TypeError, ValueError):
+            return str(v)
+    return next((n for k, n, _ in REG_MODI.get(cosa, []) if k == v), str(v))
+
+
+def _reg_uguali(cosa, a, b):
+    if REGOLAZIONI[cosa]["tipo"] == "num":
+        x, y = _fsv_numero(a), _fsv_numero(b)
+        return x is not None and y is not None and abs(x - y) < 1e-9
+    return str(a) == str(b)
+
+
+def regolazioni_dati(app, ult, adesso):
+    """Valori attuali, scelte possibili e modifiche in attesa. -> ({cosa: {...}}, cronologia)"""
+    with closing(app.db._c()) as c:
+        mod = c.execute("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'regmod.%' ORDER BY ts").fetchall()
+    richieste = {}
+    for serie, ts, v in mod:
+        parti = (v.split("|") + ["", "", "", ""])[:4]
+        if parti[3].startswith("inviato"):
+            richieste.setdefault(serie[7:], []).append((ts, parti[0], parti[1], parti[2]))
+    out, cronologia = {}, []
+    lo, hi = reg_limiti_acs(ult)
+    for cosa, d in REGOLAZIONI.items():
+        r = ult.get(d["serie"])
+        cur = (r[2] if d["tipo"] == "num" else r[3]) if r else None
+        riga = {"cosa": cosa, "nome": d["nome"], "gruppo": d["gruppo"], "valore": cur, "testo": reg_testo(cosa, cur),
+                "unita": d["unita"], "attesa": None,
+                "opzioni": [[k, n, av] for k, n, av in REG_MODI[cosa]] if cosa in REG_MODI else None,
+                "lo": lo if cosa == "acs_setpoint" else None, "hi": hi if cosa == "acs_setpoint" else None,
+                "modificabile": cur is not None}
+        rq = richieste.get(cosa, [])
+        if rq and cur is not None:
+            rts, rprima, rdopo, rip = rq[-1]
+            if not _reg_uguali(cosa, rdopo, cur) and adesso - rts < 7200:
+                riga["attesa"] = {"ts": rts, "dopo": reg_testo(cosa, rdopo)}
+        for rts, rprima, rdopo, rip in rq:
+            cronologia.append({"ts": rts, "id": d["gruppo"], "nome": d["nome"], "prima": reg_testo(cosa, rprima),
+                               "dopo": reg_testo(cosa, rdopo), "fonte": "pannello", "ip": rip, "chiesta": rts})
+        out[cosa] = riga
+    return out, cronologia
 
 
 @api("/api/dispositivi")
@@ -8670,13 +9662,20 @@ def api_dispositivi(app, q):
     ora = int(time.time())
     cfg = app.cfg.leggi()
     cfg.setdefault("dispositivi", {})
-    ult = {r[0]: r for r in app.db.ultimi()}
+    ult = app.db.ultimi_dict()
     tol = max(900, int(app.intervallo_pdc() * 3))
     out = cornice(app, ora)
+    try:
+        boost_riprendi(app)
+    except Exception:
+        log.exception("boost: ripresa del controllo")
     out.update({
         "schede": [_scheda_pdc(app, ult, cfg, ora, tol), _scheda_smarther(app, ult, cfg, ora, tol)],
         "storico": storico_versioni(app),
         "installatore": impostazioni_installatore(app, ult),
+        "regolazioni": regolazioni_dati(app, ult, ora)[0],
+        "boost": boost_dati(app, ult, ora),
+        "da_casa": (q.get("_casa") or ["1"])[0] == "1",
         "comandi": elenco_comandi(app),
         "loghi": elenco_loghi(app),
         "loghi_bianchi": bool(cfg["dispositivi"].get("loghi_bianchi")),
@@ -8694,12 +9693,29 @@ COMANDI_ST = {  # cosa -> (componente SmartThings, nome da mostrare)
     "acqua": ("main", "Acqua calda sanitaria"),
 }
 NOME_COMANDO = {"riscaldamento": "Riscaldamento casa", "acqua": "Acqua calda sanitaria", "smarther": "Termostato Smarther"}
-_ultimo_comando = {}
 _lock_comandi = threading.Lock()
+_ultime_azioni = {}
+
+
+def _troppo_presto(chiave, secondi):
+    """Antirimbalzo: True se la stessa azione e' partita meno di `secondi` fa; altrimenti la segna come partita adesso."""
+    with _lock_comandi:
+        if time.time() - _ultime_azioni.get(chiave, 0) < secondi:
+            return True
+        _ultime_azioni[chiave] = time.time()
+        return False
 
 
 def _servizio(app, sigla):
     return next((s for s in app.servizi if s.sigla == sigla), None)
+
+
+def _sveglia_tra(sv, *ritardi):
+    """Fa rileggere il servizio dopo ciascun ritardo (secondi): SmartThings a volte e' lento ad aggiornare."""
+    for ritardo in ritardi:
+        t = threading.Timer(ritardo, sv.sveglia.set)
+        t.daemon = True
+        t.start()
 
 
 def _rileggi_dopo(app, sigla):
@@ -8708,10 +9724,7 @@ def _rileggi_dopo(app, sigla):
     if not sv:
         return
     sv.ult_info = 0  # Netatmo: rilegge anche la modalita' della casa (homesdata)
-    for ritardo in (4, 20):
-        t = threading.Timer(ritardo, sv.sveglia.set)
-        t.daemon = True
-        t.start()
+    _sveglia_tra(sv, 4, 20)
 
 
 def _comando_st(app, cosa, acceso):
@@ -8792,7 +9805,7 @@ def _comando_nt(app, acceso):
     cfg = app.cfg.leggi()["netatmo"]
     home, room = cfg.get("home_id"), cfg.get("room_id")
     if not home or not room:  # li scrive la lettura quando trova la casa
-        ult = {r[0]: r for r in app.db.ultimi()}
+        ult = app.db.ultimi_dict()
         home = home or (ult.get("info.nt.casa_id") or (0, 0, 0, ""))[3]
         room = room or (ult.get("info.nt.stanza_id") or (0, 0, 0, ""))[3]
     if not home or not room:
@@ -8848,11 +9861,18 @@ def _comando_nt(app, acceso):
     return metodo
 
 
-def _registra_comando(app, cosa, acceso, ip, esito):
-    t = int(time.time())
-    voce = f"{'acceso' if acceso else 'spento'}|{ip}|{str(esito).replace('|', '/')[:900]}"
+def _scrivi_stato(app, serie, valore):
+    """Una riga nel registro dei cambi (tabella stati): e' li' che stanno comandi, modifiche FSV e regolazioni."""
     with closing(app.db._c()) as c, c:
-        c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", (f"cmd.{cosa}", t, voce))
+        c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", (serie, int(time.time()), valore))
+
+
+def _esito_txt(x, n=600):
+    return str(x).replace("|", "/")[:n]      # il separatore del registro e' «|»
+
+
+def _registra_comando(app, cosa, acceso, ip, esito):
+    _scrivi_stato(app, f"cmd.{cosa}", f"{'acceso' if acceso else 'spento'}|{ip}|{_esito_txt(esito, 900)}")
     log.info("comando dal pannello: %s -> %s da %s (%s)", NOME_COMANDO.get(cosa, cosa),
              "acceso" if acceso else "spento", ip, esito)
 
@@ -8864,10 +9884,8 @@ def esegui_comando(app, cosa, acceso, ip):
         return {"ok": False, "errore": "Comando non valido."}
     if app.demo:
         return {"ok": True, "demo": True}
-    with _lock_comandi:
-        if time.time() - _ultimo_comando.get(cosa, 0) < 2:
-            return {"ok": False, "errore": "Un attimo: il comando precedente e' appena partito."}
-        _ultimo_comando[cosa] = time.time()
+    if _troppo_presto("cmd." + cosa, 2):
+        return {"ok": False, "errore": "Un attimo: il comando precedente e' appena partito."}
     metodo = ""
     try:
         if cosa == "smarther":
@@ -8897,9 +9915,479 @@ def elenco_comandi(app, massimo=100):
     out = []
     for serie, ts, v in righe:
         parti = (v.split("|") + ["", "", ""])[:3]
+        if serie.startswith("cmd.fsv") or serie.startswith("cmd.reg"):   # modifica non riuscita: il testo dice cosa e valori
+            out.append({"ts": ts, "cosa": "Impostazione installatore" if serie.startswith("cmd.fsv") else "Regolazione",
+                        "acceso": False, "testo": parti[0],
+                        "ip": parti[1], "esito": parti[2]})
+            continue
         out.append({"ts": ts, "cosa": NOME_COMANDO.get(serie[4:], serie[4:]), "acceso": parti[0] == "acceso",
                     "ip": parti[1], "esito": parti[2]})
     return out
+
+
+# --------------------------------------------------------------------------
+# Modifica delle impostazioni installatore (FSV) dalla scheda Installatore
+# --------------------------------------------------------------------------
+# SmartThings espone gli FSV con la funzione samsungce.ehsFsvSettings. Il nome del comando e i suoi argomenti non sono
+# scritti da nessuna parte nel pannello: si chiede la definizione a SmartThings (una volta al giorno) e si costruisce
+# il comando da li'. Se la definizione non e' chiara, NON si scrive niente e si mostra cosa e' stato trovato.
+FSV_CAPABILITY = "samsungce.ehsFsvSettings"
+
+
+def _definizione_fsv(app, sv):
+    """La definizione della funzione FSV secondo SmartThings: dict. Si tiene in cache 24 ore."""
+    grezzo = app.db.meta_get("fsv_definizione")
+    ts = float(app.db.meta_get("fsv_definizione_ts", 0) or 0)
+    if grezzo and time.time() - ts < 86400:
+        try:
+            return json.loads(grezzo)
+        except ValueError:
+            pass
+    d = sv._get(f"/capabilities/{FSV_CAPABILITY}/1")
+    app.db.meta_set("fsv_definizione", json.dumps(d, ensure_ascii=False))
+    app.db.meta_set("fsv_definizione_ts", int(time.time()))
+    return d
+
+
+def _tipo(schema):
+    return (schema or {}).get("type") if isinstance(schema, dict) else None
+
+
+def _numero_per(schema, n):
+    return int(n) if _tipo(schema) == "integer" else n
+
+
+def costruisci_comando_fsv(defn, codice, valore):
+    """-> {'component','capability','command','arguments'}. Alza ErroreAPI (con la definizione) se non si capisce."""
+    cmds = defn.get("commands") if isinstance(defn, dict) else None
+    riassunto = json.dumps(cmds, ensure_ascii=False)[:700] if cmds else "nessun comando"
+
+    def non_capisco(perche):
+        return ErroreAPI("richiesta", 0, f"{perche} Non scrivo niente. Definizione trovata: {riassunto}")
+
+    if not isinstance(cmds, dict) or not cmds:
+        raise non_capisco("SmartThings non indica nessun comando per le impostazioni installatore.")
+    scelto = next((n for n in ("setFsvSettings", "setFsvSetting", "setFsvValue", "setValue") if n in cmds), None)
+    if not scelto:
+        c = [n for n in cmds if "fsv" in n.lower()] or [n for n in cmds if n.lower().startswith("set")]
+        if len(c) == 1:
+            scelto = c[0]
+    if not scelto:
+        raise non_capisco("Non so quale comando serve (ce ne sono diversi).")
+    args = cmds[scelto].get("arguments") or []
+    if len(args) == 1:
+        schema = args[0].get("schema") or {}
+        t = _tipo(schema)
+        elemento = schema.get("items") if t == "array" else schema if t == "object" else None
+        props = (elemento or {}).get("properties") if isinstance(elemento, dict) else None
+        if not isinstance(props, dict) or not props:
+            raise non_capisco("Il formato dell'argomento non e' quello che mi aspetto.")
+        oggetto = {}
+        for nome, sch in props.items():
+            low = nome.lower()
+            if low == "id" or low.endswith("id"):
+                oggetto[nome] = int(codice) if _tipo(sch) == "integer" else str(codice)
+            elif "value" in low and "min" not in low and "max" not in low:
+                oggetto[nome] = _numero_per(sch, valore)
+            elif nome in (elemento.get("required") or []):
+                raise non_capisco(f"Il comando richiede anche '{nome}', che non so cosa sia.")
+        if len(oggetto) < 2:
+            raise non_capisco("Non trovo dove mettere codice e valore.")
+        argomenti = [[oggetto] if t == "array" else oggetto]
+    elif len(args) == 2:
+        argomenti = []
+        for a in args:
+            low = str(a.get("name", "")).lower()
+            if low == "id" or low.endswith("id"):
+                argomenti.append(int(codice) if _tipo(a.get("schema")) == "integer" else str(codice))
+            elif "value" in low:
+                argomenti.append(_numero_per(a.get("schema"), valore))
+            else:
+                raise non_capisco(f"Argomento '{a.get('name')}' sconosciuto.")
+    else:
+        raise non_capisco("Il numero di argomenti non e' quello che mi aspetto.")
+    return {"component": "main", "capability": FSV_CAPABILITY, "command": scelto, "arguments": argomenti}
+
+
+def _registra_fsv(app, codice, prima, dopo, ip, esito):
+    _scrivi_stato(app, f"fsvmod.{codice}", f"{prima}|{dopo}|{ip}|{_esito_txt(esito)}")
+    log.info("FSV dal pannello: %s %s -> %s da %s (%s)", codice, prima, dopo, ip, esito)
+
+
+def _posta_st(app, dev, comando):
+    corpo = json.dumps({"commands": [comando]}).encode()
+    for tentativo in (1, 2):
+        token = app.token_st.get()
+        code, js = http_json("POST", f"{ST_API}/devices/{dev}/commands",
+                             {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                              "Accept": "application/json"}, corpo)
+        if code == 401 and tentativo == 1 and not app.token_st.usa_pat():
+            app.token_st.invalida()
+            continue
+        break
+    if code in (401, 403):
+        raise ErroreAPI("auth", code, "Il token SmartThings non ha il permesso di COMANDO (serve lo scope x:devices:*).")
+    if code >= 400:
+        raise classifica("SmartThings", code, js)
+    esiti = [str(r.get("status", "")).upper() for r in (js.get("results") or []) if isinstance(r, dict)]
+    if esiti and not any(e in ("ACCEPTED", "COMPLETED") for e in esiti):
+        raise ErroreAPI("richiesta", code, "SmartThings ha rifiutato il comando (" + ", ".join(esiti) + ").")
+
+
+def modifica_fsv(app, codice, valore, ip):
+    """Cambia UNA impostazione installatore: -> {'ok': bool, 'errore'?, 'prima'?, 'dopo'?}. Il valore va letto di nuovo
+    dalla pompa: SmartThings puo' metterci un po' ad aggiornarlo, e finche' non lo fa la scheda dice 'in attesa'."""
+    codice = str(codice or "").strip()
+    n, err = fsv_valore_valido(codice, valore)
+    if err:
+        return {"ok": False, "errore": err}
+    ult = app.db.ultimi_dict()
+    r = ult.get("fsv." + codice)
+    if not r:
+        return {"ok": False, "errore": "La pompa non ha comunicato questo codice: non lo modifico."}
+    prima = r[3] if r[3] not in (None, "") else (_num_it(r[2]) if r[2] is not None else "")
+    if _fsv_numero(prima) == n:
+        return {"ok": False, "errore": "E' gia' a questo valore."}
+    if app.demo:   # nella demo il valore cambia davvero nel database finto, cosi' si vede tutto il giro
+        t = int(time.time())
+        with closing(app.db._c()) as c, c:
+            c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", (f"fsv.{codice}", t, str(n)))
+            c.execute("INSERT INTO ultimo(serie,ts,num,txt) VALUES(?,?,NULL,?) ON CONFLICT(serie) DO UPDATE SET "
+                      "ts=excluded.ts, txt=excluded.txt", (f"fsv.{codice}", t, str(n)))
+        _registra_fsv(app, codice, prima, str(n), ip, "inviato (demo)")
+        return {"ok": True, "demo": True, "prima": prima, "dopo": str(n)}
+    if _troppo_presto("fsv", 5):
+        return {"ok": False, "errore": "Un attimo: la modifica precedente e' appena partita."}
+    try:
+        sv, dev = _dispositivo_st(app)
+        comando = costruisci_comando_fsv(_definizione_fsv(app, sv), codice, n)
+        _posta_st(app, dev, comando)
+    except ErroreAPI as e:
+        _registra_fsv_rifiutata(app, codice, prima, n, ip, e.messaggio)
+        return {"ok": False, "errore": e.messaggio}
+    except ErroreConfig as e:
+        _registra_fsv_rifiutata(app, codice, prima, n, ip, str(e))
+        return {"ok": False, "errore": str(e)}
+    _registra_fsv(app, codice, prima, str(n), ip, f"inviato ({comando['command']})")
+    sv.ult_info = 0
+    _sveglia_tra(sv, 4, 20, 60, 180, 600)
+    return {"ok": True, "prima": prima, "dopo": str(n)}
+
+
+def _registra_fsv_rifiutata(app, codice, prima, n, ip, motivo):
+    """Una modifica non riuscita non e' una modifica: va solo nel registro dei comandi, come gli altri tentativi."""
+    _scrivi_stato(app, f"cmd.fsv{codice}", f"{codice}: {prima} -> {n}|{ip}|non riuscito: {_esito_txt(motivo)}")
+    log.info("FSV dal pannello non riuscito: %s %s -> %s (%s)", codice, prima, n, motivo)
+
+
+SOLO_CASA = "Questa modifica si fa solo da casa, collegato alla rete locale (non da fuori)."
+
+
+def _fuori_casa(gestore, cosa):
+    """True (e lo scrive nel log) se la richiesta non viene dalla rete di casa."""
+    if gestore is not None and not da_casa(gestore):
+        log.warning("modifica '%s' rifiutata: richiesta da fuori casa (%s)", cosa, ip_client(gestore))
+        return True
+    return False
+
+
+@api_post("/api/fsv")
+def api_fsv(app, corpo, gestore):
+    if _fuori_casa(gestore, "fsv"):
+        return {"ok": False, "errore": SOLO_CASA}
+    return modifica_fsv(app, corpo.get("codice"), corpo.get("valore"), ip_client(gestore))
+
+
+# --------------------------------------------------------------------------
+# Modifica di temperatura/modo dell'acqua calda e del modo della pompa
+# --------------------------------------------------------------------------
+
+
+def valida_regolazione(app, cosa, valore, ult):
+    """-> (valore pulito, errore)"""
+    d = REGOLAZIONI.get(cosa)
+    if not d:
+        return None, "Regolazione sconosciuta."
+    if cosa in REG_MODI:
+        v = str(valore or "").strip()
+        if v not in [k for k, _, _ in REG_MODI[cosa]]:
+            return None, "Modo non previsto per questa pompa."
+        return v, None
+    try:
+        n = float(str(valore).replace(",", "."))
+    except (TypeError, ValueError):
+        return None, "Il valore non e' un numero."
+    lo, hi = reg_limiti_acs(ult)
+    if n != int(n):
+        return None, "La temperatura va a gradi interi."
+    n = int(n)
+    if not (lo <= n <= hi):
+        return None, f"Fuori dai limiti della pompa (da {lo} a {hi} °C)."
+    return n, None
+
+
+def _registra_reg(app, cosa, prima, dopo, ip, esito):
+    _scrivi_stato(app, f"regmod.{cosa}", f"{prima}|{dopo}|{ip}|{_esito_txt(esito)}")
+    log.info("regolazione dal pannello: %s %s -> %s da %s (%s)", cosa, prima, dopo, ip, esito)
+
+
+def _registra_reg_rifiutata(app, cosa, prima, dopo, ip, motivo):
+    nome = REGOLAZIONI[cosa]["nome"]
+    _scrivi_stato(app, f"cmd.reg{cosa}", f"{nome}: {reg_testo(cosa, prima)} -> {reg_testo(cosa, dopo)}|{ip}|non riuscito: {_esito_txt(motivo)}")
+    log.info("regolazione dal pannello non riuscita: %s %s -> %s (%s)", cosa, prima, dopo, motivo)
+
+
+def modifica_regolazione(app, cosa, valore, ip):
+    """Cambia UNA regolazione: -> {'ok': bool, 'errore'?}. Come per gli FSV, il valore va riletto dalla pompa."""
+    ult = app.db.ultimi_dict()
+    v, err = valida_regolazione(app, cosa, valore, ult)
+    if err:
+        return {"ok": False, "errore": err}
+    d = REGOLAZIONI[cosa]
+    r = ult.get(d["serie"])
+    prima = (r[2] if d["tipo"] == "num" else r[3]) if r else None
+    if prima is None:
+        return {"ok": False, "errore": "La pompa non ha ancora comunicato il valore di adesso: non modifico."}
+    if _reg_uguali(cosa, prima, v):
+        return {"ok": False, "errore": "E' gia' a questo valore."}
+    if app.demo:
+        t = int(time.time())
+        rec = Rec()
+        if d["tipo"] == "num":
+            rec.num.append((d["serie"], t, float(v), True))
+        else:
+            rec.stati[d["serie"]] = str(v)
+        app.db.salva(rec, t)
+        _registra_reg(app, cosa, prima, v, ip, "inviato (demo)")
+        return {"ok": True, "demo": True}
+    if _troppo_presto("reg", 3):
+        return {"ok": False, "errore": "Un attimo: la modifica precedente e' appena partita."}
+    try:
+        sv, dev = _dispositivo_st(app)
+        _posta_st(app, dev, {"component": d["comp"], "capability": d["cap"], "command": d["cmd"],
+                             "arguments": [v]})
+    except ErroreAPI as e:
+        _registra_reg_rifiutata(app, cosa, prima, v, ip, e.messaggio)
+        return {"ok": False, "errore": e.messaggio}
+    except ErroreConfig as e:
+        _registra_reg_rifiutata(app, cosa, prima, v, ip, str(e))
+        return {"ok": False, "errore": str(e)}
+    _registra_reg(app, cosa, prima, v, ip, f"inviato ({d['cmd']})")
+    sv.ult_info = 0
+    _sveglia_tra(sv, 4, 20, 60, 180)
+    return {"ok": True}
+
+
+@api_post("/api/regolazioni")
+def api_regolazioni(app, corpo, gestore):
+    if _fuori_casa(gestore, str(corpo.get("cosa"))):
+        return {"ok": False, "errore": SOLO_CASA}
+    return modifica_regolazione(app, corpo.get("cosa"), corpo.get("valore"), ip_client(gestore))
+
+
+# --------------------------------------------------------------------------
+# Boost acqua calda: come Dwellsee. Setpoint piu' alto, POI modo "force"; alla fine modo e setpoint di prima.
+# Lo stato sta nel database (stati 'boost.attivo'), cosi' il ripristino riparte anche dopo un riavvio.
+# --------------------------------------------------------------------------
+BOOST_MAX_S = 7200          # dopo 2 ore si ripristina comunque
+BOOST_PREDEFINITO = 50
+BOOST_PAUSA_S = 20          # ogni quanto il pannello controlla se il boost e' finito
+_boost_thread = [None]
+_boost_lock = threading.Lock()
+
+
+def _boost_leggi(app):
+    with closing(app.db._c()) as c:
+        r = c.execute("SELECT valore FROM stati WHERE serie='boost.attivo' ORDER BY ts DESC LIMIT 1").fetchone()
+    try:
+        d = json.loads(r[0]) if r and r[0] else None
+    except ValueError:
+        d = None
+    return d or None
+
+
+def _boost_scrivi(app, d):
+    with closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM stati WHERE serie='boost.attivo'")      # la chiave e' (serie, ts): si tiene una riga sola
+        c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", ("boost.attivo", int(time.time()), json.dumps(d) if d else ""))
+
+
+def _boost_manda(app, sv, dev, cosa, v):
+    """Un comando del boost (setpoint o modo). In demo scrive il valore nel database."""
+    d = REGOLAZIONI[cosa]
+    if app.demo:
+        t = int(time.time())
+        rec = Rec()
+        if d["tipo"] == "num":
+            rec.num.append((d["serie"], t, float(v), True))
+        else:
+            rec.stati[d["serie"]] = str(v)
+        app.db.salva(rec, t)
+        return
+    _posta_st(app, dev, {"component": d["comp"], "capability": d["cap"], "command": d["cmd"], "arguments": [v]})
+
+
+def _dispositivo_st(app):
+    if app.demo:
+        return None, None
+    sv = _servizio(app, "st")
+    dev = app.cfg.leggi()["smartthings"].get("device_id") or (sv._trova_device() if sv else None)
+    if not dev or not sv:
+        raise ErroreAPI("richiesta", 0, "SmartThings: non trovo la pompa di calore.")
+    return sv, dev
+
+
+def _boost_rileggi(app, sv):
+    if sv is None:
+        return
+    sv.ult_info = 0
+    _sveglia_tra(sv, 4, 20, 60)
+
+
+def _boost_ripristina(app, motivo, ip="pannello"):
+    """Rimette modo e setpoint di prima (nell'ordine di Dwellsee: modo, poi setpoint). -> (ok, errore)"""
+    with _boost_lock:
+        b = _boost_leggi(app)
+        if not b:
+            return True, None
+        try:
+            sv, dev = _dispositivo_st(app)
+            ora_sp = app.db.ultimi_dict().get("acs.setpoint")
+            if b.get("modo_prima"):
+                _boost_manda(app, sv, dev, "acs_modo", b["modo_prima"])
+                _registra_reg(app, "acs_modo", "force", b["modo_prima"], ip, f"inviato (fine boost: {motivo})")
+            if b.get("sp_prima") is not None:
+                _boost_manda(app, sv, dev, "acs_setpoint", int(b["sp_prima"]))
+                _registra_reg(app, "acs_setpoint", ora_sp[2] if ora_sp else "", int(b["sp_prima"]), ip,
+                              f"inviato (fine boost: {motivo})")
+        except (ErroreAPI, ErroreConfig) as e:
+            msg = getattr(e, "messaggio", None) or str(e)
+            b["errore"] = f"Ripristino non riuscito ({msg}). Riprovo da solo."
+            b["tentativi"] = int(b.get("tentativi", 0)) + 1
+            _boost_scrivi(app, b)
+            log.warning("boost: ripristino fallito: %s", msg)
+            return False, msg
+        _boost_scrivi(app, None)
+        log.info("boost finito (%s): modo %s, setpoint %s", motivo, b.get("modo_prima"), b.get("sp_prima"))
+        _boost_rileggi(app, sv)
+        return True, None
+
+
+def _boost_thread_finito(app):
+    """True (e libera il posto) solo se non c'e' piu' nessun boost: cosi' un boost nuovo non resta senza controllo."""
+    with _boost_lock:
+        if _boost_leggi(app) is None:
+            _boost_thread[0] = None
+            return True
+    return False
+
+
+def _boost_vigila(app):
+    while True:
+        time.sleep(BOOST_PAUSA_S)
+        b = _boost_leggi(app)
+        if not b:
+            if _boost_thread_finito(app):
+                return
+            continue
+        ora = time.time()
+        t = app.db.ultimi_dict().get("acs.temperatura")
+        motivo = None
+        if ora >= b["scade"]:
+            motivo = "tempo massimo"
+        elif t and t[2] is not None and ora - b["inizio"] > 120 and ora - t[1] < 900 and t[2] >= b["obiettivo"]:
+            motivo = f"acqua a {t[2]:g} °C"
+        if motivo:
+            ok, _ = _boost_ripristina(app, motivo)
+            if not ok and int(b.get("tentativi", 0)) >= 30:
+                _boost_scrivi(app, None)          # dopo troppi tentativi si rinuncia (resta il registro dei comandi)
+            if _boost_thread_finito(app):
+                return
+
+
+def boost_riprendi(app):
+    """Se c'e' un boost in corso e nessuno lo controlla (dopo un riavvio), riprende a controllarlo."""
+    if not _boost_leggi(app):
+        return
+    with _boost_lock:
+        if _boost_thread[0] and _boost_thread[0].is_alive():
+            return
+        th = threading.Thread(target=_boost_vigila, args=(app,), daemon=True, name="boost")
+        _boost_thread[0] = th
+        th.start()
+
+
+def boost_dati(app, ult, adesso):
+    b = _boost_leggi(app)
+    if not b:
+        return {"attivo": False, "massimo_min": BOOST_MAX_S // 60, "predefinito": BOOST_PREDEFINITO}
+    t = ult.get("acs.temperatura")
+    return {"attivo": True, "inizio": b["inizio"], "scade": b["scade"], "obiettivo": b["obiettivo"],
+            "sp_prima": b.get("sp_prima"), "modo_prima": b.get("modo_prima"), "errore": b.get("errore"),
+            "temperatura": t[2] if t else None, "massimo_min": BOOST_MAX_S // 60, "predefinito": BOOST_PREDEFINITO}
+
+
+def boost_avvia(app, obiettivo, ip):
+    ult = app.db.ultimi_dict()
+    if _boost_leggi(app):
+        return {"ok": False, "errore": "C'e' gia' un boost in corso."}
+    try:
+        n = float(str(obiettivo).replace(",", "."))
+    except (TypeError, ValueError):
+        return {"ok": False, "errore": "La temperatura non e' un numero."}
+    lo, hi = reg_limiti_acs(ult)
+    if n != int(n) or not (lo <= n <= hi):
+        return {"ok": False, "errore": f"La temperatura va a gradi interi, da {lo} a {hi} °C."}
+    n = int(n)
+    sp, modo, temp = ult.get("acs.setpoint"), ult.get("pdc.modo"), ult.get("acs.temperatura")
+    if not sp or sp[2] is None or not modo or not modo[3]:
+        return {"ok": False, "errore": "La pompa non ha ancora comunicato setpoint e modo di adesso: non parto."}
+    if temp and temp[2] is not None and temp[2] >= n:
+        return {"ok": False, "errore": f"L'acqua e' gia' a {temp[2]:g} °C: il boost non serve."}
+    if _troppo_presto("reg", 3):
+        return {"ok": False, "errore": "Un attimo: la modifica precedente e' appena partita."}
+    prima_sp, prima_modo = int(sp[2]), str(modo[3])
+    try:
+        sv, dev = _dispositivo_st(app)
+        if n != prima_sp:
+            _boost_manda(app, sv, dev, "acs_setpoint", n)       # prima il setpoint...
+            _registra_reg(app, "acs_setpoint", prima_sp, n, ip, "inviato (boost)")
+        try:
+            _boost_manda(app, sv, dev, "acs_modo", "force")     # ...poi il modo, come Dwellsee
+        except (ErroreAPI, ErroreConfig):
+            if n != prima_sp:                                    # il boost non e' partito: rimette il setpoint
+                try:
+                    _boost_manda(app, sv, dev, "acs_setpoint", prima_sp)
+                except (ErroreAPI, ErroreConfig):
+                    log.warning("boost: setpoint non rimesso dopo il rifiuto del modo")
+            raise
+    except ErroreAPI as e:
+        _registra_reg_rifiutata(app, "acs_modo", prima_modo, "force", ip, e.messaggio)
+        return {"ok": False, "errore": e.messaggio}
+    except ErroreConfig as e:
+        _registra_reg_rifiutata(app, "acs_modo", prima_modo, "force", ip, str(e))
+        return {"ok": False, "errore": str(e)}
+    _registra_reg(app, "acs_modo", prima_modo, "force", ip, "inviato (boost)")
+    t = int(time.time())
+    _boost_scrivi(app, {"inizio": t, "scade": t + BOOST_MAX_S, "obiettivo": n, "sp_prima": prima_sp,
+                        "modo_prima": prima_modo, "ip": ip})
+    log.info("boost avviato da %s: obiettivo %s, prima modo %s setpoint %s", ip, n, prima_modo, prima_sp)
+    _boost_rileggi(app, sv)
+    boost_riprendi(app)
+    return {"ok": True}
+
+
+@api_post("/api/boost")
+def api_boost(app, corpo, gestore):
+    if _fuori_casa(gestore, "boost"):
+        return {"ok": False, "errore": SOLO_CASA}
+    ip = ip_client(gestore)
+    if corpo.get("azione") == "ferma":
+        if not _boost_leggi(app):
+            return {"ok": False, "errore": "Non c'e' nessun boost in corso."}
+        ok, err = _boost_ripristina(app, "fermato a mano", ip)
+        return {"ok": ok, "errore": None if ok else f"Ripristino non riuscito: {err}. Il pannello riprova da solo."}
+    return boost_avvia(app, corpo.get("obiettivo"), ip)
 #@@PARTE plugin@@
 
 # ==========================================================================
@@ -9283,6 +10771,11 @@ def _impronte_correnti():
 PARTI_CARICATE = _impronte_correnti()    # com'era il file quando e' partito il pannello
 
 
+def _parti_cambiate(parti):
+    """Nomi delle parti del file su disco diverse da quelle caricate all'avvio."""
+    return [n for n, (s, _) in parti.items() if _impronta(n, s) != PARTI_CARICATE.get(n)]
+
+
 def stato_aggiornamento():
     """{'stato': aggiornato|applicabile|riavvio|errore, 'parti': [...], 'versione_disco', 'versione'}"""
     out = {"versione": VERSIONE, "versione_disco": VERSIONE, "parti": [], "stato": "aggiornato"}
@@ -9294,7 +10787,7 @@ def stato_aggiornamento():
     out["versione_disco"] = m.group(1) if m else VERSIONE
     if not PARTI_CARICATE or "nucleo" not in parti:
         return dict(out, stato="riavvio", parti=[], messaggio="Non riesco a confrontare il file con quello in uso: riavvia il pannello.")
-    cambiate = [n for n, (s, _) in parti.items() if _impronta(n, s) != PARTI_CARICATE.get(n)]
+    cambiate = _parti_cambiate(parti)
     out["parti"] = [{"nome": n, "titolo": NOMI_PARTI.get(n, n), "a_caldo": n in RICARICABILI} for n in cambiate]
     if any(n not in RICARICABILI for n in cambiate):
         out["stato"] = "riavvio"
@@ -9315,7 +10808,7 @@ def applica_aggiornamento(app):
             return {"ok": False, "messaggio": f"Non riesco a leggere il file del pannello ({e})."}
         if not PARTI_CARICATE or "nucleo" not in parti:
             return {"ok": False, "messaggio": "Non riesco a confrontare il file con quello in uso: serve il riavvio completo."}
-        cambiate = [n for n, (s, _) in parti.items() if _impronta(n, s) != PARTI_CARICATE.get(n)]
+        cambiate = _parti_cambiate(parti)
         fissi = [n for n in cambiate if n not in RICARICABILI]
         if fissi:
             return {"ok": False, "riavvio": True, "messaggio": "Per questa versione serve il riavvio completo (cambiato: "
@@ -9349,7 +10842,7 @@ def applica_aggiornamento(app):
             return {"ok": False, "messaggio": f"Il codice nuovo si e' fermato per un errore ({type(e).__name__}: {e}). "
                     "Ho rimesso quello di prima."}
         # l'impronta delle pagine (la stessa formula della parte web) dipende anche dal numero di versione
-        g["BUILD"] = hashlib.sha256((g["VERSIONE"] + "".join(g["WEB_ASSETS"][k] for k in sorted(g["WEB_ASSETS"]))).encode("utf-8")).hexdigest()[:8]
+        g["BUILD"] = g["_calcola_build"](g["VERSIONE"], g["WEB_ASSETS"])
         for n in cambiate:
             PARTI_CARICATE[n] = _impronta(n, parti[n][0])
         if "plugin" in cambiate and "plugin_ricarica" in g:      # il caricatore e' nuovo: rilegge la cartella plugin
@@ -9459,8 +10952,8 @@ def cmd_imposta_password(app):
         p2 = getpass.getpass("Ripeti la password: ")
         if p1 != p2:
             print("Le due password non coincidono, riprova.")
-        elif len(p1) < 10:
-            print("Troppo corta: servono almeno 10 caratteri (il pannello potra' essere visibile da internet).")
+        elif len(p1) < PASSWORD_MIN:
+            print(f"Troppo corta: servono almeno {PASSWORD_MIN} caratteri (il pannello potra' essere visibile da internet).")
         else:
             break
     h = hash_password(p1)
@@ -9520,19 +11013,7 @@ def main(argv=None, base=AQUI):
               "Aprilo con il Blocco note, compila almeno la sezione smartthings (e netatmo), poi rilancia.")
         if not a.demo:
             return 0
-    avvisi_riordino = []
-    if not a.demo:
-        try:
-            rc, avvisi_riordino = riordina_cartelle(base, cfg)
-        except Exception as e:      # il riordino non deve mai impedire di partire per un imprevisto
-            rc, avvisi_riordino = 0, [f"Riordino cartelle saltato: {e}"]
-        if rc:
-            for r in avvisi_riordino:
-                print("ATTENZIONE:", r)
-            return 1
     imposta_log(base)
-    for r in avvisi_riordino:
-        log.info(r)
     if not a.demo:
         try:
             if cfg.completa():
@@ -9602,6 +11083,7 @@ def main(argv=None, base=AQUI):
         else:
             avvia_telegram_e_sentinella(app)
             avvia_manutenzione(app)
+            esterni_assicura(app)
             app.avvia()
         try:
             srv, _ = avvia_web(app, a.host, a.porta)
@@ -9618,6 +11100,10 @@ def main(argv=None, base=AQUI):
                 log.info("Plugin trovati: %d", n_plugin)
         except Exception:
             log.exception("caricamento dei plugin fallito (il pannello parte lo stesso)")
+        try:
+            boost_riprendi(app)
+        except Exception:
+            log.exception("boost: ripresa dopo il riavvio")
         porta = srv.server_address[1]
         log.info("Interfaccia web attiva sulla porta %s", porta)
         print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))

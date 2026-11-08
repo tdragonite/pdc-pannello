@@ -5,6 +5,8 @@ const INDIRIZZO = "INCOLLA-QUI-L-INDIRIZZO";
 const TOKEN = "INCOLLA-QUI-IL-TOKEN";
 // (L'indirizzo si ricorda da solo: nelle versioni future dello script puoi lasciare il testo qui sopra com'e'.)
 const CHIAVE = "pdc_widget_indirizzo";
+// Nome del Comando rapido (app Comandi) con l'unica azione Scriptable «Refresh All Widgets»: serve al tocco sull'ora in basso a destra.
+const COMANDO_AGGIORNA = "Aggiorna widget";
 let ind = INDIRIZZO, tok = TOKEN;
 try {
   if (tok === "INCOLLA-QUI-IL-TOKEN") { if (Keychain.contains("pdc_widget_token")) tok = Keychain.get("pdc_widget_token"); }
@@ -157,6 +159,7 @@ function costruisci({d, vecchio}) {
   const gN = scegli([12, 11.5, 11], g => [[nota, g, "regular"]], COL_DX);
   const piede = dx.addStack(); piede.setPadding(3, 0, 3, 0);            // stesse spaziature verticali del riquadro a sinistra: i due testi stanno sulla stessa linea
   testo(piede, nota, gN, "regular", vecchio || d.piede.tipo === "warn" ? new Color("#ffc873") : C.grigio2);
+  try { piede.url = "shortcuts://run-shortcut?name=" + encodeURIComponent(COMANDO_AGGIORNA); } catch (e) {}   // toccando l'ora dell'aggiornamento parte il comando rapido che ricarica i widget (il resto del widget apre il pannello)
   return w;
 }
 

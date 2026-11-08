@@ -53,8 +53,8 @@ MESSAGGI_DEFAULT = {
                  "🔥 Riscaldamento {ore_casa} h · 🚿 Acqua calda {ore_acs} h ({cicli} cicli)\n"
                  "🏠 In casa {casa_min}–{casa_max} °C · fuori {esterna} °C\n{anomalie}",
     "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
-    "sbrinamento_inizio": "🧊 <b>PdC in sbrinamento</b> — esterna {esterna}, dalle {ora}.",
-    "sbrinamento_fine": "✅ <b>Sbrinamento finito</b> dopo {durata}, {consumo}.",
+    "sbrinamento_inizio": "🧊 <b>{impianto}</b>\nSbrinamento iniziato: esterna {esterna}\n<i>dalle {ora}</i>",
+    "sbrinamento_fine": "✅ <b>{impianto}</b>\nSbrinamento finito\n<i>dopo {durata}, {consumo}</i>",
     "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
     "per_codice": {},
 }
@@ -70,7 +70,8 @@ ALLARMI_DEFAULT = {
     "umidita_molto_alta": {"attivo": True},
     "cicli_brevi": {"attivo": True, "durata_minima_min": 10, "quanti": 4, "ore": 3},
     "portata_bassa": {"attivo": True, "sotto_lmin": 6.0, "minuti": 15},
-    "mandata_lontana": {"attivo": True, "scarto_gradi": 8.0, "minuti": 40},
+    # sopra la curva la PdC ci sta spesso (il compressore resta a bassa frequenza: mediana +8 °C sui dati reali), sotto e' raro e vero
+    "mandata_lontana": {"attivo": True, "scarto_sopra_gradi": 12.0, "scarto_gradi": 8.0, "minuti": 40},
     "acs_bassa": {"attivo": True, "sotto_gradi": 35.0, "minuti": 30},
     "cop_basso": {"attivo": True, "sotto": 2.0, "ore_minime": 3},
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
@@ -451,7 +452,7 @@ class Sentinella(threading.Thread):
         app, ora = self.app, int(time.time())
         al = app.cfg.leggi()["allarmi"]
         db = app.db
-        ult = {r[0]: r for r in db.ultimi()}
+        ult = db.ultimi_dict()
 
         def num(s, max_eta=900):
             r = ult.get(s)
@@ -530,11 +531,14 @@ class Sentinella(threading.Thread):
             att = curva["ora"]["mandata"] if curva else None
             man = num("ciclo.mandata", 900)
             in_casa = self.durata("casa_run", modo == "casa", ora) >= 20
-            fuori = in_casa and att is not None and man is not None and abs(man - att) > float(r["scarto_gradi"])
+            sotto = float(r["scarto_gradi"])
+            sopra = float(r.get("scarto_sopra_gradi", sotto))
+            lim = sopra if (man is not None and att is not None and man > att) else sotto
+            fuori = in_casa and att is not None and man is not None and abs(man - att) > lim
             m = self.durata("mandata", fuori, ora)
             self.imposta("mandata_lontana", m >= float(r["minuti"]),
                          f"La mandata è {num_it(man)} °C, la curva prevede {num_it(att)} °C (scarto oltre "
-                         f"{num_it(r['scarto_gradi'])} °C).")
+                         f"{num_it(lim)} °C).")
 
         if on("acs_bassa") and pdc_on:
             r = al["acs_bassa"]
@@ -572,7 +576,7 @@ class Sentinella(threading.Thread):
         non si riannuncia l'inizio, ma la fine si'. Non sono anomalie: niente eventi, niente promemoria."""
         db, tg = self.app.db, self.app.telegram
         ora = int(time.time())
-        r = {x[0]: x for x in db.ultimi()}.get("pdc.sbrinamento")
+        r = db.ultimi_dict().get("pdc.sbrinamento")
         primo, self.sbr_primo = self.sbr_primo, False
         if not r or r[3] not in ("on", "off") or ora - r[1] > 900:
             return
@@ -588,7 +592,7 @@ class Sentinella(threading.Thread):
             inizio = on_ts[-1] if on_ts else ora
             db.meta_set("tg_sbr_inizio", str(inizio))
             if not primo and tg.allarme_attivo("sbrinamento_inizio"):
-                est = {x[0]: x for x in db.ultimi()}.get("ciclo.esterna")
+                est = db.ultimi_dict().get("ciclo.esterna")
                 est_t = f"{num_it(est[2], 0)} °C" if est and est[2] is not None and ora - est[1] <= 1800 else "n.d."
                 tg.accoda("sbrinamento_inizio", "sbrinamento_inizio", "info", "", extra={"esterna": est_t,
                           "ora": time.strftime("%H:%M", time.localtime(inizio))}, muto=True)
@@ -614,7 +618,7 @@ class Sentinella(threading.Thread):
         except (ValueError, KeyError):
             return None
         lt = time.localtime(ora)
-        g0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+        g0 = _ore_locali(lt)
         fine = g0 + a * 60
         inizio = (g0 if da < a else g0 - 86400) + da * 60
         if ora < fine:  # riepilogo prima della fine del silenzio: si racconta la notte fino a ora
@@ -643,7 +647,7 @@ class Sentinella(threading.Thread):
         hm = lambda x: time.strftime("%H:%M", time.localtime(x))
         for ts, cod, liv, testo, chiuso in reversed(db.eventi_recenti(100)):
             if ini <= ts < fin:
-                fino = f"alle {hm(chiuso)}" if chiuso and chiuso < fin else ("ancora aperto" if not chiuso else f"alle {hm(chiuso)}")
+                fino = f"alle {hm(chiuso)}" if chiuso else "ancora aperto"
                 righe.append(f"⚠️ {esc_html(TITOLI.get(cod, cod))}: dalle {hm(ts)} {fino}")
         return "\n".join(righe)
 
@@ -662,7 +666,7 @@ class Sentinella(threading.Thread):
         if self.app.db.meta_get("tg_riepilogo_giorno") == oggi:
             return
         self.app.db.meta_set("tg_riepilogo_giorno", oggi)
-        oggi0 = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+        oggi0 = _ore_locali(lt)
         ieri0 = oggi0 - 86400
         ora = int(time.time())
         tol = max(150, int(self.app.intervallo_pdc() * 1.5))

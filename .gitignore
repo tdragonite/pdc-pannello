@@ -1,0 +1,12 @@
+# Mai caricare: contengono password e token o i tuoi dati
+config.json
+dati/
+log/
+diagnostica/
+cloudflared/
+*.db
+*.db-wal
+*.db-shm
+*.log
+__pycache__/
+plugin/
