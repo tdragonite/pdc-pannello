@@ -63,7 +63,7 @@ def _comando_st(app, cosa, acceso):
         break
     if code in (401, 403):
         raise ErroreAPI("auth", code, "Il token SmartThings non ha il permesso di COMANDO (serve lo scope x:devices:*): "
-                                      "rigeneralo come spiegato nel README, paragrafo sui comandi.")
+                                      "rigeneralo come spiegato in docs/comandi-e-regolazioni.md.")
     if code >= 400:
         raise classifica("SmartThings", code, js)
     esiti = [str(r.get("status", "")).upper() for r in (js.get("results") or []) if isinstance(r, dict)]
@@ -114,7 +114,7 @@ def _prova_in_ordine(tentativi, verifica=None):
                 continue
         return nome + (" (scartati: " + " | ".join(risposte) + ")" if risposte else "")
     raise ErroreAPI("richiesta", 0, "Netatmo non ha eseguito il comando. " + " | ".join(risposte)
-                    + " (se compaiono 403/permessi: rigenera i token con write_smarther, vedi README)")
+                    + " (se compaiono 403/permessi: rigenera i token con write_smarther, vedi docs/comandi-e-regolazioni.md)")
 
 
 def _comando_nt(app, acceso):
