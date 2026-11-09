@@ -8,7 +8,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 
 ## Per cominciare
 
-1. Serve un PC che resta acceso (qui si parla di Windows) con **Python 3.9 o più recente** e un account SmartThings con la pompa dentro. Facoltativi: Netatmo (Smarther), un bot Telegram, un dominio Cloudflare.
+1. Serve un PC che resta acceso (qui si parla di Windows) con **Python 3.10 o più recente** e un account SmartThings con la pompa dentro. Facoltativi: Netatmo (Smarther), un bot Telegram, un dominio Cloudflare.
 2. Metti `pdc_pannello.py` e `pdc_strumenti.py` in una cartella, per esempio `C:\pdc`.
 3. Per provarlo subito con dati finti: `python pdc_pannello.py --demo --porta 7010`, poi apri `http://localhost:7010`.
 4. Per usarlo davvero, segui [docs/installazione.md](docs/installazione.md): collegare SmartThings e Netatmo, scegliere la password, avviarlo.

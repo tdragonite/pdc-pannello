@@ -2,7 +2,7 @@
 
 Questo piccolo script (`pdc_strumenti.py`) è l'attrezzo di appoggio del pannello. Serve a: **trovare l'ID della pompa** (`st-devices`), fare la **procedura guidata per il token SmartThings OAuth** che si rinnova da solo (`st-oauth`), **salvare i dati veri della pompa e dello Smarther** per diagnosticare problemi o capire cosa espongono i dispositivi (`st-dump`, `nt-dump`), vedere l'**elenco degli sbrinamenti** (`sbrinamenti`, capitolo 5), **provare i webhook di Netatmo** (`nt-webhook-prova`, capitolo 6), capire perché la **ripartenza prevista** c'è o non c'è (`rip-diag`, capitolo 7), **provare a leggere una stazione meteo vicina** (`meteo-prova`, capitolo 8), **raccogliere tutti i dati in un solo file per l'analisi** (`analisi`, capitolo 9), **vedere i comandi che la pompa espone** e **osservare cosa cambia mentre premi Boost o un programma** (`st-capacita` e `st-osserva`, capitolo 10) e fare qualche **esperimento** (`st-prova-refresh`, in fondo). Il pannello vero è `pdc_pannello.py`: guida completa in [README.md](../README.md) e nella cartella `docs/`.
 
-Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
+Non installa nulla e non ha dipendenze: serve solo Python 3.10 o più recente.
 
 ---
 
@@ -12,7 +12,7 @@ Non installa nulla e non ha dipendenze: serve solo Python 3.9 o più recente.
 2. Apri un terminale **dentro quella cartella**:
    - **Windows**: apri la cartella in Esplora risorse, tieni premuto *Maiusc* e fai clic destro su uno spazio vuoto → *Apri finestra PowerShell qui*.
    - **Mac**: tasto destro sulla cartella → *Nuovo Terminale nella cartella*.
-3. Controlla che Python ci sia: scrivi `python --version` (su Mac `python3 --version`). Deve comparire 3.9 o più.
+3. Controlla che Python ci sia: scrivi `python --version` (su Mac `python3 --version`). Deve comparire 3.10 o più.
    Nei comandi qui sotto uso `python`; su Mac scrivi `python3`.
 4. Lancia `python pdc_strumenti.py st-devices`. La prima volta crea un file **`config.json`** vuoto e si ferma. Apri `config.json` con il Blocco note: è l'unico file dove metterai le tue chiavi.
 
@@ -63,7 +63,7 @@ Nel terminale lancia `smartthings apps:create`. Al primo uso si apre il browser 
 Alla fine ti mostra **Client ID** e **Client Secret**. Il secret **si vede una volta sola**: copialo subito.
 
 ### 2c. Autorizza
-Lancia `python pdc_strumenti.py st-oauth`, incolla Client ID e Secret quando li chiede, apri l'indirizzo che ti stampa (**usa Chrome**: con Edge a volte dà errore), accedi con l'account Samsung e consenti. Finisci su una pagina semplice di testo con una riga `"code": "...."`: incolla quel codice (o tutta la pagina) nel terminale **subito**, perché dura poco.
+Lancia `python pdc_strumenti.py st-oauth`, incolla Client ID e Secret quando li chiede (il secret non si vede mentre lo incolli: è normale), apri l'indirizzo che ti stampa (**usa Chrome**: con Edge a volte dà errore), accedi con l'account Samsung e consenti. Finisci su una pagina semplice di testo con una riga `"code": "...."`: incolla quel codice (o tutta la pagina) nel terminale **subito**, perché dura poco.
 
 Se tutto va bene scrive i token in `config.json` e hai finito.
 
@@ -150,6 +150,7 @@ Note:
 - Se Ctrl+C o un errore lo interrompe, il comando prova comunque a rimuovere il webhook. Se restasse registrato: `python pdc_strumenti.py nt-webhook-prova --elimina`.
 - Usa il token Netatmo del pannello **senza rinnovarlo** (Netatmo cambia il refresh token a ogni rinnovo: farlo a pannello acceso lo romperebbe). Se il token sta per scadere ti dice di riprovare tra qualche minuto; con il pannello FERMO puoi usare `--rinnova`.
 - **`--metodo nuovo`**: registra con il servizio nuovo di Netatmo (`POST /webhooks/v1/`) invece di `/api/addwebhook`, e alla fine toglie con `DELETE /webhooks/v1/`. Parte solo se l'elenco dei webhook dell'account e' vuoto (il DELETE li toglie *tutti*). Se resta registrato: `python pdc_strumenti.py nt-webhook-prova --metodo nuovo --elimina`.
+- **`--sostituisci`**: con il metodo di partenza («vecchio»), se sull'account c'e' gia' un webhook registrato il comando si ferma per non toccarlo; con `--sostituisci` procede, lo sostituisce e poi lo toglie.
 - Servono `cloudflared` nella cartella `cloudflared` accanto allo script (c'e' gia' se il pannello usa il tunnel) e il `client_secret` Netatmo in `config.json`.
 - Se il tunnel temporaneo e' bloccato o Netatmo lo rifiuta, il comando lo dice: manda l'output a Claude.
 
@@ -186,6 +187,7 @@ python pdc_strumenti.py analisi                      ultimi 45 giorni, 1 giorno 
 python pdc_strumenti.py analisi --giorni 14          meno storico (file piu' piccolo)
 python pdc_strumenti.py analisi --grezzi 3           3 giorni di misure non mediate
 python pdc_strumenti.py analisi --ciclo 0            senza i campioni grezzi del ciclo (file piu' piccolo)
+python pdc_strumenti.py analisi --ricircolo-off "13:30-17:00,21:30-08:00" --ricircolo-dal "2026-11-05 14:30"   fasce a ricircolo spento e da quando valgono (all'avvio le stampa)
 ```
 
 Crea `diagnostica/analisi_AAAAMMGG_HHMM.json`. Dentro: impostazioni (FSV, dispositivi), qualita' dei dati e buchi, riepilogo per giorno, giornata tipica per ora, ogni ciclo dello Smarther (durata, quanto la casa sale oltre il target, isteresi vera), ogni avvio del compressore, profilo della PdC per temperatura esterna, curva climatica contro mandata misurata, efficienza, bollitore, sbrinamenti, ripartenza prevista, cambi di stato, allarmi, e tutte le serie mediate nel tempo (5 minuti gli ultimi 14 giorni, 30 minuti prima), più i byte grezzi del ciclo del compressore degli ultimi 7 giorni (`--ciclo`), che servono a cercare valori non ancora decodificati.

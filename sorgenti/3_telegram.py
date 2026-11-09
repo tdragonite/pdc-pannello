@@ -312,7 +312,8 @@ class Telegram:
                 self._togli(e)          # si e' risolto da solo durante il ritardo: nessun messaggio
                 continue
             if not self.attivo():
-                self._togli(e) if e["tentativi"] > 0 else None
+                if e["tentativi"] > 0 or adesso - e["due"] > 3600:     # a Telegram spento la coda non si accumula per sempre
+                    self._togli(e)
                 continue
             if not self._limite_ok(e["forza"]):
                 self._togli(e)
@@ -645,7 +646,7 @@ class Sentinella(threading.Thread):
             if v_max > soglie_umidita(self.app)[0]:
                 righe.append(f"💧 Umidità fino a {num_it(v_max, 0)} % (alle {time.strftime('%H:%M', time.localtime(ts_max))})")
         hm = lambda x: time.strftime("%H:%M", time.localtime(x))
-        for ts, cod, liv, testo, chiuso in reversed(db.eventi_recenti(100)):
+        for ts, cod, _liv, _testo, chiuso in reversed(db.eventi_recenti(100)):
             if ini <= ts < fin:
                 fino = f"alle {hm(chiuso)}" if chiuso else "ancora aperto"
                 righe.append(f"⚠️ {esc_html(TITOLI.get(cod, cod))}: dalle {hm(ts)} {fino}")

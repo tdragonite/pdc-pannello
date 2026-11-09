@@ -574,6 +574,8 @@ def fsv_valore_valido(cod, valore):
         n = float(str(valore).replace(",", "."))
     except (TypeError, ValueError):
         return None, "Il valore non e' un numero."
+    if not math.isfinite(n):
+        return None, "Il valore non e' un numero."
     if n != int(n):
         return None, "Queste impostazioni vanno a numeri interi."
     n = int(n)
@@ -596,7 +598,7 @@ def _cronologia_fsv(storia, richieste, nomi, unita, adesso):
                 continue
             ts, dopo, prima = st[i][0], st[i][1], st[i - 1][1]
             fonte, ip, chiesta = "letto", "", None
-            for k, (rts, rprima, rdopo, rip, _) in enumerate(richieste.get(cod, [])):
+            for k, (rts, _rprima, rdopo, rip, _) in enumerate(richieste.get(cod, [])):
                 if (cod, k) not in usate and rts <= ts <= rts + 172800 and _fsv_numero(rdopo) == _fsv_numero(dopo):
                     usate.add((cod, k))
                     fonte, ip, chiesta = "pannello", rip, rts

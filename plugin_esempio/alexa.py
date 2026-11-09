@@ -4,7 +4,7 @@
 #
 # SICUREZZA:
 #  0. (facoltativo, serve la libreria "cryptography") si puo' verificare la firma digitale di Amazon su ogni richiesta:
-#     campo «Verifica firma Amazon» = spenta / solo avviso / attiva. Senza la libreria resta tutto com'e' e lo stato lo dice.
+#     campo «Verifica firma Amazon» = spenta / solo avviso / attiva. Senza la libreria «spenta» e «solo avviso» lasciano passare tutto (lo stato lo dice), «attiva» rifiuta.
 #  1. l'indirizzo contiene un segreto casuale, generato al primo avvio: senza non si arriva a nulla (404);
 #  2. ogni richiesta deve venire dalla TUA skill (la prima volta se ne memorizza l'ID). L'ID utente Amazon NON si controlla:
 #     cambia ogni volta che la skill viene disattivata e riattivata, e una skill in sviluppo la vede comunque solo il tuo account;
@@ -25,12 +25,14 @@ from datetime import datetime, timezone
 
 INFO = {
     "titolo": "Alexa",
-    "versione": "1.4.0",
+    "versione": "1.4.1",
     "interfaccia": 1,
     "descrizione": "Skill personale per Alexa: risponde su temperatura e umidità (in casa e fuori), pompa di calore, acqua calda, mandata e ripartenza, "
                    "e accende o spegne lo Smarther. Si usa con le Routine di Alexa, senza pronunciare il nome della skill.",
 }
 CHANGELOG = [
+    {"v": "1.4.1", "data": "2026-11-09T23:45", "titolo": "Firma «Attiva» più severa", "righe": [
+        ["s", "Firma non verificabile", "Con «Attiva», se la firma non si può controllare (manca la libreria cryptography o i certificati di sistema) la richiesta ora viene rifiutata, invece di passare."]]},
     {"v": "1.4.0", "data": "2026-11-04T15:00", "titolo": "Temperatura e umidità di fuori", "righe": [
         ["n", "Due domande «fuori»", "Temperatura e umidità di fuori, nei due ordini. L’umidità viene dalla stazione meteo vicina (Impostazioni → Collegamenti)."],
         ["m", "Pompa di calore", "La risposta sulla pompa di calore dice anche l’umidità di fuori."],
@@ -503,6 +505,10 @@ def richiesta(rich):
             _locale.firma = " · firma Amazon valida"
         elif ok is None:
             _locale.firma = f" · firma non verificata ({motivo})"
+            if modo == "attiva":        # «Attiva» non lascia passare cio' che non si riesce a controllare
+                ctx.log.warning("firma Amazon non verificabile, richiesta rifiutata: %s", motivo)
+                _stato("rifiutata una richiesta: firma non verificabile")
+                return 403, {"errore": "non autorizzato"}
         else:
             _locale.firma = f" · firma NON valida ({motivo})"
             ctx.log.warning("firma Amazon non valida: %s", motivo)

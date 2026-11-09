@@ -53,6 +53,7 @@ Backup, aggiornamenti, cosa fare se qualcosa non va e cosa è bene sapere sulla 
 | Netatmo: token rifiutato | Rigenera i token dal portale con gli scope dello Smarther e incollali (i vecchi sono invalidati). |
 | Il COP o le “ore di funzionamento” sono strani | Controlla l'avviso giallo in Efficienza: se mancano dati di potenza o portata, il COP è parziale. |
 | Mancano i dati del ciclo (frequenza, portata…) | Si aggiornano solo mentre la pdc è in funzione: da ferma non ci sono punti nuovi. |
+| La portata (o il COP) è strana dal 5/11 pomeriggio | La pompa rimanda a volte lo stesso istante con la portata corrotta (17-24 l/min senza senso). Dalla 0.25.2 la portata si legge dai byte 6-7 insieme (16 bit, ÷10) e tutto sopra 60 l/min si scarta; il `config.json` si aggiorna da solo se non hai cambiato la vecchia regola. Per rimettere a posto lo storico, a pannello fermo: `python pdc_pannello.py backup`, poi `python pdc_pannello.py ridecodifica`. Le versioni diverse dello stesso istante si leggono in `dati\diag_versioni_ciclo.txt`. |
 | Il tunnel dice “non collegato” | Guarda `log\cloudflared.log`; prova `protocollo` = `http2`; controlla che il PC abbia internet; verifica che l'antivirus non blocchi `cloudflared.exe`. |
 | Telegram non arriva | `python pdc_pannello.py telegram-prova` dice il motivo. Hai scritto almeno un messaggio al bot? |
 | Non so cosa succede | Guarda `log\pdc_pannello.log`; se devi chiedere aiuto, `python pdc_pannello.py esporta-diagnostica` crea `diagnostica\diagnostica.json`, senza password né token. |

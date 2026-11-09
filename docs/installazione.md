@@ -5,7 +5,7 @@ Tutto quello che serve per far partire il pannello: Python, primo avvio, prova c
 ## Cosa serve
 
 - Un PC (qui si parla di **Windows**) che resta acceso: il pannello raccoglie i dati solo finché gira.
-- **Python 3.9 o più recente**. Per controllare, apri PowerShell e scrivi `python --version`. Se non c'è, installalo da python.org **spuntando “Add python.exe to PATH”**.
+- **Python 3.10 o più recente**. Per controllare, apri PowerShell e scrivi `python --version`. Se non c'è, installalo da python.org **spuntando “Add python.exe to PATH”**.
 - Un account SmartThings con la pompa di calore dentro (si usa l'API di SmartThings, non c'è nessun accesso diretto alla pompa).
 - Facoltativi: l'app Netatmo (Smarther), un bot Telegram, un dominio su Cloudflare.
 
@@ -76,7 +76,7 @@ Più lungo da preparare, ma poi non ci pensi più.
    ```
    python pdc_strumenti.py st-oauth
    ```
-   Incolla Client ID e Secret, apri l'indirizzo che ti stampa (meglio con **Chrome**), accedi con l'account Samsung e consenti. Arrivi su una pagina di testo con una riga `"code": "…"`: incolla quel codice (o tutta la pagina) nel terminale **subito**, dura poco.
+   Incolla Client ID e Secret (il secret non si vede mentre lo incolli: è normale), apri l'indirizzo che ti stampa (meglio con **Chrome**), accedi con l'account Samsung e consenti. Arrivi su una pagina di testo con una riga `"code": "…"`: incolla quel codice (o tutta la pagina) nel terminale **subito**, dura poco.
 4. Se va bene scrive da solo i token in `config.json`. Fatto.
 
 

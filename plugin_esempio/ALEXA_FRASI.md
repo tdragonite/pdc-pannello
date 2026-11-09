@@ -1,6 +1,6 @@
 # Alexa — frasi e Routine
 
-Skill: **centrale termica** (italiano, Italia). Plugin `alexa.py` versione 1.4.0.
+Skill: **centrale termica** (italiano, Italia). Plugin `alexa.py` versione 1.4.1.
 
 ## Come si usa
 

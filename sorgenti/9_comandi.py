@@ -39,7 +39,7 @@ def cmd_stato(app):
     ac = info_accesso_st(app)
     print("Accesso SmartThings:", {"oauth": "OAuth (si rinnova da solo)", "pat": "token personale PAT (24 ore)"}.get(ac["tipo"], ac["tipo"]))
     aperti = [e for e in app.db.eventi_recenti(30) if e[4] is None]
-    for _, cod, liv, testo, _ in aperti:
+    for _, cod, _liv, testo, _ in aperti:
         print(f"ANOMALIA APERTA [{cod}]: {testo}")
 
 
