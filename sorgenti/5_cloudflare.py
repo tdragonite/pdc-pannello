@@ -73,6 +73,22 @@ def _url_download():
     return None
 
 
+def _digest_ufficiale(nome_file):
+    """SHA-256 che GitHub pubblica per il file dell'ultima versione (campo «digest» dell'API): None se non si riesce a leggerlo."""
+    try:
+        code, js = http_json("GET", "https://api.github.com/repos/cloudflare/cloudflared/releases/latest",
+                             {"User-Agent": "pdc-pannello", "Accept": "application/vnd.github+json"}, timeout=20)
+    except Exception:                                            # noqa: BLE001
+        return None
+    if code != 200 or not isinstance(js, dict):
+        return None
+    for a in js.get("assets") or []:
+        if isinstance(a, dict) and a.get("name") == nome_file:
+            d = str(a.get("digest") or "")
+            return d[7:].lower() if d.startswith("sha256:") and len(d) == 71 else None
+    return None
+
+
 def scarica_cloudflared(app):
     url = _url_download()
     if not url:
@@ -85,10 +101,12 @@ def scarica_cloudflared(app):
         req = Request(url, headers={"User-Agent": "pdc-pannello"})
         with urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
             tot = 0
+            impronta = hashlib.sha256()
             while True:
                 blocco = r.read(1 << 16)
                 if not blocco:
                     break
+                impronta.update(blocco)
                 tot += len(blocco)
                 if tot > 150_000_000:
                     raise ErroreCF("Il file scaricato e' troppo grande: lo scarto.")
@@ -100,6 +118,12 @@ def scarica_cloudflared(app):
     if tot < 5_000_000:
         tmp.unlink(missing_ok=True)
         raise ErroreCF("Il file scaricato e' troppo piccolo per essere cloudflared.")
+    atteso = _digest_ufficiale(url.rsplit("/", 1)[1])
+    if atteso and atteso != impronta.hexdigest():
+        tmp.unlink(missing_ok=True)
+        raise ErroreCF("Il file scaricato non corrisponde all'impronta (SHA-256) pubblicata da GitHub: lo scarto. Riprova fra poco.")
+    if not atteso:
+        log.warning("cloudflared: impronta SHA-256 ufficiale non disponibile, controllo solo dimensione e tipo di file")
     if os.name == "nt":
         with open(tmp, "rb") as f:
             if f.read(2) != b"MZ":
@@ -272,6 +296,7 @@ class TunnelCF:
     def _guardia_interna(self):
         attesa = 5
         while not self.fermo.wait(5):
+            pausa = 0
             with self.lock:
                 if not self.voluto:
                     return
@@ -287,15 +312,17 @@ class TunnelCF:
                         self._lancia(_percorso_exe(self.app), self._cfg())
                     except ErroreCF as e:
                         self.ultimo_errore = str(e)
-                    self.fermo.wait(min(300, attesa))
+                    pausa = min(300, attesa)         # l'attesa si fa FUORI dal lucchetto: Ferma/Riavvia non restano bloccati
                     attesa = min(300, attesa * 2)
-                    continue
-                if self.collegato():
+                elif self.collegato():
                     self.fallimenti, attesa = 0, 5
                     self.app.eventi.chiudi("cf_tunnel")
                 elif time.time() - self.partito_il > 180:
                     self.app.eventi.apri("cf_tunnel", "Il tunnel e' avviato ma non risulta collegato a Cloudflare da oltre 3 minuti. "
                                          + self._ultima_riga_problema(), "avviso")
+            if pausa:
+                self.fermo.wait(pausa)
+                continue
             try:
                 self._controllo_esterno()
             except Exception:

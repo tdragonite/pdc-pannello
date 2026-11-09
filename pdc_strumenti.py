@@ -34,8 +34,10 @@ Esempi:
 """
 
 import argparse
+import atexit
 import base64
 from datetime import datetime
+import getpass
 import json
 import os
 import re
@@ -45,6 +47,9 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+if sys.version_info < (3, 10):
+    sys.exit(f"Serve Python 3.10 o piu' recente (hai la {sys.version.split()[0]}): scaricalo da python.org.")
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -489,12 +494,23 @@ def extract_code(text):
     return text.strip('"\' ')
 
 
+def _chiedi_segreto(nome):
+    """Chiede un segreto senza mostrarlo sullo schermo (se il terminale non lo permette, lo chiede in chiaro)."""
+    try:
+        say(f"({nome}: mentre incolli non si vede nulla, e' normale. Poi premi Invio.)")
+        return getpass.getpass(f"{nome}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except Exception:                                            # noqa: BLE001
+        return input(f"{nome}: ").strip()
+
+
 def cmd_st_oauth(cfg, args):
     oa = cfg["smartthings"]["oauth"]
     say("\n=== Autorizzazione OAuth SmartThings ===")
     say("Prima devi aver creato l'app OAuth con la SmartThings CLI (vedi la guida, punto 2).")
     cid = oa.get("client_id") or input("Client ID: ").strip()
-    secret = oa.get("client_secret") or input("Client Secret: ").strip()
+    secret = oa.get("client_secret") or _chiedi_segreto("Client Secret")
     if not cid or not secret:
         die("Servono Client ID e Client Secret.")
     url = f"{ST_BASE}/oauth/authorize?" + urlencode({
@@ -571,6 +587,7 @@ def _db_leggibile(path):
         return db, None
     except sqlite3.Error:
         tmp = Path(tempfile.mkdtemp(prefix="pdc_diag_"))
+        atexit.register(shutil.rmtree, tmp, True)                # la copia sparisce anche se il comando si ferma con un errore
         for suff in ("", "-wal", "-shm"):
             src = Path(str(path) + suff)
             if src.exists():
@@ -594,7 +611,7 @@ def cmd_rip_diag(cfg, args):
         import pdc_pannello as pp
     except Exception as e:                                   # noqa: BLE001
         die(f"Non riesco a caricare pdc_pannello.py (deve stare nella stessa cartella di questo script): {e}")
-    if "diag" not in getattr(pp.stima_ripartenza, "__code__", None).co_varnames:
+    if "diag" not in getattr(getattr(pp.stima_ripartenza, "__code__", None), "co_varnames", ()):
         die("Questo pdc_pannello.py e' troppo vecchio per la diagnostica: sostituiscilo con l'ultimo (versione 0.19 piu' recente).")
     db_path = _trova_db(args.db)
     db, tmp = _db_leggibile(db_path)
@@ -824,6 +841,7 @@ def cmd_nt_dump(cfg, args):
 # Prova dei webhook Netatmo (sola osservazione: il pannello non viene toccato)
 # --------------------------------------------------------------------------
 
+WH_MAX_EVENTI = 2000
 WH_SEGRETI = ("user_id", "home_id", "home_name", "url")    # tolti dal file da mandare (i MAC li neutralizza sanitize)
 
 
@@ -850,9 +868,12 @@ def wh_ricevitore(porta, segreto, eventi, lock):
 
         def do_POST(self):
             try:
-                n = min(int(self.headers.get("Content-Length") or 0), 262144)
+                lungo = int(self.headers.get("Content-Length") or 0)
             except ValueError:
-                n = 0
+                lungo = 0
+            n = max(0, min(lungo, 262144))                  # mai negativo: read(-1) aspetterebbe la fine della connessione
+            if lungo != n:
+                self.close_connection = True                # corpo non letto per intero: la connessione non si riusa
             corpo = self.rfile.read(n) if n else b""
             firma = wh_firma_ok(corpo, segreto, self.headers.get("X-Netatmo-secret"))
             try:
@@ -860,8 +881,10 @@ def wh_ricevitore(porta, segreto, eventi, lock):
             except ValueError:
                 js = {"raw": corpo[:300].decode("utf-8", "replace")}
             with lock:
-                eventi.append({"arrivo": time.time(), "firma": firma, "percorso": self.path, "corpo": js,
-                               "da": (self.headers.get("CF-Connecting-IP") or self.client_address[0]), "agente": (self.headers.get("User-Agent") or "")[:60]})
+                if len(eventi) < WH_MAX_EVENTI:             # l'indirizzo e' pubblico (anche se temporaneo): la memoria non cresce senza limite
+                    eventi.append({"arrivo": time.time(), "firma": firma, "percorso": self.path, "corpo": js,
+                                   "da": (self.headers.get("CF-Connecting-IP") or self.client_address[0]),
+                                   "agente": (self.headers.get("User-Agent") or "")[:60]})
             risp = b'{"status":"ok"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1035,6 +1058,10 @@ def cmd_nt_webhook_prova(cfg, args):
         if c0 >= 400 or elenco != []:
             die("Con --metodo nuovo parto solo se l'elenco dei webhook e' certamente vuoto (la cancellazione finale con DELETE /webhooks/v1/ "
                 "toglie TUTTI i webhook dell'account). Non lo e' (o non riesco a leggerlo): guarda l'elenco qui sopra.")
+    elif c0 < 400 and isinstance(js0, dict) and js0.get("body") not in ([], None) and not args.sostituisci:
+        die("Sul tuo account c'e' gia' un webhook registrato (vedi l'elenco qui sopra): con il metodo 'vecchio' la prova lo SOSTITUIREBBE e alla fine "
+            "lo toglierebbe. Se e' quello che serve a qualcosa (per esempio al pannello) non andare avanti. Se vuoi procedere lo stesso, "
+            "rilancia aggiungendo --sostituisci.")
     srv = pr = None
     registrato = False
     url = args.url
@@ -1238,9 +1265,9 @@ def cmd_meteo_prova(cfg, args):
     rapporto = {"url": url, "candidati": []}
 
     say(f"1) Leggo la pagina {url} ...")
-    http, tipo, html = meteo_scarica(url)
-    say(f"   HTTP {http}, {tipo}, {len(html)} caratteri")
-    if http is None:
+    codice_http, tipo, html = meteo_scarica(url)
+    say(f"   HTTP {codice_http}, {tipo}, {len(html)} caratteri")
+    if codice_http is None:
         die("Non riesco a raggiungere la pagina (vedi sopra). Controlla la connessione e riprova.")
     titolo = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
     if titolo:
@@ -1386,10 +1413,10 @@ def _buchi(serie):
     """Intervallo tipico fra due misure e i buchi nei dati (piu' di 5 volte l'intervallo tipico, minimo 10 minuti)."""
     if len(serie) < 2:
         return {"intervallo_s": None, "buchi": 0, "minuti_senza_dati": 0, "buchi_maggiori": []}
-    d = [b[0] - a[0] for a, b in zip(serie, serie[1:])]
+    d = [b[0] - a[0] for a, b in zip(serie, serie[1:], strict=False)]
     med = sorted(d)[len(d) // 2]
     lim = max(5 * med, 600)
-    br = [(b[0] - a[0], a[0]) for a, b in zip(serie, serie[1:]) if b[0] - a[0] > lim]
+    br = [(b[0] - a[0], a[0]) for a, b in zip(serie, serie[1:], strict=False) if b[0] - a[0] > lim]
     br.sort(reverse=True)
     return {"intervallo_s": med, "buchi": len(br), "minuti_senza_dati": round(sum(x for x, _ in br) / 60),
             "buchi_maggiori": [{"da": _ore(t), "minuti": round(x / 60)} for x, t in br[:10]]}
@@ -1578,7 +1605,7 @@ def _griglia(S, t_fine, giorni, passo_fine=300, passo_lungo=1800, giorni_fine=14
             continue
         pezzi = []
         limite = t_fine - giorni_fine * 86400
-        for nome, passo, a, b in (("lungo", passo_lungo, t_fine - giorni * 86400, limite), ("fine", passo_fine, limite, t_fine)):
+        for passo, a, b in ((passo_lungo, t_fine - giorni * 86400, limite), (passo_fine, limite, t_fine)):
             if b <= a:
                 continue
             a0 = a - a % passo
@@ -1600,7 +1627,7 @@ def _grezzi(S, t_fine, giorni):
     for serie, dati in S.items():
         r = [(t, v) for t, v in dati if t >= da]
         if r:
-            out[serie] = {"t0": r[0][0], "dt": [0] + [y[0] - x[0] for x, y in zip(r, r[1:])], "v": [round(v, 3) for _, v in r]}
+            out[serie] = {"t0": r[0][0], "dt": [0] + [y[0] - x[0] for x, y in zip(r, r[1:], strict=False)], "v": [round(v, 3) for _, v in r]}
     return {"nota": "Misure vere, non mediate: t0 = istante della prima misura (secondi Unix); dt[i] = secondi trascorsi dalla misura precedente (dt[0] = 0); "
                     "v[i] = valore. Il tempo della misura i e' t0 + somma(dt[0..i]).", "serie": out}
 
@@ -1667,7 +1694,7 @@ def _raffreddamento_acs(S, stati, ora, finestre_testo, dal_ts):
             continue
         ore = (g1 - g0) / 3600
         sale = max(v for _, v in dentro) - v0
-        salti = sum(1 for (ta, va), (tb, vb) in zip(dentro, dentro[1:]) if va - vb >= 1.5 and tb - ta <= 900)
+        salti = sum(1 for (ta, va), (tb, vb) in zip(dentro, dentro[1:], strict=False) if va - vb >= 1.5 and tb - ta <= 900)
         riga.update({"da": _ore(g0), "a": _ore(g1), "ore_misurate": round(ore, 2), "temp_inizio": v0, "temp_fine": v1,
                      "gradi_persi": round(v0 - v1, 1), "gradi_ora": round((v0 - v1) / ore, 2),
                      "la_pdc_e_ripartita": bool(rip), "ore_prima_della_ripartenza": round((rip - w0) / 3600, 2) if rip else None,
@@ -1732,7 +1759,7 @@ def cmd_analisi(cfg, args):
     mod = None
     if pp is not None:
         try:
-            mod = pp.calcola_modi(db, da, ora, max(150, 45), ora)["segmenti"]
+            mod = pp.calcola_modi(db, da, ora, 150, ora)["segmenti"]
         except Exception as e:                                   # noqa: BLE001
             out.setdefault("errori", {})["calcola_modi"] = str(e)
     import bisect
@@ -1826,7 +1853,7 @@ def cmd_analisi(cfg, args):
             teor = [pp.mandata_calcolata((t1, m1, t2, m2), e) for e, _ in punti]
         else:
             teor = [m1 if e <= t1 else m2 if e >= t2 else m1 + (m2 - m1) * (e - t1) / (t2 - t1) for e, _ in punti]
-        diff = [m - t for (e, m), t in zip(punti, teor)]
+        diff = [m - t for (e, m), t in zip(punti, teor, strict=True)]
         return {"nota": "Mandata misurata (compressore acceso, valvola sul riscaldamento casa, da almeno 10 minuti) meno la mandata che la curva climatica prevede per quella temperatura esterna.",
                 "curva": {"esterna_bassa": t1, "mandata_bassa": m1, "esterna_alta": t2, "mandata_alta": m2},
                 "differenza_misurata_meno_curva": _stat(diff)}
@@ -1841,6 +1868,8 @@ def cmd_analisi(cfg, args):
             return json.loads(json.dumps(r, default=str))
         _sezione(out, "efficienza_pannello", efficienza)
         _sezione(out, "bollitore_pannello", lambda: pp.calcola_bollitore(db, da, ora, ora, 300))
+        say(f"  Raffreddamento acqua calda: fasce a ricircolo spento «{args.ricircolo_off}», timer attivo dal {args.ricircolo_dal} "
+            "(se il timer e' cambiato rilancia con --ricircolo-off e --ricircolo-dal)")
         _sezione(out, "raffreddamento_acs", lambda: _raffreddamento_acs(
             S, stati, ora, args.ricircolo_off, int(time.mktime(time.strptime(args.ricircolo_dal, "%Y-%m-%d %H:%M")))))
         _sezione(out, "sbrinamenti", lambda: json.loads(json.dumps(pp.elenco_sbrinamenti(db, da, ora, ora), default=str)))
@@ -1930,6 +1959,7 @@ def main():
     w.add_argument("--url", help="usa questo indirizzo pubblico (che deve arrivare alla --porta di questo PC) invece del tunnel temporaneo")
     w.add_argument("--metodo", choices=("vecchio", "nuovo"), default="vecchio",
                    help="vecchio = /api/addwebhook (default); nuovo = servizio /webhooks/v1/ (parte solo se l'elenco dei webhook e' vuoto)")
+    w.add_argument("--sostituisci", action="store_true", help="con il metodo 'vecchio': procede anche se c'e' gia' un webhook registrato (verra' sostituito e poi tolto)")
     w.add_argument("--rinnova", action="store_true", help="rinnova il token Netatmo: SOLO a pannello fermo")
     w.add_argument("--elimina", action="store_true", help="non ascolta: toglie da Netatmo un webhook rimasto registrato")
     g = sub.add_parser("rip-diag", help="diagnostica della ripartenza prevista dello Smarther (legge il database, pannello anche acceso)")
@@ -1945,11 +1975,11 @@ def main():
     an.add_argument("--giorni", type=int, default=45, help="quanti giorni di storico includere (default 45, massimo 120)")
     an.add_argument("--ciclo", type=int, default=7, help="quanti giorni di campioni GREZZI del ciclo (byte del compressore) includere (default 7, 0 = nessuno)")
     an.add_argument("--grezzi", type=int, default=1, help="quanti giorni di misure GREZZE (non mediate) includere, gli ultimi (default 1, 0 = nessuna)")
-    an.add_argument("--ricircolo-off", default="13:30-17:00,21:30-08:00", help="fasce a ricircolo SPENTO, tipo 13:30-17:00,21:30-08:00 (default quelle del timer attuale)")
-    an.add_argument("--ricircolo-dal", default="2026-11-05 14:30", help="da quando vale il timer attuale, 'AAAA-MM-GG HH:MM' (default 2026-11-05 14:30)")
+    an.add_argument("--ricircolo-off", default="13:30-17:00,21:30-08:00", help="fasce a ricircolo SPENTO, tipo 13:30-17:00,21:30-08:00 "
+                    "(default: quelle del timer del 5/11/2026; se lo cambi, indicale qui)")
+    an.add_argument("--ricircolo-dal", default="2026-11-05 14:30", help="da quando valgono quelle fasce, 'AAAA-MM-GG HH:MM' (default 2026-11-05 14:30)")
     mp = sub.add_parser("meteo-prova", help="prova a leggere umidita' e temperatura da una pagina WeatherLink 'embeddable' (nessuna chiave, config.json non serve)")
     mp.add_argument("url", help="indirizzo della pagina, tipo https://www.weatherlink.com/embeddablePage/show/<codice>/summary")
-    mp.add_argument("--salva", action="store_true", help="(sempre attivo, il rapporto va in diagnostica/meteo_prova.json)")
     args = ap.parse_args()
     if not args.cmd:
         ap.print_help()

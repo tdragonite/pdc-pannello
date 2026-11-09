@@ -73,7 +73,7 @@ Tutto da **Impostazioni → Accesso da internet**, con la procedura guidata:
 
    In *Zone Resources* scegli *Include → Specific zone* e il tuo dominio. Copia il token.
 2. **Incollalo** e premi *Verifica*: il pannello trova i tuoi domini.
-3. **Scegli** dominio e sottodominio (per esempio `pdc` → `pdc.tuodominio.it`) e premi *Crea tunnel e collega*. Il pannello crea tunnel e record DNS, scarica `cloudflared` e lo avvia.
+3. **Scegli** dominio e sottodominio (per esempio `pdc` → `pdc.tuodominio.it`) e premi *Crea tunnel e collega*. Il pannello crea tunnel e record DNS, scarica `cloudflared` (controllando che il file corrisponda all'impronta SHA-256 pubblicata da GitHub: se non coincide lo scarta) e lo avvia.
 
 Il **token API non viene conservato**: lo usa e lo butta. In `config.json` resta solo il token del tunnel, che serve a far girare quel tunnel e nient'altro.
 

@@ -434,7 +434,7 @@ def valida_regolazione(app, cosa, valore, ult):
     except (TypeError, ValueError):
         return None, "Il valore non e' un numero."
     lo, hi = reg_limiti_acs(ult)
-    if n != int(n):
+    if not math.isfinite(n) or n != int(n):
         return None, "La temperatura va a gradi interi."
     n = int(n)
     if not (lo <= n <= hi):
@@ -584,6 +584,7 @@ def _boost_ripristina(app, motivo, ip="pannello"):
             log.warning("boost: ripristino fallito: %s", msg)
             return False, msg
         _boost_scrivi(app, None)
+        app.eventi.chiudi("boost_ripristino")
         log.info("boost finito (%s): modo %s, setpoint %s", motivo, b.get("modo_prima"), b.get("sp_prima"))
         _boost_rileggi(app, sv)
         return True, None
@@ -617,6 +618,10 @@ def _boost_vigila(app):
             ok, _ = _boost_ripristina(app, motivo)
             if not ok and int(b.get("tentativi", 0)) >= 30:
                 _boost_scrivi(app, None)          # dopo troppi tentativi si rinuncia (resta il registro dei comandi)
+                log.error("boost: ripristino abbandonato dopo 30 tentativi: modo e setpoint di prima NON rimessi")
+                app.eventi.apri("boost_ripristino", f"Il boost e' finito ma non sono riuscito a rimettere i valori di prima (modo «{b.get('modo_prima')}», "
+                                f"setpoint {b.get('sp_prima')} °C) dopo 30 tentativi: la pompa potrebbe essere rimasta in «Forzato». "
+                                "Controlla e rimettili da Controlli.", "errore")
             if _boost_thread_finito(app):
                 return
 
@@ -652,7 +657,7 @@ def boost_avvia(app, obiettivo, ip):
     except (TypeError, ValueError):
         return {"ok": False, "errore": "La temperatura non e' un numero."}
     lo, hi = reg_limiti_acs(ult)
-    if n != int(n) or not (lo <= n <= hi):
+    if not math.isfinite(n) or n != int(n) or not (lo <= n <= hi):
         return {"ok": False, "errore": f"La temperatura va a gradi interi, da {lo} a {hi} °C."}
     n = int(n)
     sp, modo, temp = ult.get("acs.setpoint"), ult.get("pdc.modo"), ult.get("acs.temperatura")

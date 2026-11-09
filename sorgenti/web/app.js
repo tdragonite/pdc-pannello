@@ -37,7 +37,7 @@ const S = {
   pagina: (location.hash.replace('#/', '').split('/')[0] in TITOLI) ? location.hash.replace('#/', '').split('/')[0] : 'dashboard',
   sub: location.hash.replace('#/', '').split('/')[1] || '',
   range: ls.get('range', '24h'), rangeEff: ls.get('rangeEff', '7g'), custom: ls.get('custom', null),
-  dati: null, sse: false, off: 0,
+  dati: null, sse: false, off: 0, solo: false,
 };
 const ora = () => Math.floor(Date.now() / 1000) + S.off;
 
@@ -363,7 +363,7 @@ function curva(c) {
   nice(x0, x1, 5).forEach(v => { g += `<line x1="${X(v)}" x2="${X(v)}" y1="${T}" y2="${H - B}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${X(v)}" y="${H - B + 16}" text-anchor="${X(v) > W - 12 ? 'end' : 'middle'}">${v}°</text>`; });   // l'ultimo numero finisce sul bordo, non sporge
   nice(y0, y1, 10).forEach(v => { g += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${v}°</text>`; });
   const A = c.basso, Z = c.alto;
-  const pts = c.punti.map(p => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.6" fill="#ff6b57" fill-opacity=".38"/>`).join('');
+  const pts = c.punti.map((p, i) => `<circle data-pc="${i}" cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.6" fill="#ff6b57" fill-opacity=".38"/>`).join('');
   let ora_ = '';
   if (c.ora.esterna != null && c.ora.mandata != null) {
     const ox = X(Math.max(x0, Math.min(x1, c.ora.esterna))), oy = Y(c.ora.mandata);
@@ -380,7 +380,7 @@ function curva(c) {
     ${ora_}${lab(A.esterna, A.mandata, num(A.mandata, 0) + '°C', '#4da3ff')}${lab(Z.esterna, Z.mandata, num(Z.mandata, 0) + '°C', '#34d3b0')}
     <text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">Temperatura esterna (°C)</text>
     <text transform="translate(8.5 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">Mandata (°C)</text>
-</svg>
+</svg><div class="tip" id="tipc" hidden></div>
     <div class="box2">
       <div class="bx tn c-acs"><small class="eti">Freddo</small><p><b>${num(A.mandata, 0)}°C</b><span>mandata a <strong>${num(A.esterna, 0)}°C</strong> esterni</span></p></div>
       <div class="bx tn c-est"><small class="eti">Mite</small><p><b>${num(Z.mandata, 0)}°C</b><span>mandata a <strong>${num(Z.esterna, 0)}°C</strong> esterni</span></p></div>
@@ -391,6 +391,34 @@ function curva(c) {
       <li><i class="pt"></i>Puntini: mandate misurate mentre scaldava</li>
       <li><i class="in"></i>Offset del pannello non leggibile</li>
     </ul>`);
+  const cw = $('#curva'); if (cw) cw._cv = {W, X, Y, pts: c.punti, lungo: !!c.lungo, sel: null};
+}
+
+// Tooltip dei puntini della curva: ora (o giorno e ora se il periodo supera le 24 ore) e valori del puntino più vicino
+function sceltaCurva(m, c) {
+  if (m.sel && m.sel !== c) { m.sel.setAttribute('r', '2.6'); m.sel.setAttribute('fill-opacity', '.38'); }
+  m.sel = c;
+  if (c) { c.setAttribute('r', '4.2'); c.setAttribute('fill-opacity', '1'); }
+}
+function togliTipCurva() {
+  const w = $('#curva'), t = $('#tipc'); if (t) t.hidden = true;
+  if (w && w._cv) sceltaCurva(w._cv, null);
+}
+function tooltipCurva(e) {
+  const w = $('#curva'), svg = w && w.querySelector('svg'), tip = $('#tipc'); if (!w || !w._cv || !svg || !tip) return;
+  const m = w._cv, r = svg.getBoundingClientRect(), k = r.width / m.W;
+  let best = -1, bd = 18 * 18;   // raggio di 18 px: comodo anche col dito
+  m.pts.forEach((p, i) => { const dx = r.left + m.X(p[0]) * k - e.clientX, dy = r.top + m.Y(p[1]) * k - e.clientY, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = i; } });
+  if (best < 0) { togliTipCurva(); return; }
+  const p = m.pts[best];
+  sceltaCurva(m, svg.querySelector(`[data-pc="${best}"]`));
+  const quando = m.lungo ? `${new Date(p[2] * 1000).toLocaleDateString('it-IT', {day: 'numeric', month: 'numeric'})} ${hhmm(p[2])}` : hhmm(p[2]);
+  tip.innerHTML = `<b>${quando}</b><br>${num(p[0])}°C esterni · mandata ${num(p[1])}°C`;
+  tip.hidden = false;
+  const wr = w.getBoundingClientRect(), x = r.left + m.X(p[0]) * k - wr.left, y = r.top + m.Y(p[1]) * k - wr.top, mezzo = tip.offsetWidth / 2 + 2;
+  tip.style.left = Math.max(mezzo, Math.min(wr.width - mezzo, x)) + 'px';
+  tip.style.top = (y < 56 ? y + 14 : y - 8) + 'px';           // vicino al bordo alto compare sotto il puntino
+  tip.style.transform = y < 56 ? 'translate(-50%,0)' : '';
 }
 
 function avvisi() {
@@ -516,7 +544,7 @@ function disegnaAnalisi(p) {
 }
 
 // linea a gradini: ogni valore dura fino a meta' strada dal punto successivo; dove c'e' un buco i pezzi si staccano
-function segmentiGradini(punti, X, buco, mezzo) {
+function segmentiGradini(punti, buco, mezzo) {
   const segs = []; let cur = null, prec = null;
   for (let i = 0; i < punti.length; i++) {
     const [t, v] = punti[i];
@@ -530,7 +558,7 @@ function segmentiGradini(punti, X, buco, mezzo) {
 }
 function percorsoGradini(punti, X, Y, buco, mezzo, area, base) {
   let s = '';
-  segmentiGradini(punti, X, buco, mezzo).forEach(seg => {
+  segmentiGradini(punti, buco, mezzo).forEach(seg => {
     let ultY = null, x0 = null, x1 = null, p = '';
     seg.forEach(([t, v], i) => {
       const x = X(t).toFixed(1), y = Y(v).toFixed(1);
@@ -863,7 +891,6 @@ function vistaImp() {
   document.querySelectorAll('#imp .imp-tab').forEach(g => { g.hidden = g.dataset.t !== (cur || 'stato'); });
   if (reg) caricaRegistro();
 }
-S.solo = S.solo || false;
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
   try {
@@ -1049,6 +1076,30 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.4', quando: '9 novembre 2026', titolo: 'Controllo generale', righe: [
+    ['s', 'Numeri strani nei campi', 'Scrivere «nan», «inf» o un numero enorme in un campo di FSV, regolazioni o Boost dava «errore interno»: ora risponde con il solito messaggio, senza mandare nulla alla pompa.'],
+    ['s', 'Tunnel che si ferma di continuo', 'Se cloudflared non riusciva a ripartire, Avvia, Ferma e Riavvia restavano bloccati fino a 5 minuti: ora rispondono subito.'],
+    ['s', 'Boost non ripristinato', 'Se dopo 30 tentativi il Boost non riesce a rimettere i valori di prima, il pannello apre un’anomalia (con avviso Telegram) invece di rinunciare in silenzio.'],
+    ['s', 'Richieste rifiutate', 'Dopo una richiesta rifiutata (non consentita, troppo grande, login bloccato) la connessione si chiude: niente più errori 400 a caso sulla richiesta successiva.'],
+    ['s', 'Pulsanti che restavano spenti', 'Se il server non rispondeva, i pulsanti di Accesso da internet e della password restavano disabilitati: ora tornano attivi e compare l’avviso.'],
+    ['s', 'Password da config.json', 'Una password scritta a mano in config.json ora deve avere almeno 10 caratteri, come quella cambiata dal pannello (prima ne bastavano 8).'],
+    ['m', 'Password più robuste', 'Le nuove password si proteggono con 600.000 passaggi invece di 200.000. Quelle già impostate continuano a funzionare.'],
+    ['m', 'Registro senza segreti', 'Gli errori delle rotte dei plugin non scrivono più l’indirizzo segreto nel registro, e il registro mostrato in Impostazioni lo nasconde comunque.'],
+    ['m', 'cloudflared scaricato con controllo', 'Il programma si confronta con l’impronta SHA-256 pubblicata da GitHub: se non corrisponde viene scartato.'],
+    ['m', 'Telegram spento', 'Con Telegram spento i messaggi in coda più vecchi di un’ora si buttano: alla riaccensione non arriva più una raffica di avvisi vecchi.'],
+    ['m', 'Alexa 1.4.1', 'Con la verifica firma su «Attiva», una richiesta la cui firma non si può controllare ora viene rifiutata.'],
+    ['m', 'Grafici più fluidi', 'Trascinando o toccando un grafico, il pannello aggiorna una volta per fotogramma invece che a ogni minimo movimento.'],
+    ['m', 'Integrazioni più leggere', 'La scheda Integrazioni, che si aggiorna ogni 5 secondi, ora chiede solo lo stato dei plugin e non tutte le impostazioni.'],
+    ['m', 'Python 3.10', 'Ora serve Python 3.10 o più recente: se è più vecchio, il pannello lo dice subito all’avvio invece di rompersi più avanti.'],
+  ]},
+  {v: '0.25.3', quando: '9 novembre 2026', titolo: 'Puntini della curva', righe: [
+    ['n', 'Ora sui puntini della curva', 'Nella Dashboard, passando il mouse o toccando un puntino della curva climatica compaiono l’ora (il giorno e l’ora se il periodo supera le 24 ore), la temperatura esterna e la mandata di quella misura.'],
+    ['m', 'Portata a 36 byte', 'Anche il formato a 36 byte legge la portata dai byte 6 e 7 insieme, come da guida; vale solo per le installazioni nuove.'],
+  ]},
+  {v: '0.25.2', quando: '8 novembre 2026', titolo: 'Portata e COP', righe: [
+    ['s', 'Portata dei cicli', 'La portata sta nei byte 6 e 7 insieme (un numero a 16 bit), non nel solo byte 7. Dal 5 novembre la pompa rimanda a volte lo stesso istante con il valore corrotto (17-24 L/min senza senso): il COP sembrava peggiorare ma era solo il dato. Ora si leggono i due byte e tutto sopra 60 L/min si scarta. Per rimettere a posto i giorni passati: backup e ridecodifica.'],
+    ['n', 'Diagnostica delle versioni', 'Quando la pompa rimanda lo stesso istante con byte diversi, il pannello lo scrive (una riga per versione) in dati/diag_versioni_ciclo.txt, senza toccare nessun dato.'],
+  ]},
   {v: '0.25.1', quando: '8 novembre 2026', titolo: 'Avvisi finti e dati esterni', righe: [
     ['s', 'Browser che si stacca', 'Se il browser chiudeva la connessione a metà risposta (ricaricando la pagina, per esempio), il registro mostrava un errore con tutta la traccia anche se non c’era niente da correggere: ora viene ignorato, come già succedeva per gli altri distacchi.'],
     ['s', 'Meteo e stazione sempre aggiornati', 'La previsione e l’umidità della stazione vicina si leggono ora anche con la Dashboard chiusa, da un solo lavoro di fondo: niente buco alla riapertura (nemmeno per Alexa e il widget) e niente avvisi finti di «dato vecchio».'],
@@ -1913,7 +1964,7 @@ async function plgAggiorna() {
   if (plgOccupato || document.hidden || S.pagina !== 'impostazioni' || S.sub !== 'integrazioni') return;
   plgOccupato = true;
   try {
-    const r = await leggiJson('/api/impostazioni');
+    const r = await leggiJson('/api/plugin/stato');      // solo i plugin, non tutte le impostazioni
     if (!r || !r.ok || S.sub !== 'integrazioni') return;
     const d = await r.json();
     d.sezioni.filter(x => x.tab === 'integrazioni' && x.plugin).forEach(x => {
@@ -2281,17 +2332,27 @@ function avvia() {
       else if (S.dati) { const b = $('#dsp'); if (b) b.dataset.h = ''; disegna(); }
     }
   });
-  document.addEventListener('pointermove', e => {
+  // i movimenti si elaborano una volta per fotogramma (l'ultimo di ogni dito), non a ogni evento: il browser ne manda anche piu' di uno per fotogramma
+  const muoviPunt = e => {
     if (spostaMuovi(e) || zoomaMuovi(e) || dita.size > 1) return;
+    const cv = e.target.closest && e.target.closest('#curva svg'); if (!cv) togliTipCurva();
     if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e);
+    else if (cv) tooltipCurva(e);
     else { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
+  };
+  const inAttesa = new Map();
+  document.addEventListener('pointermove', e => {
+    if (!inAttesa.size) requestAnimationFrame(() => { const l = [...inAttesa.values()]; inAttesa.clear(); l.forEach(muoviPunt); });
+    inAttesa.set(e.pointerId, e);
   });
   document.addEventListener('pointerleave', togliCursore);
   document.addEventListener('input', segnaModifica); document.addEventListener('change', segnaModifica);
-  document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { if (e.target.id.startsWith('cf-')) cfAzione(e); else azioniImpostazioni(e); } });
+  document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { 
+    Promise.resolve(e.target.id.startsWith('cf-') ? cfAzione(e) : azioniImpostazioni(e))
+      .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; CFS.occupato = false; }); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
-  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
+  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; const cv = e.target.closest && e.target.closest('#curva svg'); if (!cv) togliTipCurva(); if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else if (cv) tooltipCurva(e); else muoviCursore(e); });
   document.addEventListener('pointerup', e => { spostaSu(); zoomaSu(e); }); document.addEventListener('pointercancel', e => { spostaSu(); zoomaSu(e); });
   if (S.range === 'custom' && S.pagina !== 'efficienza') { $('#custom').hidden = false; if (S.custom) { $('#c-da').value = loc(S.custom.da); $('#c-a').value = loc(S.custom.a); } }
   ricordaFinestra();

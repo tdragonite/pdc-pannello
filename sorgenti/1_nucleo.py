@@ -10,7 +10,7 @@ Cosa fa:
   - avvisi Telegram, tunnel Cloudflare, plugin (Alexa, widget), backup e compattazione notturni
   - configurazione in config.json (stesso file di pdc_strumenti.py)
 
-Solo libreria standard di Python (3.9 o piu' recente). Tutto vive nella cartella dello script.
+Solo libreria standard di Python (3.10 o piu' recente). Tutto vive nella cartella dello script.
 
 Comandi:
     python pdc_pannello.py                      avvia raccolta dati + interfaccia web (porta 7000)
@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.25.1"
+VERSIONE = "0.25.4"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -35,6 +35,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import socket
@@ -51,6 +52,9 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+if sys.version_info < (3, 10):
+    sys.exit(f"Serve Python 3.10 o piu' recente (hai la {sys.version.split()[0]}): scaricalo da python.org e rilancia il pannello.")
 
 AQUI = Path(__file__).resolve().parent
 ST_API = "https://api.smartthings.com/v1"
@@ -86,10 +90,12 @@ def _hz(byte):
             "nulli": [65535], "unita": "Hz", "attivo": True}
 
 
-def _spegni(campo):
-    c = dict(campo)
-    c["attivo"] = False
-    return c
+def _portata31(byte=6):
+    """Portata del formato a 31 byte: i byte 6-7 insieme sono UN numero a 16 bit, in decimi di L/min (guida Dwellsee,
+    corretta l'8-9/11/2026). Sopra 60 L/min e' un campione corrotto (la pompa a volte rimanda lo stesso istante col valore
+    moltiplicato per 10 e tagliato a 16 bit): si scarta."""
+    return {"byte": byte, "tipo": "u16", "offset": 0, "scala": 0.1, "min": 0, "max": 60,
+            "nulli": [65535], "unita": "L/min", "attivo": True}
 
 
 _OUTDOOR = {
@@ -108,14 +114,14 @@ MAPPA_CICLO_DEFAULT = {
     "indoor_31": {
         "ritorno": _t(2),
         "mandata": _t(3),
-        "portata": _u8(7, "L/min", 0.1, 0, 60),
+        "portata": _portata31(),
         "vel_pompa": _u8(8, "%"),
         "acs_ciclo": _t(27),
     },
     "indoor_36": {
         "ritorno": _t(2),
         "mandata": _t(3),
-        "portata": _spegni(_u8(7, "L/min", 0.1, 0, 60)),  # inaffidabile su questo modello
+        "portata": _portata31(),   # come il formato a 31 byte (guida Dwellsee: byte 6-7, 16 bit)
         "vel_pompa": _u8(8, "%"),
     },
     "indoor_24": {
@@ -346,7 +352,7 @@ class Config:
             f.flush()
             os.fsync(f.fileno())  # se la luce va via subito dopo, il file nuovo e' davvero sul disco (contiene il refresh token)
         riservato(tmp)
-        for tentativo in range(5):  # su Windows il file puo' essere momentaneamente occupato
+        for _ in range(5):  # su Windows il file puo' essere momentaneamente occupato
             try:
                 os.replace(tmp, self.path)
                 return
@@ -377,10 +383,21 @@ class Config:
                     dove[percorso[-1]] = nuovo[percorso[-1]]
                     mod = True
             return mod
+        def rinnova_portata(raw):
+            """La portata del formato a 31 byte si legge dai byte 6-7 (16 bit), non dal solo byte 7: si aggiorna SOLO se nel file
+            c'e' ancora identica la vecchia definizione (se l'hai cambiata a mano non si tocca)."""
+            vecchia = {"byte": 7, "tipo": "u8", "offset": 0, "scala": 0.1, "min": 0, "max": 60,
+                       "nulli": [255], "unita": "L/min", "attivo": True}
+            ind = (raw.get("mappa_ciclo") or {}).get("indoor_31") if isinstance(raw.get("mappa_ciclo"), dict) else None
+            if isinstance(ind, dict) and ind.get("portata") == vecchia:
+                ind["portata"] = _portata31()
+                return True
+            return False
         with self.lock:
             raw = self._raw()
             mod = rec(raw, TEMPLATE)
             mod = rinnova(raw) or mod
+            mod = rinnova_portata(raw) or mod
             if mod:
                 self._scrivi(raw)
                 return True
@@ -468,6 +485,34 @@ class DB:
     def _c(self):
         return sqlite3.connect(self.path, timeout=30)
 
+    # Dal 5/11 17:25 la pompa rimanda a volte lo stesso istante con la portata corrotta (vedi docs/manutenzione-e-problemi.md):
+    # i valori assurdi si scartano gia' in decodifica (max 60 L/min), qui si registrano solo le versioni diverse.
+    DIAG_MAX_BYTE = 400_000  # il file di diagnostica smette di crescere oltre questa dimensione
+
+    def _diag_versione(self, tipo, ts, hex_prima, hex_nuovo):
+        """Diagnostica: lo stesso (tipo, istante) e' arrivato con byte diversi. Scrive una riga (una volta sola per
+        versione) in diag_versioni_ciclo.txt accanto al database: non tocca nessun dato."""
+        chiave = (tipo, ts, hex_nuovo)
+        visti = self.__dict__.setdefault("_diag_visti", set())
+        if chiave in visti:
+            return
+        if len(visti) > 5000:
+            visti.clear()
+        visti.add(chiave)
+        try:
+            f = Path(self.path).parent / "diag_versioni_ciclo.txt"
+            if f.exists() and f.stat().st_size > self.DIAG_MAX_BYTE:
+                return
+            a, b = bytes.fromhex(hex_prima), bytes.fromhex(hex_nuovo)
+            diversi = ",".join(f"{i}:{x:02X}>{y:02X}" for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y)
+            ora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            camp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            with open(f, "a", encoding="utf-8") as fh:
+                fh.write(f"arrivo {ora} | {tipo} campione {camp} | byte cambiati {diversi or 'lunghezza'} | "
+                         f"prima {hex_prima} | poi {hex_nuovo}\n")
+        except Exception:
+            pass  # e' solo diagnostica: non deve mai dare fastidio
+
     @staticmethod
     def _upsert_ultimo(c, serie, ts, num, txt):
         c.execute("INSERT INTO ultimo(serie,ts,num,txt) VALUES(?,?,?,?) "
@@ -479,7 +524,11 @@ class DB:
         cambiati = []
         with self.lock, closing(self._c()) as c, c:
             for tipo, ts, hx in rec.ciclo:
-                c.execute("INSERT OR IGNORE INTO ciclo VALUES(?,?,?)", (tipo, ts, hx))
+                r = c.execute("SELECT hex FROM ciclo WHERE tipo=? AND ts=?", (tipo, ts)).fetchone()
+                if r is None:
+                    c.execute("INSERT OR IGNORE INTO ciclo VALUES(?,?,?)", (tipo, ts, hx))
+                elif r[0] != hx:
+                    self._diag_versione(tipo, ts, r[0], hx)
             for serie, ts, val, lento in rec.num:
                 if lento:
                     r = c.execute("SELECT ts, num FROM ultimo WHERE serie=?", (serie,)).fetchone()
@@ -978,6 +1027,7 @@ class Raccoglitore(threading.Thread):
 class ServizioST(Raccoglitore):
     def __init__(self, app):
         super().__init__(app, "st")
+        self.ult_info = 0          # ultima lettura dei dati di info del dispositivo
         self.passi = 0
         self.offline = 0
         # stato del "refresh" (vedi _refresh): lo legge la Dashboard
@@ -1029,7 +1079,7 @@ class ServizioST(Raccoglitore):
             self.app.eventi.chiudi("st_ciclo_formato")
         if self.passi % 5 == 0:
             self._salute(dev, ts)
-        if time.time() - getattr(self, "ult_info", 0) > 3600:
+        if time.time() - self.ult_info > 3600:
             self.ult_info = time.time()
             self._info_dispositivo(dev, ts)
         self.passi += 1
@@ -1160,6 +1210,7 @@ class ServizioST(Raccoglitore):
 class ServizioNT(Raccoglitore):
     def __init__(self, app):
         super().__init__(app, "nt")
+        self.ult_info = 0          # ultima lettura della modalita' della casa (homesdata)
 
     def intervallo(self):
         return max(60, int(self.app.cfg.leggi()["generale"]["intervallo_netatmo_secondi"]))
@@ -1187,7 +1238,7 @@ class ServizioNT(Raccoglitore):
             self.app.cfg.aggiorna(lambda raw: raw.setdefault("netatmo", {}).update(home_id=home))
         js = self._get("/api/homestatus", {"home_id": home})
         ts = int(time.time())
-        if ts - getattr(self, "ult_info", 0) > 120:  # la modalita' della casa (hg = spento) sta solo in homesdata
+        if ts - self.ult_info > 120:  # la modalita' della casa (hg = spento) sta solo in homesdata
             self.ult_info = ts
             try:
                 self.app.db.salva(estrai_netatmo_casa(self._get("/api/homesdata")), ts)

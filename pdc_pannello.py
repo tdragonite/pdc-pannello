@@ -10,7 +10,7 @@ Cosa fa:
   - avvisi Telegram, tunnel Cloudflare, plugin (Alexa, widget), backup e compattazione notturni
   - configurazione in config.json (stesso file di pdc_strumenti.py)
 
-Solo libreria standard di Python (3.9 o piu' recente). Tutto vive nella cartella dello script.
+Solo libreria standard di Python (3.10 o piu' recente). Tutto vive nella cartella dello script.
 
 Comandi:
     python pdc_pannello.py                      avvia raccolta dati + interfaccia web (porta 7000)
@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.25.1"
+VERSIONE = "0.25.4"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -35,6 +35,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import socket
@@ -51,6 +52,9 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+if sys.version_info < (3, 10):
+    sys.exit(f"Serve Python 3.10 o piu' recente (hai la {sys.version.split()[0]}): scaricalo da python.org e rilancia il pannello.")
 
 AQUI = Path(__file__).resolve().parent
 ST_API = "https://api.smartthings.com/v1"
@@ -86,10 +90,12 @@ def _hz(byte):
             "nulli": [65535], "unita": "Hz", "attivo": True}
 
 
-def _spegni(campo):
-    c = dict(campo)
-    c["attivo"] = False
-    return c
+def _portata31(byte=6):
+    """Portata del formato a 31 byte: i byte 6-7 insieme sono UN numero a 16 bit, in decimi di L/min (guida Dwellsee,
+    corretta l'8-9/11/2026). Sopra 60 L/min e' un campione corrotto (la pompa a volte rimanda lo stesso istante col valore
+    moltiplicato per 10 e tagliato a 16 bit): si scarta."""
+    return {"byte": byte, "tipo": "u16", "offset": 0, "scala": 0.1, "min": 0, "max": 60,
+            "nulli": [65535], "unita": "L/min", "attivo": True}
 
 
 _OUTDOOR = {
@@ -108,14 +114,14 @@ MAPPA_CICLO_DEFAULT = {
     "indoor_31": {
         "ritorno": _t(2),
         "mandata": _t(3),
-        "portata": _u8(7, "L/min", 0.1, 0, 60),
+        "portata": _portata31(),
         "vel_pompa": _u8(8, "%"),
         "acs_ciclo": _t(27),
     },
     "indoor_36": {
         "ritorno": _t(2),
         "mandata": _t(3),
-        "portata": _spegni(_u8(7, "L/min", 0.1, 0, 60)),  # inaffidabile su questo modello
+        "portata": _portata31(),   # come il formato a 31 byte (guida Dwellsee: byte 6-7, 16 bit)
         "vel_pompa": _u8(8, "%"),
     },
     "indoor_24": {
@@ -346,7 +352,7 @@ class Config:
             f.flush()
             os.fsync(f.fileno())  # se la luce va via subito dopo, il file nuovo e' davvero sul disco (contiene il refresh token)
         riservato(tmp)
-        for tentativo in range(5):  # su Windows il file puo' essere momentaneamente occupato
+        for _ in range(5):  # su Windows il file puo' essere momentaneamente occupato
             try:
                 os.replace(tmp, self.path)
                 return
@@ -377,10 +383,21 @@ class Config:
                     dove[percorso[-1]] = nuovo[percorso[-1]]
                     mod = True
             return mod
+        def rinnova_portata(raw):
+            """La portata del formato a 31 byte si legge dai byte 6-7 (16 bit), non dal solo byte 7: si aggiorna SOLO se nel file
+            c'e' ancora identica la vecchia definizione (se l'hai cambiata a mano non si tocca)."""
+            vecchia = {"byte": 7, "tipo": "u8", "offset": 0, "scala": 0.1, "min": 0, "max": 60,
+                       "nulli": [255], "unita": "L/min", "attivo": True}
+            ind = (raw.get("mappa_ciclo") or {}).get("indoor_31") if isinstance(raw.get("mappa_ciclo"), dict) else None
+            if isinstance(ind, dict) and ind.get("portata") == vecchia:
+                ind["portata"] = _portata31()
+                return True
+            return False
         with self.lock:
             raw = self._raw()
             mod = rec(raw, TEMPLATE)
             mod = rinnova(raw) or mod
+            mod = rinnova_portata(raw) or mod
             if mod:
                 self._scrivi(raw)
                 return True
@@ -468,6 +485,34 @@ class DB:
     def _c(self):
         return sqlite3.connect(self.path, timeout=30)
 
+    # Dal 5/11 17:25 la pompa rimanda a volte lo stesso istante con la portata corrotta (vedi docs/manutenzione-e-problemi.md):
+    # i valori assurdi si scartano gia' in decodifica (max 60 L/min), qui si registrano solo le versioni diverse.
+    DIAG_MAX_BYTE = 400_000  # il file di diagnostica smette di crescere oltre questa dimensione
+
+    def _diag_versione(self, tipo, ts, hex_prima, hex_nuovo):
+        """Diagnostica: lo stesso (tipo, istante) e' arrivato con byte diversi. Scrive una riga (una volta sola per
+        versione) in diag_versioni_ciclo.txt accanto al database: non tocca nessun dato."""
+        chiave = (tipo, ts, hex_nuovo)
+        visti = self.__dict__.setdefault("_diag_visti", set())
+        if chiave in visti:
+            return
+        if len(visti) > 5000:
+            visti.clear()
+        visti.add(chiave)
+        try:
+            f = Path(self.path).parent / "diag_versioni_ciclo.txt"
+            if f.exists() and f.stat().st_size > self.DIAG_MAX_BYTE:
+                return
+            a, b = bytes.fromhex(hex_prima), bytes.fromhex(hex_nuovo)
+            diversi = ",".join(f"{i}:{x:02X}>{y:02X}" for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y)
+            ora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            camp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            with open(f, "a", encoding="utf-8") as fh:
+                fh.write(f"arrivo {ora} | {tipo} campione {camp} | byte cambiati {diversi or 'lunghezza'} | "
+                         f"prima {hex_prima} | poi {hex_nuovo}\n")
+        except Exception:
+            pass  # e' solo diagnostica: non deve mai dare fastidio
+
     @staticmethod
     def _upsert_ultimo(c, serie, ts, num, txt):
         c.execute("INSERT INTO ultimo(serie,ts,num,txt) VALUES(?,?,?,?) "
@@ -479,7 +524,11 @@ class DB:
         cambiati = []
         with self.lock, closing(self._c()) as c, c:
             for tipo, ts, hx in rec.ciclo:
-                c.execute("INSERT OR IGNORE INTO ciclo VALUES(?,?,?)", (tipo, ts, hx))
+                r = c.execute("SELECT hex FROM ciclo WHERE tipo=? AND ts=?", (tipo, ts)).fetchone()
+                if r is None:
+                    c.execute("INSERT OR IGNORE INTO ciclo VALUES(?,?,?)", (tipo, ts, hx))
+                elif r[0] != hx:
+                    self._diag_versione(tipo, ts, r[0], hx)
             for serie, ts, val, lento in rec.num:
                 if lento:
                     r = c.execute("SELECT ts, num FROM ultimo WHERE serie=?", (serie,)).fetchone()
@@ -978,6 +1027,7 @@ class Raccoglitore(threading.Thread):
 class ServizioST(Raccoglitore):
     def __init__(self, app):
         super().__init__(app, "st")
+        self.ult_info = 0          # ultima lettura dei dati di info del dispositivo
         self.passi = 0
         self.offline = 0
         # stato del "refresh" (vedi _refresh): lo legge la Dashboard
@@ -1029,7 +1079,7 @@ class ServizioST(Raccoglitore):
             self.app.eventi.chiudi("st_ciclo_formato")
         if self.passi % 5 == 0:
             self._salute(dev, ts)
-        if time.time() - getattr(self, "ult_info", 0) > 3600:
+        if time.time() - self.ult_info > 3600:
             self.ult_info = time.time()
             self._info_dispositivo(dev, ts)
         self.passi += 1
@@ -1160,6 +1210,7 @@ class ServizioST(Raccoglitore):
 class ServizioNT(Raccoglitore):
     def __init__(self, app):
         super().__init__(app, "nt")
+        self.ult_info = 0          # ultima lettura della modalita' della casa (homesdata)
 
     def intervallo(self):
         return max(60, int(self.app.cfg.leggi()["generale"]["intervallo_netatmo_secondi"]))
@@ -1187,7 +1238,7 @@ class ServizioNT(Raccoglitore):
             self.app.cfg.aggiorna(lambda raw: raw.setdefault("netatmo", {}).update(home_id=home))
         js = self._get("/api/homestatus", {"home_id": home})
         ts = int(time.time())
-        if ts - getattr(self, "ult_info", 0) > 120:  # la modalita' della casa (hg = spento) sta solo in homesdata
+        if ts - self.ult_info > 120:  # la modalita' della casa (hg = spento) sta solo in homesdata
             self.ult_info = ts
             try:
                 self.app.db.salva(estrai_netatmo_casa(self._get("/api/homesdata")), ts)
@@ -1280,7 +1331,6 @@ import bisect
 import collections
 import gzip
 import hmac
-import math
 import queue
 import secrets
 import struct
@@ -1534,6 +1584,7 @@ a{color:var(--acs)}
 
 /* ---------- curva ---------- */
 .curva svg{width:100%;height:auto;display:block;margin-top:6px}
+#curva{position:relative}
 .curva text{fill:var(--mut);font-size:11px;font-family:inherit}
 .curva .ass{fill:var(--mut2);font-size:11px}
 .box2,.exp{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
@@ -1880,7 +1931,7 @@ const S = {
   pagina: (location.hash.replace('#/', '').split('/')[0] in TITOLI) ? location.hash.replace('#/', '').split('/')[0] : 'dashboard',
   sub: location.hash.replace('#/', '').split('/')[1] || '',
   range: ls.get('range', '24h'), rangeEff: ls.get('rangeEff', '7g'), custom: ls.get('custom', null),
-  dati: null, sse: false, off: 0,
+  dati: null, sse: false, off: 0, solo: false,
 };
 const ora = () => Math.floor(Date.now() / 1000) + S.off;
 
@@ -2206,7 +2257,7 @@ function curva(c) {
   nice(x0, x1, 5).forEach(v => { g += `<line x1="${X(v)}" x2="${X(v)}" y1="${T}" y2="${H - B}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${X(v)}" y="${H - B + 16}" text-anchor="${X(v) > W - 12 ? 'end' : 'middle'}">${v}°</text>`; });   // l'ultimo numero finisce sul bordo, non sporge
   nice(y0, y1, 10).forEach(v => { g += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="rgba(255,255,255,.06)"/><text class="ass" x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${v}°</text>`; });
   const A = c.basso, Z = c.alto;
-  const pts = c.punti.map(p => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.6" fill="#ff6b57" fill-opacity=".38"/>`).join('');
+  const pts = c.punti.map((p, i) => `<circle data-pc="${i}" cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.6" fill="#ff6b57" fill-opacity=".38"/>`).join('');
   let ora_ = '';
   if (c.ora.esterna != null && c.ora.mandata != null) {
     const ox = X(Math.max(x0, Math.min(x1, c.ora.esterna))), oy = Y(c.ora.mandata);
@@ -2223,7 +2274,7 @@ function curva(c) {
     ${ora_}${lab(A.esterna, A.mandata, num(A.mandata, 0) + '°C', '#4da3ff')}${lab(Z.esterna, Z.mandata, num(Z.mandata, 0) + '°C', '#34d3b0')}
     <text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">Temperatura esterna (°C)</text>
     <text transform="translate(8.5 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">Mandata (°C)</text>
-</svg>
+</svg><div class="tip" id="tipc" hidden></div>
     <div class="box2">
       <div class="bx tn c-acs"><small class="eti">Freddo</small><p><b>${num(A.mandata, 0)}°C</b><span>mandata a <strong>${num(A.esterna, 0)}°C</strong> esterni</span></p></div>
       <div class="bx tn c-est"><small class="eti">Mite</small><p><b>${num(Z.mandata, 0)}°C</b><span>mandata a <strong>${num(Z.esterna, 0)}°C</strong> esterni</span></p></div>
@@ -2234,6 +2285,34 @@ function curva(c) {
       <li><i class="pt"></i>Puntini: mandate misurate mentre scaldava</li>
       <li><i class="in"></i>Offset del pannello non leggibile</li>
     </ul>`);
+  const cw = $('#curva'); if (cw) cw._cv = {W, X, Y, pts: c.punti, lungo: !!c.lungo, sel: null};
+}
+
+// Tooltip dei puntini della curva: ora (o giorno e ora se il periodo supera le 24 ore) e valori del puntino più vicino
+function sceltaCurva(m, c) {
+  if (m.sel && m.sel !== c) { m.sel.setAttribute('r', '2.6'); m.sel.setAttribute('fill-opacity', '.38'); }
+  m.sel = c;
+  if (c) { c.setAttribute('r', '4.2'); c.setAttribute('fill-opacity', '1'); }
+}
+function togliTipCurva() {
+  const w = $('#curva'), t = $('#tipc'); if (t) t.hidden = true;
+  if (w && w._cv) sceltaCurva(w._cv, null);
+}
+function tooltipCurva(e) {
+  const w = $('#curva'), svg = w && w.querySelector('svg'), tip = $('#tipc'); if (!w || !w._cv || !svg || !tip) return;
+  const m = w._cv, r = svg.getBoundingClientRect(), k = r.width / m.W;
+  let best = -1, bd = 18 * 18;   // raggio di 18 px: comodo anche col dito
+  m.pts.forEach((p, i) => { const dx = r.left + m.X(p[0]) * k - e.clientX, dy = r.top + m.Y(p[1]) * k - e.clientY, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = i; } });
+  if (best < 0) { togliTipCurva(); return; }
+  const p = m.pts[best];
+  sceltaCurva(m, svg.querySelector(`[data-pc="${best}"]`));
+  const quando = m.lungo ? `${new Date(p[2] * 1000).toLocaleDateString('it-IT', {day: 'numeric', month: 'numeric'})} ${hhmm(p[2])}` : hhmm(p[2]);
+  tip.innerHTML = `<b>${quando}</b><br>${num(p[0])}°C esterni · mandata ${num(p[1])}°C`;
+  tip.hidden = false;
+  const wr = w.getBoundingClientRect(), x = r.left + m.X(p[0]) * k - wr.left, y = r.top + m.Y(p[1]) * k - wr.top, mezzo = tip.offsetWidth / 2 + 2;
+  tip.style.left = Math.max(mezzo, Math.min(wr.width - mezzo, x)) + 'px';
+  tip.style.top = (y < 56 ? y + 14 : y - 8) + 'px';           // vicino al bordo alto compare sotto il puntino
+  tip.style.transform = y < 56 ? 'translate(-50%,0)' : '';
 }
 
 function avvisi() {
@@ -2359,7 +2438,7 @@ function disegnaAnalisi(p) {
 }
 
 // linea a gradini: ogni valore dura fino a meta' strada dal punto successivo; dove c'e' un buco i pezzi si staccano
-function segmentiGradini(punti, X, buco, mezzo) {
+function segmentiGradini(punti, buco, mezzo) {
   const segs = []; let cur = null, prec = null;
   for (let i = 0; i < punti.length; i++) {
     const [t, v] = punti[i];
@@ -2373,7 +2452,7 @@ function segmentiGradini(punti, X, buco, mezzo) {
 }
 function percorsoGradini(punti, X, Y, buco, mezzo, area, base) {
   let s = '';
-  segmentiGradini(punti, X, buco, mezzo).forEach(seg => {
+  segmentiGradini(punti, buco, mezzo).forEach(seg => {
     let ultY = null, x0 = null, x1 = null, p = '';
     seg.forEach(([t, v], i) => {
       const x = X(t).toFixed(1), y = Y(v).toFixed(1);
@@ -2706,7 +2785,6 @@ function vistaImp() {
   document.querySelectorAll('#imp .imp-tab').forEach(g => { g.hidden = g.dataset.t !== (cur || 'stato'); });
   if (reg) caricaRegistro();
 }
-S.solo = S.solo || false;
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
   try {
@@ -2892,6 +2970,30 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.4', quando: '9 novembre 2026', titolo: 'Controllo generale', righe: [
+    ['s', 'Numeri strani nei campi', 'Scrivere «nan», «inf» o un numero enorme in un campo di FSV, regolazioni o Boost dava «errore interno»: ora risponde con il solito messaggio, senza mandare nulla alla pompa.'],
+    ['s', 'Tunnel che si ferma di continuo', 'Se cloudflared non riusciva a ripartire, Avvia, Ferma e Riavvia restavano bloccati fino a 5 minuti: ora rispondono subito.'],
+    ['s', 'Boost non ripristinato', 'Se dopo 30 tentativi il Boost non riesce a rimettere i valori di prima, il pannello apre un’anomalia (con avviso Telegram) invece di rinunciare in silenzio.'],
+    ['s', 'Richieste rifiutate', 'Dopo una richiesta rifiutata (non consentita, troppo grande, login bloccato) la connessione si chiude: niente più errori 400 a caso sulla richiesta successiva.'],
+    ['s', 'Pulsanti che restavano spenti', 'Se il server non rispondeva, i pulsanti di Accesso da internet e della password restavano disabilitati: ora tornano attivi e compare l’avviso.'],
+    ['s', 'Password da config.json', 'Una password scritta a mano in config.json ora deve avere almeno 10 caratteri, come quella cambiata dal pannello (prima ne bastavano 8).'],
+    ['m', 'Password più robuste', 'Le nuove password si proteggono con 600.000 passaggi invece di 200.000. Quelle già impostate continuano a funzionare.'],
+    ['m', 'Registro senza segreti', 'Gli errori delle rotte dei plugin non scrivono più l’indirizzo segreto nel registro, e il registro mostrato in Impostazioni lo nasconde comunque.'],
+    ['m', 'cloudflared scaricato con controllo', 'Il programma si confronta con l’impronta SHA-256 pubblicata da GitHub: se non corrisponde viene scartato.'],
+    ['m', 'Telegram spento', 'Con Telegram spento i messaggi in coda più vecchi di un’ora si buttano: alla riaccensione non arriva più una raffica di avvisi vecchi.'],
+    ['m', 'Alexa 1.4.1', 'Con la verifica firma su «Attiva», una richiesta la cui firma non si può controllare ora viene rifiutata.'],
+    ['m', 'Grafici più fluidi', 'Trascinando o toccando un grafico, il pannello aggiorna una volta per fotogramma invece che a ogni minimo movimento.'],
+    ['m', 'Integrazioni più leggere', 'La scheda Integrazioni, che si aggiorna ogni 5 secondi, ora chiede solo lo stato dei plugin e non tutte le impostazioni.'],
+    ['m', 'Python 3.10', 'Ora serve Python 3.10 o più recente: se è più vecchio, il pannello lo dice subito all’avvio invece di rompersi più avanti.'],
+  ]},
+  {v: '0.25.3', quando: '9 novembre 2026', titolo: 'Puntini della curva', righe: [
+    ['n', 'Ora sui puntini della curva', 'Nella Dashboard, passando il mouse o toccando un puntino della curva climatica compaiono l’ora (il giorno e l’ora se il periodo supera le 24 ore), la temperatura esterna e la mandata di quella misura.'],
+    ['m', 'Portata a 36 byte', 'Anche il formato a 36 byte legge la portata dai byte 6 e 7 insieme, come da guida; vale solo per le installazioni nuove.'],
+  ]},
+  {v: '0.25.2', quando: '8 novembre 2026', titolo: 'Portata e COP', righe: [
+    ['s', 'Portata dei cicli', 'La portata sta nei byte 6 e 7 insieme (un numero a 16 bit), non nel solo byte 7. Dal 5 novembre la pompa rimanda a volte lo stesso istante con il valore corrotto (17-24 L/min senza senso): il COP sembrava peggiorare ma era solo il dato. Ora si leggono i due byte e tutto sopra 60 L/min si scarta. Per rimettere a posto i giorni passati: backup e ridecodifica.'],
+    ['n', 'Diagnostica delle versioni', 'Quando la pompa rimanda lo stesso istante con byte diversi, il pannello lo scrive (una riga per versione) in dati/diag_versioni_ciclo.txt, senza toccare nessun dato.'],
+  ]},
   {v: '0.25.1', quando: '8 novembre 2026', titolo: 'Avvisi finti e dati esterni', righe: [
     ['s', 'Browser che si stacca', 'Se il browser chiudeva la connessione a metà risposta (ricaricando la pagina, per esempio), il registro mostrava un errore con tutta la traccia anche se non c’era niente da correggere: ora viene ignorato, come già succedeva per gli altri distacchi.'],
     ['s', 'Meteo e stazione sempre aggiornati', 'La previsione e l’umidità della stazione vicina si leggono ora anche con la Dashboard chiusa, da un solo lavoro di fondo: niente buco alla riapertura (nemmeno per Alexa e il widget) e niente avvisi finti di «dato vecchio».'],
@@ -3756,7 +3858,7 @@ async function plgAggiorna() {
   if (plgOccupato || document.hidden || S.pagina !== 'impostazioni' || S.sub !== 'integrazioni') return;
   plgOccupato = true;
   try {
-    const r = await leggiJson('/api/impostazioni');
+    const r = await leggiJson('/api/plugin/stato');      // solo i plugin, non tutte le impostazioni
     if (!r || !r.ok || S.sub !== 'integrazioni') return;
     const d = await r.json();
     d.sezioni.filter(x => x.tab === 'integrazioni' && x.plugin).forEach(x => {
@@ -4124,17 +4226,27 @@ function avvia() {
       else if (S.dati) { const b = $('#dsp'); if (b) b.dataset.h = ''; disegna(); }
     }
   });
-  document.addEventListener('pointermove', e => {
+  // i movimenti si elaborano una volta per fotogramma (l'ultimo di ogni dito), non a ogni evento: il browser ne manda anche piu' di uno per fotogramma
+  const muoviPunt = e => {
     if (spostaMuovi(e) || zoomaMuovi(e) || dita.size > 1) return;
+    const cv = e.target.closest && e.target.closest('#curva svg'); if (!cv) togliTipCurva();
     if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e);
+    else if (cv) tooltipCurva(e);
     else { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
+  };
+  const inAttesa = new Map();
+  document.addEventListener('pointermove', e => {
+    if (!inAttesa.size) requestAnimationFrame(() => { const l = [...inAttesa.values()]; inAttesa.clear(); l.forEach(muoviPunt); });
+    inAttesa.set(e.pointerId, e);
   });
   document.addEventListener('pointerleave', togliCursore);
   document.addEventListener('input', segnaModifica); document.addEventListener('change', segnaModifica);
-  document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { if (e.target.id.startsWith('cf-')) cfAzione(e); else azioniImpostazioni(e); } });
+  document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { 
+    Promise.resolve(e.target.id.startsWith('cf-') ? cfAzione(e) : azioniImpostazioni(e))
+      .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; CFS.occupato = false; }); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
-  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else muoviCursore(e); });
+  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; const cv = e.target.closest && e.target.closest('#curva svg'); if (!cv) togliTipCurva(); if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else if (cv) tooltipCurva(e); else muoviCursore(e); });
   document.addEventListener('pointerup', e => { spostaSu(); zoomaSu(e); }); document.addEventListener('pointercancel', e => { spostaSu(); zoomaSu(e); });
   if (S.range === 'custom' && S.pagina !== 'efficienza') { $('#custom').hidden = false; if (S.custom) { $('#c-da').value = loc(S.custom.da); $('#c-a').value = loc(S.custom.a); } }
   ricordaFinestra();
@@ -4247,7 +4359,7 @@ BUILD = _calcola_build(VERSIONE, WEB_ASSETS)
 # Password, sessioni, blocco anti-tentativi
 # --------------------------------------------------------------------------
 
-PBKDF2_ITER = 200_000
+PBKDF2_ITER = 600_000      # l'hash salva le iterazioni usate: le password gia' impostate (200k) restano valide
 
 
 def hash_password(pw):
@@ -4270,8 +4382,8 @@ def applica_credenziali(app):
     acc = app.cfg.leggi()["accesso"]
     if not acc.get("password"):
         return
-    if len(acc["password"]) < 8:
-        log.error("accesso.password troppo corta (minimo 8 caratteri): ignorata")
+    if len(acc["password"]) < PASSWORD_MIN:
+        log.error("accesso.password troppo corta (minimo %d caratteri): ignorata", PASSWORD_MIN)
         return
     h = hash_password(acc["password"])
 
@@ -4570,14 +4682,14 @@ def dati_curva(db, ult, da, a, esterna_ora):
     ma = dict(q_serie(db, "ciclo.mandata", da, a))
     fr = dict(q_serie(db, "ciclo.freq_compressore", da, a))
     cambi = q_cambi(db, "pdc.valvola", da, a)
-    punti = [[es[t], ma[t]] for t in sorted(es)
+    punti = [[es[t], ma[t], t] for t in sorted(es)     # [esterna, mandata, istante]: l'istante serve al tooltip
              if t in ma and fr.get(t, 0) > 0 and stato_a(cambi, t) in (None, "room")]
     if len(punti) > 300:
         passo = len(punti) / 300
         punti = [punti[int(i * passo)] for i in range(300)]
     curva = (t1, m1, t2, m2)
     return {"basso": {"esterna": t1, "mandata": m1}, "alto": {"esterna": t2, "mandata": m2},
-            "zona": zona, "zona_fonte": fonte, "punti": punti,
+            "zona": zona, "zona_fonte": fonte, "punti": punti, "lungo": a - da > 86400,
             "ora": {"esterna": esterna_ora,
                     "mandata": mandata_calcolata(curva, esterna_ora) if esterna_ora is not None else None}}
 
@@ -5057,7 +5169,7 @@ RIP_MAX_ORE = 12          # oltre questo orizzonte la stima non e' credibile
 
 def _med_pesata(vals, pesi):
     """Mediana pesata: robusta, non si fa spostare da una discesa strana."""
-    coppie = sorted(zip(vals, pesi))
+    coppie = sorted(zip(vals, pesi, strict=True))
     meta = sum(p for _, p in coppie) / 2.0
     acc = 0.0
     for v, p in coppie:
@@ -5183,8 +5295,8 @@ def ripartenza_fit(campioni, ora, diag=None):
         if diag is not None:
             diag.setdefault("motivi", []).append("pause valide troppo vecchie (peso %.1f, ne servono almeno 3,0): servono dati piu' recenti" % sum(pesi))
         return None
-    scarti = [(c["scarto"], p) for c, p in zip(campioni, pesi) if c["scarto"] is not None]
-    assoluti = [(c["te"], p) for c, p in zip(campioni, pesi)]
+    scarti = [(c["scarto"], p) for c, p in zip(campioni, pesi, strict=True) if c["scarto"] is not None]
+    assoluti = [(c["te"], p) for c, p in zip(campioni, pesi, strict=True)]
     return {"k": _med_pesata([c["k"] for c in campioni], pesi),
             "sovra": _med_pesata([c["sovra"] for c in campioni], pesi),
             "coda_min": _med_pesata([c["coda_min"] for c in campioni], pesi),
@@ -5862,7 +5974,7 @@ def _tratti_calmi(temp, tts, cicli, w0, w1):
     for g0, g1 in liberi:
         pts = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
         ini = g0
-        for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+        for (ta, va), (tb, vb) in zip(pts, pts[1:], strict=False):
             if tb - ta <= 900 and (va - vb >= 1.0 or vb - va >= 0.3):
                 if ta - ini >= 3600:
                     out.append((ini, ta))
@@ -6416,12 +6528,20 @@ class Gestore(BaseHTTPRequestHandler):
         if e_https(self):
             self.send_header("Strict-Transport-Security", "max-age=15552000")
         self.send_header("Content-Security-Policy", sost.get("Content-Security-Policy", CSP))
+        if getattr(self, "_chiudi", False):      # corpo della richiesta non letto: la connessione non si riusa
+            self.send_header("Connection", "close")
         for k, v in extra:
             if k not in sost:
                 self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(dati)
+
+    def _rifiuta_json(self, obj, codice):
+        """Errore dato prima di leggere il corpo della richiesta: poi si chiude la connessione, altrimenti il corpo
+        rimasto in coda sarebbe letto come richiesta successiva (HTTP/1.1 keep-alive)."""
+        self._chiudi = True
+        self._json(obj, codice)
 
     def _json(self, obj, codice=200):
         self._invia(codice, json.dumps(obj, separators=(",", ":"), ensure_ascii=False),
@@ -6551,13 +6671,13 @@ class Gestore(BaseHTTPRequestHandler):
         # difesa da richieste fatte da altri siti: intestazione speciale + stessa origine
         origine = self.headers.get("Origin")
         if self.headers.get("X-Pdc") != "1" or (origine and urlparse(origine).netloc != self.headers.get("Host", "")):
-            return self._json({"errore": "richiesta non consentita"}, 403)
+            return self._rifiuta_json({"errore": "richiesta non consentita"}, 403)
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
         if n < 0 or n > 200_000:
-            return self._json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
+            return self._rifiuta_json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
         try:
             corpo = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
             if not isinstance(corpo, dict):
@@ -6569,6 +6689,7 @@ class Gestore(BaseHTTPRequestHandler):
     def _login(self, app):
         ip = ip_client(self)
         origine = self.headers.get("Origin")
+        self._chiudi = True      # in tutti i casi di rifiuto (e se il corpo supera il limite) il corpo non viene letto per intero
         if origine and origine != "null" and urlparse(origine).netloc != self.headers.get("Host", ""):
             return self._invia(403, "Richiesta non consentita", "text/plain; charset=utf-8")
         if app.limite.bloccato(ip):
@@ -6577,6 +6698,8 @@ class Gestore(BaseHTTPRequestHandler):
             n = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
         except ValueError:
             n = 0
+        lungh = self.headers.get("Content-Length", "0").strip()
+        self._chiudi = not lungh.isdigit() or int(lungh) > n        # corpo piu' lungo del limite: resta in coda, quindi si chiude
         dati = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
         utente, pw = dati.get("utente", [""])[0], dati.get("password", [""])[0]
         acc = app.cfg.leggi()["accesso"]
@@ -7109,7 +7232,8 @@ class Telegram:
                 self._togli(e)          # si e' risolto da solo durante il ritardo: nessun messaggio
                 continue
             if not self.attivo():
-                self._togli(e) if e["tentativi"] > 0 else None
+                if e["tentativi"] > 0 or adesso - e["due"] > 3600:     # a Telegram spento la coda non si accumula per sempre
+                    self._togli(e)
                 continue
             if not self._limite_ok(e["forza"]):
                 self._togli(e)
@@ -7442,7 +7566,7 @@ class Sentinella(threading.Thread):
             if v_max > soglie_umidita(self.app)[0]:
                 righe.append(f"💧 Umidità fino a {num_it(v_max, 0)} % (alle {time.strftime('%H:%M', time.localtime(ts_max))})")
         hm = lambda x: time.strftime("%H:%M", time.localtime(x))
-        for ts, cod, liv, testo, chiuso in reversed(db.eventi_recenti(100)):
+        for ts, cod, _liv, _testo, chiuso in reversed(db.eventi_recenti(100)):
             if ini <= ts < fin:
                 fino = f"alle {hm(chiuso)}" if chiuso else "ancora aperto"
                 righe.append(f"⚠️ {esc_html(TITOLI.get(cod, cod))}: dalle {hm(ts)} {fino}")
@@ -7922,6 +8046,7 @@ _SEGRETI = [
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=\-]{8,}"), r"\1***"),
     (re.compile(r"(?i)((?:access_token|refresh_token|client_secret|secret|password|passwd|pat|token|api_key|apikey)[\"']?\s*[:=]\s*[\"']?)[^\s,\"'}&]+"), r"\1***"),
     (re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{30,}\b"), "***"),
+    (re.compile(r"(/plugin/)[^\s\"'?]+"), r"\1***"),             # le rotte pubbliche dei plugin contengono un segreto
     (re.compile(r"[A-Za-z0-9_\-]{40,}"), "***"),
 ]
 
@@ -8093,6 +8218,22 @@ def _url_download():
     return None
 
 
+def _digest_ufficiale(nome_file):
+    """SHA-256 che GitHub pubblica per il file dell'ultima versione (campo «digest» dell'API): None se non si riesce a leggerlo."""
+    try:
+        code, js = http_json("GET", "https://api.github.com/repos/cloudflare/cloudflared/releases/latest",
+                             {"User-Agent": "pdc-pannello", "Accept": "application/vnd.github+json"}, timeout=20)
+    except Exception:                                            # noqa: BLE001
+        return None
+    if code != 200 or not isinstance(js, dict):
+        return None
+    for a in js.get("assets") or []:
+        if isinstance(a, dict) and a.get("name") == nome_file:
+            d = str(a.get("digest") or "")
+            return d[7:].lower() if d.startswith("sha256:") and len(d) == 71 else None
+    return None
+
+
 def scarica_cloudflared(app):
     url = _url_download()
     if not url:
@@ -8105,10 +8246,12 @@ def scarica_cloudflared(app):
         req = Request(url, headers={"User-Agent": "pdc-pannello"})
         with urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
             tot = 0
+            impronta = hashlib.sha256()
             while True:
                 blocco = r.read(1 << 16)
                 if not blocco:
                     break
+                impronta.update(blocco)
                 tot += len(blocco)
                 if tot > 150_000_000:
                     raise ErroreCF("Il file scaricato e' troppo grande: lo scarto.")
@@ -8120,6 +8263,12 @@ def scarica_cloudflared(app):
     if tot < 5_000_000:
         tmp.unlink(missing_ok=True)
         raise ErroreCF("Il file scaricato e' troppo piccolo per essere cloudflared.")
+    atteso = _digest_ufficiale(url.rsplit("/", 1)[1])
+    if atteso and atteso != impronta.hexdigest():
+        tmp.unlink(missing_ok=True)
+        raise ErroreCF("Il file scaricato non corrisponde all'impronta (SHA-256) pubblicata da GitHub: lo scarto. Riprova fra poco.")
+    if not atteso:
+        log.warning("cloudflared: impronta SHA-256 ufficiale non disponibile, controllo solo dimensione e tipo di file")
     if os.name == "nt":
         with open(tmp, "rb") as f:
             if f.read(2) != b"MZ":
@@ -8292,6 +8441,7 @@ class TunnelCF:
     def _guardia_interna(self):
         attesa = 5
         while not self.fermo.wait(5):
+            pausa = 0
             with self.lock:
                 if not self.voluto:
                     return
@@ -8307,15 +8457,17 @@ class TunnelCF:
                         self._lancia(_percorso_exe(self.app), self._cfg())
                     except ErroreCF as e:
                         self.ultimo_errore = str(e)
-                    self.fermo.wait(min(300, attesa))
+                    pausa = min(300, attesa)         # l'attesa si fa FUORI dal lucchetto: Ferma/Riavvia non restano bloccati
                     attesa = min(300, attesa * 2)
-                    continue
-                if self.collegato():
+                elif self.collegato():
                     self.fallimenti, attesa = 0, 5
                     self.app.eventi.chiudi("cf_tunnel")
                 elif time.time() - self.partito_il > 180:
                     self.app.eventi.apri("cf_tunnel", "Il tunnel e' avviato ma non risulta collegato a Cloudflare da oltre 3 minuti. "
                                          + self._ultima_riga_problema(), "avviso")
+            if pausa:
+                self.fermo.wait(pausa)
+                continue
             try:
                 self._controllo_esterno()
             except Exception:
@@ -9477,6 +9629,8 @@ def fsv_valore_valido(cod, valore):
         n = float(str(valore).replace(",", "."))
     except (TypeError, ValueError):
         return None, "Il valore non e' un numero."
+    if not math.isfinite(n):
+        return None, "Il valore non e' un numero."
     if n != int(n):
         return None, "Queste impostazioni vanno a numeri interi."
     n = int(n)
@@ -9499,7 +9653,7 @@ def _cronologia_fsv(storia, richieste, nomi, unita, adesso):
                 continue
             ts, dopo, prima = st[i][0], st[i][1], st[i - 1][1]
             fonte, ip, chiesta = "letto", "", None
-            for k, (rts, rprima, rdopo, rip, _) in enumerate(richieste.get(cod, [])):
+            for k, (rts, _rprima, rdopo, rip, _) in enumerate(richieste.get(cod, [])):
                 if (cod, k) not in usate and rts <= ts <= rts + 172800 and _fsv_numero(rdopo) == _fsv_numero(dopo):
                     usate.add((cod, k))
                     fonte, ip, chiesta = "pannello", rip, rts
@@ -10118,7 +10272,7 @@ def valida_regolazione(app, cosa, valore, ult):
     except (TypeError, ValueError):
         return None, "Il valore non e' un numero."
     lo, hi = reg_limiti_acs(ult)
-    if n != int(n):
+    if not math.isfinite(n) or n != int(n):
         return None, "La temperatura va a gradi interi."
     n = int(n)
     if not (lo <= n <= hi):
@@ -10268,6 +10422,7 @@ def _boost_ripristina(app, motivo, ip="pannello"):
             log.warning("boost: ripristino fallito: %s", msg)
             return False, msg
         _boost_scrivi(app, None)
+        app.eventi.chiudi("boost_ripristino")
         log.info("boost finito (%s): modo %s, setpoint %s", motivo, b.get("modo_prima"), b.get("sp_prima"))
         _boost_rileggi(app, sv)
         return True, None
@@ -10301,6 +10456,10 @@ def _boost_vigila(app):
             ok, _ = _boost_ripristina(app, motivo)
             if not ok and int(b.get("tentativi", 0)) >= 30:
                 _boost_scrivi(app, None)          # dopo troppi tentativi si rinuncia (resta il registro dei comandi)
+                log.error("boost: ripristino abbandonato dopo 30 tentativi: modo e setpoint di prima NON rimessi")
+                app.eventi.apri("boost_ripristino", f"Il boost e' finito ma non sono riuscito a rimettere i valori di prima (modo «{b.get('modo_prima')}», "
+                                f"setpoint {b.get('sp_prima')} °C) dopo 30 tentativi: la pompa potrebbe essere rimasta in «Forzato». "
+                                "Controlla e rimettili da Controlli.", "errore")
             if _boost_thread_finito(app):
                 return
 
@@ -10336,7 +10495,7 @@ def boost_avvia(app, obiettivo, ip):
     except (TypeError, ValueError):
         return {"ok": False, "errore": "La temperatura non e' un numero."}
     lo, hi = reg_limiti_acs(ult)
-    if n != int(n) or not (lo <= n <= hi):
+    if not math.isfinite(n) or n != int(n) or not (lo <= n <= hi):
         return {"ok": False, "errore": f"La temperatura va a gradi interi, da {lo} a {hi} °C."}
     n = int(n)
     sp, modo, temp = ult.get("acs.setpoint"), ult.get("pdc.modo"), ult.get("acs.temperatura")
@@ -10637,6 +10796,12 @@ def plugin_ricarica(app):
         return len(PLUGIN)
 
 
+@api("/api/plugin/stato")
+def api_plugin_stato(app, q):
+    """Solo i riquadri dei plugin (stato e contatori): la scheda Integrazioni li rilegge ogni 5 secondi, senza scaricare tutte le impostazioni."""
+    return {"sezioni": sezioni_plugin()}
+
+
 @api("/api/plugin/changelog")
 def api_plugin_changelog(app, q):
     """Le cronologie dei plugin, per la tab Changelog > Plugin."""
@@ -10681,10 +10846,12 @@ def plugin_pubblico(app, h, p, q):
     voce = PLUGIN_ROTTE.get(p)
     plug = PLUGIN.get(voce[0]) if voce else None
     if not voce or not plug or not plug.avviato:
+        h._chiudi = True       # i rifiuti qui sotto avvengono prima di leggere il corpo: la connessione non si riusa
         if _troppo_veloce("-", ip_client(h)):      # anche gli indirizzi sbagliati hanno un limite: niente tentativi a raffica
             return h._json({"errore": "troppe richieste"}, 429)
         return h._invia(404, "Non trovato", "text/plain; charset=utf-8")
     _, funzione, metodi = voce
+    h._chiudi = True
     if h.command not in metodi:
         return h._invia(405, "Metodo non consentito", "text/plain; charset=utf-8")
     ip = ip_client(h)
@@ -10696,6 +10863,7 @@ def plugin_pubblico(app, h, p, q):
         n = -1
     if n < 0 or n > PLUGIN_MAX_CORPO:
         return h._json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
+    h._chiudi = False
     corpo = h.rfile.read(n) if n else b""
     plug.richieste, plug.ultima = plug.richieste + 1, int(time.time())
     req = Richiesta(h.command, p, q, corpo, {k.lower(): v for k, v in h.headers.items()}, ip)
@@ -10703,7 +10871,7 @@ def plugin_pubblico(app, h, p, q):
         r = funzione(req)
     except Exception as e:
         plug.ultimo_errore = _riassunto(e)
-        log.exception("Plugin %s: errore nella rotta %s", plug.nome, p)
+        log.exception("Plugin %s: errore in una sua rotta pubblica (percorso omesso dal registro)", plug.nome)
         return h._json({"errore": "errore interno"}, 500)
     plug.ultimo_errore = ""
     if isinstance(r, dict):
@@ -10913,7 +11081,7 @@ def cmd_stato(app):
     ac = info_accesso_st(app)
     print("Accesso SmartThings:", {"oauth": "OAuth (si rinnova da solo)", "pat": "token personale PAT (24 ore)"}.get(ac["tipo"], ac["tipo"]))
     aperti = [e for e in app.db.eventi_recenti(30) if e[4] is None]
-    for _, cod, liv, testo, _ in aperti:
+    for _, cod, _liv, testo, _ in aperti:
         print(f"ANOMALIA APERTA [{cod}]: {testo}")
 
 

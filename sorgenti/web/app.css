@@ -243,6 +243,7 @@ a{color:var(--acs)}
 
 /* ---------- curva ---------- */
 .curva svg{width:100%;height:auto;display:block;margin-top:6px}
+#curva{position:relative}
 .curva text{fill:var(--mut);font-size:11px;font-family:inherit}
 .curva .ass{fill:var(--mut2);font-size:11px}
 .box2,.exp{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}

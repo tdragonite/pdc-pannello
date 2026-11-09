@@ -8,7 +8,6 @@ import bisect
 import collections
 import gzip
 import hmac
-import math
 import queue
 import secrets
 import struct
@@ -30,7 +29,7 @@ BUILD = _calcola_build(VERSIONE, WEB_ASSETS)
 # Password, sessioni, blocco anti-tentativi
 # --------------------------------------------------------------------------
 
-PBKDF2_ITER = 200_000
+PBKDF2_ITER = 600_000      # l'hash salva le iterazioni usate: le password gia' impostate (200k) restano valide
 
 
 def hash_password(pw):
@@ -53,8 +52,8 @@ def applica_credenziali(app):
     acc = app.cfg.leggi()["accesso"]
     if not acc.get("password"):
         return
-    if len(acc["password"]) < 8:
-        log.error("accesso.password troppo corta (minimo 8 caratteri): ignorata")
+    if len(acc["password"]) < PASSWORD_MIN:
+        log.error("accesso.password troppo corta (minimo %d caratteri): ignorata", PASSWORD_MIN)
         return
     h = hash_password(acc["password"])
 
@@ -353,14 +352,14 @@ def dati_curva(db, ult, da, a, esterna_ora):
     ma = dict(q_serie(db, "ciclo.mandata", da, a))
     fr = dict(q_serie(db, "ciclo.freq_compressore", da, a))
     cambi = q_cambi(db, "pdc.valvola", da, a)
-    punti = [[es[t], ma[t]] for t in sorted(es)
+    punti = [[es[t], ma[t], t] for t in sorted(es)     # [esterna, mandata, istante]: l'istante serve al tooltip
              if t in ma and fr.get(t, 0) > 0 and stato_a(cambi, t) in (None, "room")]
     if len(punti) > 300:
         passo = len(punti) / 300
         punti = [punti[int(i * passo)] for i in range(300)]
     curva = (t1, m1, t2, m2)
     return {"basso": {"esterna": t1, "mandata": m1}, "alto": {"esterna": t2, "mandata": m2},
-            "zona": zona, "zona_fonte": fonte, "punti": punti,
+            "zona": zona, "zona_fonte": fonte, "punti": punti, "lungo": a - da > 86400,
             "ora": {"esterna": esterna_ora,
                     "mandata": mandata_calcolata(curva, esterna_ora) if esterna_ora is not None else None}}
 
@@ -840,7 +839,7 @@ RIP_MAX_ORE = 12          # oltre questo orizzonte la stima non e' credibile
 
 def _med_pesata(vals, pesi):
     """Mediana pesata: robusta, non si fa spostare da una discesa strana."""
-    coppie = sorted(zip(vals, pesi))
+    coppie = sorted(zip(vals, pesi, strict=True))
     meta = sum(p for _, p in coppie) / 2.0
     acc = 0.0
     for v, p in coppie:
@@ -966,8 +965,8 @@ def ripartenza_fit(campioni, ora, diag=None):
         if diag is not None:
             diag.setdefault("motivi", []).append("pause valide troppo vecchie (peso %.1f, ne servono almeno 3,0): servono dati piu' recenti" % sum(pesi))
         return None
-    scarti = [(c["scarto"], p) for c, p in zip(campioni, pesi) if c["scarto"] is not None]
-    assoluti = [(c["te"], p) for c, p in zip(campioni, pesi)]
+    scarti = [(c["scarto"], p) for c, p in zip(campioni, pesi, strict=True) if c["scarto"] is not None]
+    assoluti = [(c["te"], p) for c, p in zip(campioni, pesi, strict=True)]
     return {"k": _med_pesata([c["k"] for c in campioni], pesi),
             "sovra": _med_pesata([c["sovra"] for c in campioni], pesi),
             "coda_min": _med_pesata([c["coda_min"] for c in campioni], pesi),
@@ -1645,7 +1644,7 @@ def _tratti_calmi(temp, tts, cicli, w0, w1):
     for g0, g1 in liberi:
         pts = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
         ini = g0
-        for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+        for (ta, va), (tb, vb) in zip(pts, pts[1:], strict=False):
             if tb - ta <= 900 and (va - vb >= 1.0 or vb - va >= 0.3):
                 if ta - ini >= 3600:
                     out.append((ini, ta))
@@ -2199,12 +2198,20 @@ class Gestore(BaseHTTPRequestHandler):
         if e_https(self):
             self.send_header("Strict-Transport-Security", "max-age=15552000")
         self.send_header("Content-Security-Policy", sost.get("Content-Security-Policy", CSP))
+        if getattr(self, "_chiudi", False):      # corpo della richiesta non letto: la connessione non si riusa
+            self.send_header("Connection", "close")
         for k, v in extra:
             if k not in sost:
                 self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(dati)
+
+    def _rifiuta_json(self, obj, codice):
+        """Errore dato prima di leggere il corpo della richiesta: poi si chiude la connessione, altrimenti il corpo
+        rimasto in coda sarebbe letto come richiesta successiva (HTTP/1.1 keep-alive)."""
+        self._chiudi = True
+        self._json(obj, codice)
 
     def _json(self, obj, codice=200):
         self._invia(codice, json.dumps(obj, separators=(",", ":"), ensure_ascii=False),
@@ -2334,13 +2341,13 @@ class Gestore(BaseHTTPRequestHandler):
         # difesa da richieste fatte da altri siti: intestazione speciale + stessa origine
         origine = self.headers.get("Origin")
         if self.headers.get("X-Pdc") != "1" or (origine and urlparse(origine).netloc != self.headers.get("Host", "")):
-            return self._json({"errore": "richiesta non consentita"}, 403)
+            return self._rifiuta_json({"errore": "richiesta non consentita"}, 403)
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
         if n < 0 or n > 200_000:
-            return self._json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
+            return self._rifiuta_json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
         try:
             corpo = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
             if not isinstance(corpo, dict):
@@ -2352,6 +2359,7 @@ class Gestore(BaseHTTPRequestHandler):
     def _login(self, app):
         ip = ip_client(self)
         origine = self.headers.get("Origin")
+        self._chiudi = True      # in tutti i casi di rifiuto (e se il corpo supera il limite) il corpo non viene letto per intero
         if origine and origine != "null" and urlparse(origine).netloc != self.headers.get("Host", ""):
             return self._invia(403, "Richiesta non consentita", "text/plain; charset=utf-8")
         if app.limite.bloccato(ip):
@@ -2360,6 +2368,8 @@ class Gestore(BaseHTTPRequestHandler):
             n = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
         except ValueError:
             n = 0
+        lungh = self.headers.get("Content-Length", "0").strip()
+        self._chiudi = not lungh.isdigit() or int(lungh) > n        # corpo piu' lungo del limite: resta in coda, quindi si chiude
         dati = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
         utente, pw = dati.get("utente", [""])[0], dati.get("password", [""])[0]
         acc = app.cfg.leggi()["accesso"]

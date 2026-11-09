@@ -1,5 +1,8 @@
 # Plugin Alexa — changelog
 
+## 1.4.1 — 9 novembre 2026
+- Con «Verifica firma Amazon = Attiva», se la firma non si può controllare (manca la libreria `cryptography` o i certificati di sistema) la richiesta viene **rifiutata** (prima passava). Con «Solo avviso» e «Spenta» non cambia nulla.
+
 ## 1.4.0 — 4 novembre 2026
 - **Due nuove domande «fuori»**, come quelle della casa con l'ordine invertito: `TemperaturaFuoriIntent` («Fuori ci sono 8,8 gradi e l'87 per cento di umidità.») e `UmidFuoriIntent` («Fuori c'è l'87 per cento di umidità e ci sono 8,8 gradi.»). La temperatura è quella della sonda della pompa, l'umidità viene dalla stazione meteo vicina (Impostazioni → Collegamenti).
 - Senza stazione, o con dato più vecchio di un'ora, dice solo i gradi (con «Non ho l'umidità della stazione» se la stazione è configurata). Se la sonda è ferma da più di 2 ore aggiunge l'avviso.

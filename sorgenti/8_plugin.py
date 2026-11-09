@@ -246,6 +246,12 @@ def plugin_ricarica(app):
         return len(PLUGIN)
 
 
+@api("/api/plugin/stato")
+def api_plugin_stato(app, q):
+    """Solo i riquadri dei plugin (stato e contatori): la scheda Integrazioni li rilegge ogni 5 secondi, senza scaricare tutte le impostazioni."""
+    return {"sezioni": sezioni_plugin()}
+
+
 @api("/api/plugin/changelog")
 def api_plugin_changelog(app, q):
     """Le cronologie dei plugin, per la tab Changelog > Plugin."""
@@ -290,10 +296,12 @@ def plugin_pubblico(app, h, p, q):
     voce = PLUGIN_ROTTE.get(p)
     plug = PLUGIN.get(voce[0]) if voce else None
     if not voce or not plug or not plug.avviato:
+        h._chiudi = True       # i rifiuti qui sotto avvengono prima di leggere il corpo: la connessione non si riusa
         if _troppo_veloce("-", ip_client(h)):      # anche gli indirizzi sbagliati hanno un limite: niente tentativi a raffica
             return h._json({"errore": "troppe richieste"}, 429)
         return h._invia(404, "Non trovato", "text/plain; charset=utf-8")
     _, funzione, metodi = voce
+    h._chiudi = True
     if h.command not in metodi:
         return h._invia(405, "Metodo non consentito", "text/plain; charset=utf-8")
     ip = ip_client(h)
@@ -305,6 +313,7 @@ def plugin_pubblico(app, h, p, q):
         n = -1
     if n < 0 or n > PLUGIN_MAX_CORPO:
         return h._json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
+    h._chiudi = False
     corpo = h.rfile.read(n) if n else b""
     plug.richieste, plug.ultima = plug.richieste + 1, int(time.time())
     req = Richiesta(h.command, p, q, corpo, {k.lower(): v for k, v in h.headers.items()}, ip)
@@ -312,7 +321,7 @@ def plugin_pubblico(app, h, p, q):
         r = funzione(req)
     except Exception as e:
         plug.ultimo_errore = _riassunto(e)
-        log.exception("Plugin %s: errore nella rotta %s", plug.nome, p)
+        log.exception("Plugin %s: errore in una sua rotta pubblica (percorso omesso dal registro)", plug.nome)
         return h._json({"errore": "errore interno"}, 500)
     plug.ultimo_errore = ""
     if isinstance(r, dict):
