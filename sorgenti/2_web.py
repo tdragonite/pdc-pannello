@@ -104,6 +104,8 @@ class Sessioni:
             c.execute("DELETE FROM sessioni WHERE h<>?", (self._h(token or ""),))
 
     def elimina(self, token):
+        if not token:
+            return
         with self.db.lock, closing(self.db._c()) as c, c:
             c.execute("DELETE FROM sessioni WHERE h=?", (self._h(token),))
 
@@ -247,7 +249,10 @@ def campioni_freq(db, da, a, soglia=5.0):
     return freq
 
 
-def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300):
+MODI_ESTENSIONE = 6 * 3600     # quanto si guarda oltre i bordi della finestra per trovare inizio e fine veri del primo e dell'ultimo tratto
+
+
+def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300, estendi=True):
     """Cosa stava facendo la pdc, a intervalli di 5 minuti.
     casa = riscaldamento casa, acs = acqua calda, riposo, nodati.
     Il compressore (Hz) dice SE lavora, la valvola deviatrice dice PER COSA."""
@@ -255,7 +260,7 @@ def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300):
     a = min(int(a), ora)
     da = int(da)
     if a <= da:
-        return {"segmenti": [], "minuti": {m: 0 for m in MODI}}
+        return {"segmenti": [], "minuti": {m: 0 for m in MODI}, "reali": []}
     inizio = da - da % passo
     freq = campioni_freq(db, inizio, a)
     freq_ts = sorted(freq)
@@ -294,11 +299,28 @@ def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300):
     minuti = {m: 0 for m in MODI}
     for s0, s1, m in segmenti:
         minuti[m] += round((s1 - s0) / 60)
-    return {"segmenti": segmenti, "minuti": minuti}
+    reali = [[s0, s1] for s0, s1, _ in segmenti]    # inizio e fine veri di ogni tratto (diversi solo per il primo e l'ultimo, tagliati dalla finestra)
+    if segmenti and estendi:
+        s0, s1, m = segmenti[0]
+        if s0 <= da and m != "nodati":
+            prima = calcola_modi(db, da - MODI_ESTENSIONE, s1, tolleranza, ora, passo, False)["segmenti"]
+            if prima and prima[-1][2] == m:
+                reali[0][0] = prima[-1][0]
+        s0, s1, m = segmenti[-1]
+        if s1 >= a and a < ora and m != "nodati":
+            dopo = calcola_modi(db, s0, min(a + MODI_ESTENSIONE, ora), tolleranza, ora, passo, False)["segmenti"]
+            if dopo and dopo[0][2] == m:
+                reali[-1][1] = dopo[0][1]
+    return {"segmenti": segmenti, "minuti": minuti, "reali": reali}
+
+
+def tolleranza(app):
+    """Secondi senza dati oltre i quali una cella conta come «nessun dato»: una volta e mezza l'intervallo di lettura, minimo 150."""
+    return max(150, int(app.intervallo_pdc() * 1.5))
 
 
 def modo_corrente(db, ora, tolleranza=150):
-    r = calcola_modi(db, ora - 3600, ora, tolleranza, ora)["segmenti"]
+    r = calcola_modi(db, ora - 3600, ora, tolleranza, ora, estendi=False)["segmenti"]
     return r[-1][2] if r else "nodati"
 
 
@@ -399,6 +421,15 @@ def finestra(q, ora):
     if da >= a:
         da = a - 3600
     return da, a
+
+
+def q_int(q, nome, predefinito, minimo, massimo):
+    """Numero intero dai parametri dell'indirizzo (?nome=...), tenuto tra minimo e massimo; se manca o non e' un numero vale il predefinito."""
+    try:
+        v = int(q.get(nome, [predefinito])[0])
+    except (TypeError, ValueError):
+        v = predefinito
+    return max(minimo, min(massimo, v))
 
 
 NOMI_MODO_ACS = {"std": "Standard", "eco": "Eco", "power": "Potenza", "force": "Forzato"}
@@ -518,10 +549,11 @@ def _ore_intervalli(livelli):
     return gr
 
 
-def _icona_blocco(prim, idx, p):
-    """Icona di un blocco di ore (p: 0 asciutto, 1 pioggia possibile, 2 pioggia certa)."""
+def _icona_blocco(prim, idx, p, notte=None):
+    """Icona di un blocco di ore (p: 0 asciutto, 1 pioggia possibile, 2 pioggia certa). notte: se non e' detto si guarda l'ora a meta' blocco."""
     cod = [prim["weather_code"][i] for i in idx if prim["weather_code"][i] is not None]
-    notte = prim["is_day"][idx[len(idx) // 2]] == 0
+    if notte is None:
+        notte = prim["is_day"][idx[len(idx) // 2]] == 0
     temp = [prim["temperature_2m"][i] for i in idx if prim["temperature_2m"][i] is not None]
     if p and any(c in _METEO_TEMPORALE for c in cod):
         return "temporale"
@@ -575,7 +607,7 @@ def meteo_riassumi(raw, ora):
     gruppi = _ore_intervalli(liv)
     ora_h = lambda i: (loc[i] % 86400) // 3600
     notte = giorno_idx == oggi and prim["is_day"][finestra[0]] == 0 if finestra else False
-    testo, lvl, codici = "asciutto", "nessuna", []
+    testo, lvl = "asciutto", "nessuna"
     if gruppi:
         a, b, mx = gruppi[0]
         lvl = "certa" if mx == 2 else "possibile"
@@ -587,31 +619,10 @@ def meteo_riassumi(raw, ora):
         else:
             quando = f"dalle {ia}" if fino_sera else f"alle {ia}" if ib - ia <= 1 else f"{ia}–{ib}"
         testo = ("pioggia " if lvl == "certa" else "possibile pioggia ") + quando
-        codici = [prim["weather_code"][finestra[j]] for j in range(a, b) if prim["weather_code"][finestra[j]] is not None]
-        freddo = any((prim["temperature_2m"][finestra[j]] or 9) <= 0.5 for j in range(a, b))
-    # icona
-    if gruppi:
-        if any(c in _METEO_TEMPORALE for c in codici):
-            icona = "temporale"
-        elif any(c in _METEO_NEVE for c in codici) or freddo:
-            icona = "neve"
-        elif lvl == "certa":
-            icona = "pioggia"
-        else:
-            icona = "luna-pioggia" if notte else "sole-pioggia"
+        icona = _icona_blocco(prim, [finestra[j] for j in range(a, b)], mx, notte)
     else:
         diurne = [i for i in (finestra or del_giorno) if 8 <= ora_h(i) <= 19] or (finestra or del_giorno)
-        nuv = [prim["cloud_cover"][i] for i in diurne if prim["cloud_cover"][i] is not None]
-        cod = [prim["weather_code"][i] for i in diurne if prim["weather_code"][i] is not None]
-        media = sum(nuv) / len(nuv) if nuv else 50
-        if cod and sum(1 for c in cod if c in (45, 48)) * 2 > len(cod):
-            icona = "nebbia"
-        elif media < 20:
-            icona = "luna" if notte else "sole"
-        elif media < 60:
-            icona = "luna-nuvola" if notte else "sole-nuvola"
-        else:
-            icona = "nuvola"
+        icona = _icona_blocco(prim, diurne, 0, notte)
     # dettaglio a blocchi di 3 ore (per il riquadro al tocco): ora d'inizio, temperatura, pioggia del blocco e icona
     nomi_liv = ("nessuna", "possibile", "certa")
     dettaglio = []
@@ -682,6 +693,61 @@ def meteo_info(app):
 
 
 # --------------------------------------------------------------------------
+# Radiazione solare oraria (Open-Meteo, archivio): si salva dopo mezzanotte per i giorni appena finiti, serie «meteo.radiazione» (W/m²)
+# --------------------------------------------------------------------------
+
+RADIAZIONE_URL = "https://archive-api.open-meteo.com/v1/archive"
+RADIAZIONE_GIORNI = 8          # ogni volta si rilegge anche qualche giorno prima (Open-Meteo corregge i dati a posteriori)
+RADIAZIONE_DOPO = 10800        # secondi dopo mezzanotte (ora locale) prima di chiedere: le 3:00
+RADIAZIONE_RIPROVA = 900       # se la richiesta fallisce si riprova dopo 15 minuti
+
+
+def radiazione_leggi(js):
+    """JSON di Open-Meteo -> [(epoch, W/m²)], saltando le ore senza valore. ValueError se la risposta non è quella attesa."""
+    try:
+        t, v = js["hourly"]["time"], js["hourly"]["shortwave_radiation"]
+    except (TypeError, KeyError):
+        raise ValueError("risposta inattesa") from None
+    if not isinstance(t, list) or not isinstance(v, list) or len(t) != len(v):
+        raise ValueError("risposta inattesa")
+    return [(int(a), round(float(b), 1)) for a, b in zip(t, v)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(b, bool) and b >= 0]
+
+
+def radiazione_lavoro(app, lat, lon, ora=None):
+    """Se oggi non è ancora stata letta, scarica la radiazione dei giorni appena finiti e la salva. -> True se ha salvato."""
+    ora = int(ora if ora is not None else time.time())
+    lt = time.localtime(ora)
+    oggi = time.strftime("%Y-%m-%d", lt)
+    mezzanotte = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    st = app.__dict__.setdefault("rad_st", {"prossimo": 0})
+    if ora < st["prossimo"] or ora < mezzanotte + RADIAZIONE_DOPO or app.db.meta_get("rad_giorno") == oggi:
+        return False
+    da = time.strftime("%Y-%m-%d", time.localtime(mezzanotte - RADIAZIONE_GIORNI * 86400 + 3600))
+    a = time.strftime("%Y-%m-%d", time.localtime(mezzanotte - 3600))
+    url = "%s?latitude=%s&longitude=%s&start_date=%s&end_date=%s&hourly=shortwave_radiation&timezone=Europe%%2FRome&timeformat=unixtime" % (
+        RADIAZIONE_URL, lat, lon, da, a)
+    try:
+        code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
+        if code != 200:
+            raise ValueError("HTTP %s" % code)
+        punti = radiazione_leggi(js)
+        if not punti:
+            raise ValueError("nessun dato")
+        rec = Rec()
+        for ts, w in punti:
+            rec.agg_num("meteo.radiazione", ts, w)
+        app.db.salva(rec, ora)
+        app.db.meta_set("rad_giorno", oggi)
+        log.info("Radiazione solare: salvate %d ore (%s - %s)", len(punti), da, a)
+        return True
+    except Exception as e:  # noqa: BLE001  - senza rete o con Open-Meteo giù si riprova dopo
+        st["prossimo"] = ora + RADIAZIONE_RIPROVA
+        log.debug("Radiazione solare: lettura non riuscita (%s)", e)
+        return False
+
+
+# --------------------------------------------------------------------------
 # Umidità esterna da una stazione meteo vicina (WeatherLink, dati grezzi): un solo valore nella card «Esterna»
 # --------------------------------------------------------------------------
 
@@ -710,7 +776,14 @@ def stazione_leggi(js):
     """JSON della stazione -> (umidità %, epoch dell'ultimo dato o None). ValueError se manca o non ha senso."""
     if not isinstance(js, dict):
         raise ValueError("risposta inattesa")
-    um = float(str(js.get("humidity")).replace(",", "."))
+    if "humidity" not in js:        # risposta vuota, pagina d'errore o JSON diverso dal solito: si dice cosa e' arrivato
+        arrivato = "risposta vuota" if not js else "testo non JSON: " + str(js["raw"])[:60] if "raw" in js else "campi: " + ", ".join(sorted(map(str, js)))[:60]
+        raise ValueError(f"la risposta del sito non contiene l'umidità ({arrivato})")
+    grezza = js["humidity"]
+    try:
+        um = float(str(grezza).replace(",", "."))
+    except ValueError:
+        raise ValueError("la stazione non sta mandando l'umidità" if grezza in (None, "", "--") else f"umidità non leggibile ({str(grezza)[:20]})") from None
     if not 0 <= um <= 100:
         raise ValueError("umidità fuori scala")
     ult = js.get("lastReceived")
@@ -741,6 +814,13 @@ def _stazione_lavoro(app, url):
             elif not vecchio and (st["falliti"] or st["vecchio"]):
                 log.info("Stazione meteo: di nuovo disponibile")
             st.update(um=um, ts=ts or ora, errore=None, falliti=0, vecchio=vecchio, prossimo=ora + STAZIONE_OGNI)
+            if not vecchio:                                   # lo storico serve per confrontare l'umidita' di fuori con quella di casa
+                try:
+                    rec = Rec()
+                    rec.agg_num("esterna.umidita", ts or ora, um)
+                    app.db.salva(rec, ora)
+                except Exception as e:                        # noqa: BLE001 - non deve mai fermare la lettura
+                    log.debug("Stazione meteo: umidita' non salvata (%s)", e)
     except Exception as e:
         st["falliti"] += 1
         st["errore"] = str(e)[:120]
@@ -789,6 +869,10 @@ def esterni_giro(app):
         if time.time() >= st["prossimo"]:
             _meteo_lavoro(app, *cfg)
         prossimi.append(st["prossimo"])
+        try:
+            radiazione_lavoro(app, *cfg)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Radiazione solare: %s", e)
     return max(15, min(60, min(prossimi) - int(time.time()))) if prossimi else 60
 
 
@@ -1013,6 +1097,42 @@ def _celle_sql(db, serie, da, a, funz):
     return {b: v for b, v in righe if v is not None}
 
 
+# VENT-INIZIO  (indicazione «puoi chiudere»: si toglie con tutto cio' che e' marcato VENT, vedi docs/ventilazione-rimozione.md)
+VENT_DOPO = 2700       # secondi: l'indicazione resta ancora 45 minuti dopo la fine della finestra rilevata (il calo di temperatura finisce prima di quando si chiude davvero)
+VENT_FERMA = 600       # secondi di umidita' ferma (a meno di 1 punto dal minimo) dopo i quali si puo' chiudere (10 minuti)
+VENT_CALO = 2          # punti di umidita' persi dall'apertura: sotto, non c'e' niente da dire
+VENT_MARGINE = 0.4     # g/m3: se in casa l'acqua nell'aria e' a questo punto da quella esterna, ventilare non asciuga piu'
+
+
+def vent_stato(db, ora, um_est=None, t_est=None, t_casa=None):
+    """Durante o poco dopo una finestra aperta: {'s': 'corso'|'chiudi', 'um': % di adesso, 'calo': punti persi, 'min': minuti di umidita' ferma}, altrimenti None."""
+    fin = [f for f in fin_eventi(db, ora - 4 * 3600, ora)[0] if f["da"] <= ora]
+    if not fin or ora - fin[-1]["a"] > VENT_DOPO:
+        return None
+    da = fin[-1]["da"]
+    H = q_serie(db, "casa.umidita", da - 3600, ora)
+    prima = [x for x in H if x[0] <= da]
+    camp = [x for x in H if x[0] > da]
+    if not prima or not camp:
+        return None
+    v0 = prima[-1][1]
+    serie = [(da, v0)] + camp
+    minimo = min(v for _, v in serie)
+    ora_v = serie[-1][1]
+    if v0 - minimo < VENT_CALO or ora_v >= minimo + 2:         # niente calo, oppure l'umidita' e' gia' risalita (finestre chiuse)
+        return None
+    ok = da
+    for k in range(len(serie) - 1, -1, -1):
+        if serie[k][1] > minimo + 1:
+            ok = serie[k + 1][0] if k + 1 < len(serie) else ora
+            break
+    ferma = max(0, ora - ok)
+    pari = (um_est is not None and t_est is not None and t_casa is not None
+            and umidita_assoluta(t_casa, ora_v) <= umidita_assoluta(t_est, um_est) + VENT_MARGINE)
+    return {"s": "chiudi" if ferma >= VENT_FERMA or pari else "corso", "um": ora_v, "calo": round(v0 - ora_v), "min": int(ferma // 60)}
+# VENT-FINE
+
+
 def stima_ripartenza(app, ora, t_casa, ts_casa, richiesta, esterna, target, diag=None):
     """Orario (in secondi, arrotondato al quarto d'ora) in cui il riscaldamento dovrebbe ripartire, oppure None.
     Si calcola solo a richiesta spenta, con dato fresco e con abbastanza discese vere nello storico.
@@ -1098,7 +1218,7 @@ def api_dashboard(app, q):
     da, a = finestra(q, ora)
     db = app.db
     ult = db.ultimi_dict()
-    tol = max(150, int(app.intervallo_pdc() * 1.5))
+    tol = tolleranza(app)
 
     def num(s):
         r = ult.get(s)
@@ -1128,7 +1248,7 @@ def api_dashboard(app, q):
     stato_acs = "spento" if not pdc_acc else ("attivo" if modo == "acs" else "standby")
     curva = dati_curva(db, ult, da, a, num("ciclo.esterna"))
     stz = stazione_info(app)
-    kwh_per = energia_kwh(db, da, a)
+    kwh_per, prezzo = energia_kwh(db, da, a), prezzo_kwh(app)
     servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
                for s in app.servizi]
     return {
@@ -1148,12 +1268,13 @@ def api_dashboard(app, q):
         "esterna": {"temp": num("ciclo.esterna"), "ts": ts_("ciclo.esterna"), "min": es_min, "max": es_max,
                     "umidita": (stz or {}).get("umidita"), "umidita_attiva": stz is not None,
                     "spark": q_griglia(db, "ciclo.esterna", da, a, 60)[0]},
-        "energia": {"kwh": kwh_per, "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo_kwh(app),
-                    "dettaglio": dettaglio_costo(app, da, a, kwh_per, prezzo_kwh(app), ora),
+        "energia": {"kwh": kwh_per, "potenza_w": num("pot.watt"), "prezzo_kwh": prezzo,
+                    "dettaglio": dettaglio_costo(app, da, a, kwh_per, prezzo, ora),
                     "spark": q_griglia(db, "pot.watt", da, a, 60)[0]},
         "casa": {"temp": num("casa.temperatura"), "umidita": num("casa.umidita"), "soglie_umidita": soglie_umidita(app), "target": num("casa.setpoint"),
                  "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
                                              num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
+                 "vent": vent_stato(db, ora, (stz or {}).get("umidita"), num("ciclo.esterna"), num("casa.temperatura")),   # VENT
                  "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
                  "ts": ts_("casa.temperatura"), "spark": q_griglia(db, "casa.temperatura", da, a, 60)[0],
                  "spark_um": q_griglia(db, "casa.umidita", da, a, 60)[0]},
@@ -1232,6 +1353,15 @@ def prezzo_kwh(app):
         return 0.0
 
 
+def _ripartisci(tot, euro):
+    """Divide `euro` tra riscaldamento, acqua calda e standby con le proporzioni dei kWh stimati in `tot` (di calcola_efficienza). None se non si puo'."""
+    if not tot:
+        return None
+    parti = {k: max(0.0, tot.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
+    somma = sum(parti.values())
+    return {k: round(euro * v / somma, 2) for k, v in parti.items()} if somma > 0 else None
+
+
 def dettaglio_costo(app, da, a, kwh, prezzo, ora):
     """Costo del periodo diviso in riscaldamento, acqua calda e standby (euro), stesse proporzioni di Efficienza applicate
     al totale del contatore. None se manca il prezzo o i dati. Calcolo tenuto in memoria 5 minuti per periodo."""
@@ -1243,20 +1373,14 @@ def dettaglio_costo(app, da, a, kwh, prezzo, ora):
         tot = voce["tot"]
     else:
         try:
-            tol = max(150, int(app.intervallo_pdc() * 1.5))
+            tol = tolleranza(app)
             tot = calcola_efficienza(app.db, da, a, tol, ora)["tot"]
         except Exception:
             tot = None
         if len(cache) > 8:
             cache.clear()
         cache[round(da)] = {"ts": ora, "tot": tot}
-    if not tot:
-        return None
-    parti = {k: max(0.0, tot.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
-    somma = sum(parti.values())
-    if somma <= 0:
-        return None
-    return {k: round(kwh * prezzo * v / somma, 2) for k, v in parti.items()}
+    return _ripartisci(tot, kwh * prezzo)
 
 
 def costo_mese(app, ora):
@@ -1293,18 +1417,12 @@ def costo_mese(app, ora):
         det = cache["tot"]
     else:
         try:
-            tol = max(150, int(app.intervallo_pdc() * 1.5))
+            tol = tolleranza(app)
             det = calcola_efficienza(db, max(t_in, primo), ora, tol, ora)["tot"]
             app.__dict__["mese_cache"] = {"mese": t_in, "ts": ora, "tot": det}
         except Exception:
             det = None
-    dettaglio = None
-    if det:
-        parti = {k: max(0.0, det.get("el_" + k) or 0.0) for k in ("casa", "acs", "riposo")}
-        somma = sum(parti.values())
-        if somma > 0:
-            dettaglio = {k: round(kwh * prezzo * v / somma, 2) for k, v in parti.items()}
-    return {"kwh": kwh, "euro": round(kwh * prezzo, 2), "dettaglio": dettaglio,
+    return {"kwh": kwh, "euro": round(kwh * prezzo, 2), "dettaglio": _ripartisci(det, kwh * prezzo),
             "stima_euro": None if stima is None else round(stima * prezzo, 2),
             "scorso_euro": None if scorso is None else round(scorso * prezzo, 2),
             "mese": inizio.month, "mese_scorso": prec.month}
@@ -1457,7 +1575,16 @@ def fin_rileva(db, da, a, soglie=None):
             i = j + 1
         else:
             i += 1
-    return [e for e in ev if e["a"] > da and e["da"] < a]
+    uniti = []
+    for e in ev:        # due cali separati da meno di 20 minuti (un rimbalzo in mezzo) sono la stessa apertura
+        if uniti and e["da"] - uniti[-1]["a"] < 1200:
+            u = uniti[-1]
+            u["a"] = max(u["a"], e["a"])
+            if e["calo"] > u["calo"]:
+                u["calo"], u["ah"] = e["calo"], e["ah"]
+        else:
+            uniti.append(dict(e))
+    return [e for e in uniti if e["a"] > da and e["da"] < a]
 
 
 def fin_eventi(db, da, a):
@@ -1556,11 +1683,8 @@ def api_fin_annulla(app, corpo, h):
 def api_analisi(app, q):
     ora = int(time.time())
     da, a = finestra(q, ora)
-    try:
-        n = max(60, min(600, int(q.get("n", ["240"])[0])))
-    except ValueError:
-        n = 240
-    tol = max(150, int(app.intervallo_pdc() * 1.5))
+    n = q_int(q, "n", 240, 60, 600)
+    tol = tolleranza(app)
     out = cornice(app, ora)
     grafici, dim = [], max(1, (a - da) // n)
     for gid, titolo, unita, serie in GRUPPI_ANALISI:
@@ -1629,19 +1753,23 @@ def _mediana(v):
     return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
 
 
-def _tratti_calmi(temp, tts, cicli, w0, w1):
-    """[(inizio, fine)] dei tratti tranquilli tra w0 e w1, lunghi almeno 1 ora: senza riscaldo dell'acqua (piu' 20 minuti di rimescolamento dopo)
-    e senza prelievi (calo di 1 grado o piu' in 15 minuti) ne' rimescolamenti (salita di 0,3 gradi o piu'). Dopo un evento si aspettano 10 minuti."""
-    occ = sorted((i, f + 1200) for i, f in cicli if f + 1200 > w0 and i < w1)
+def _intervalli_liberi(occupati, w0, w1):
+    """[(inizio, fine)] dei tratti tra w0 e w1 non coperti dagli intervalli `occupati` (ordinati per inizio)."""
     liberi, cur = [], w0
-    for i, f in occ:
+    for i, f in occupati:
         if i > cur:
             liberi.append((cur, i))
         cur = max(cur, f)
     if cur < w1:
         liberi.append((cur, w1))
+    return liberi
+
+
+def _tratti_calmi(temp, tts, cicli, w0, w1):
+    """[(inizio, fine)] dei tratti tranquilli tra w0 e w1, lunghi almeno 1 ora: senza riscaldo dell'acqua (piu' 20 minuti di rimescolamento dopo)
+    e senza prelievi (calo di 1 grado o piu' in 15 minuti) ne' rimescolamenti (salita di 0,3 gradi o piu'). Dopo un evento si aspettano 10 minuti."""
     out = []
-    for g0, g1 in liberi:
+    for g0, g1 in _intervalli_liberi(sorted((i, f + 1200) for i, f in cicli if f + 1200 > w0 and i < w1), w0, w1):
         pts = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
         ini = g0
         for (ta, va), (tb, vb) in zip(pts, pts[1:], strict=False):
@@ -1714,14 +1842,7 @@ def calcola_bollitore(db, da, a, ora, litri=300):
         w1 = _ore_locali(lt, ore=6, giorni=k)
         if w0 < da or w1 > a:
             continue
-        occ = sorted((max(i, w0), min(f + 300, w1)) for i, f in cicli if f + 300 > w0 and i < w1)
-        liberi, cur = [], w0
-        for i, f in occ:
-            if i > cur:
-                liberi.append((cur, i))
-            cur = max(cur, f)
-        if cur < w1:
-            liberi.append((cur, w1))
+        liberi = _intervalli_liberi(sorted((max(i, w0), min(f + 300, w1)) for i, f in cicli if f + 300 > w0 and i < w1), w0, w1)
         if not liberi:
             continue
         g0, g1 = max(liberi, key=lambda x: x[1] - x[0])
@@ -1789,7 +1910,7 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
     separati tra riscaldamento casa e acqua calda, COP, cicli. Il calore e' una STIMA."""
     da = int(da)
     a = min(int(a), int(ora))
-    modi = calcola_modi(db, da, a, tol, ora, passo)
+    modi = calcola_modi(db, da, a, tol, ora, passo, estendi=False)
     modo_cella = {}
     for s0, s1, m in modi["segmenti"]:
         t = s0 - (s0 - da) % passo
@@ -1926,16 +2047,12 @@ def giorni_tipici(app, giorni_sel, ora, oggi0, tol):
 @api("/api/efficienza")
 def api_efficienza(app, q):
     ora = int(time.time())
-    try:
-        giorni = int(q.get("giorni", ["7"])[0])
-    except ValueError:
-        giorni = 7
-    giorni = max(1, min(90, giorni))
+    giorni = q_int(q, "giorni", 7, 1, 90)
     lt = time.localtime(ora)
     oggi0 = _ore_locali(lt)
     da = oggi0 - (giorni - 1) * 86400
     # i confini dei giorni cadono su mezzanotte locale: la griglia da 5 minuti parte da li'
-    tol = max(150, int(app.intervallo_pdc() * 1.5))
+    tol = tolleranza(app)
     out = cornice(app, ora)
     out.update(calcola_efficienza(app.db, da, ora, tol, ora))
     out.update({"da": da, "a": ora, "n_giorni": giorni, "prezzo_kwh": prezzo_kwh(app),
@@ -1961,17 +2078,13 @@ def csv_esporta(app, q):
     import io, csv
     ora = int(time.time())
     tipo = (q.get("tipo", ["giorni"])[0] or "giorni")
-    try:
-        giorni = int(q.get("giorni", ["28"])[0])
-    except ValueError:
-        giorni = 28
     num_it = lambda v: "" if v is None else (str(round(v, 3)).replace(".", ",") if isinstance(v, float) else str(v))
     out = io.StringIO()
     w = csv.writer(out, delimiter=";", lineterminator="\r\n")
     lt = time.localtime(ora)
     oggi0 = _ore_locali(lt)
     if tipo == "misure":
-        giorni = max(1, min(7, giorni))
+        giorni = q_int(q, "giorni", 28, 1, 7)
         da = oggi0 - (giorni - 1) * 86400
         w.writerow(["serie", "data_ora", "valore"])
         with closing(app.db._c()) as c:
@@ -1980,9 +2093,9 @@ def csv_esporta(app, q):
                 w.writerow([serie, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)), num_it(float(val))])
         nome = f"pdc-misure-{time.strftime('%Y%m%d', lt)}.csv"
     else:
-        giorni = max(1, min(90, giorni))
+        giorni = q_int(q, "giorni", 28, 1, 90)
         da = oggi0 - (giorni - 1) * 86400
-        tol = max(150, int(app.intervallo_pdc() * 1.5))
+        tol = tolleranza(app)
         e = calcola_efficienza(app.db, da, ora, tol, ora)
         prezzo = prezzo_kwh(app)
         w.writerow(["giorno", "energia_casa_kWh", "energia_acqua_kWh", "energia_standby_kWh", "calore_casa_kWh",
@@ -2260,6 +2373,9 @@ class Gestore(BaseHTTPRequestHandler):
 
     def _smista(self):
         app = self.server.app
+        # Una richiesta con un corpo (POST) che poi nessuno legge lascerebbe quel corpo in coda sulla connessione, e verrebbe scambiato per la
+        # richiesta successiva (dietro il tunnel le connessioni sono condivise tra piu' visitatori): chi legge il corpo per intero rimette False.
+        self._chiudi = self.headers.get("Content-Length", "0").strip() not in ("", "0") or bool(self.headers.get("Transfer-Encoding"))
         try:
             u = urlparse(self.path)
             p, q = u.path, parse_qs(u.query)
@@ -2349,7 +2465,9 @@ class Gestore(BaseHTTPRequestHandler):
         if n < 0 or n > 200_000:
             return self._rifiuta_json({"errore": "richiesta non valida" if n < 0 else "richiesta troppo grande"}, 400 if n < 0 else 413)
         try:
-            corpo = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            grezzo = self.rfile.read(n)
+            self._chiudi = False                # corpo letto per intero: la connessione si puo' riusare
+            corpo = json.loads(grezzo.decode("utf-8") or "{}")
             if not isinstance(corpo, dict):
                 raise ValueError
         except ValueError:

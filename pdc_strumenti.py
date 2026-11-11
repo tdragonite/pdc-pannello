@@ -36,9 +36,12 @@ Esempi:
 import argparse
 import atexit
 import base64
+import bisect
 from datetime import datetime
+import functools
 import getpass
 import json
+import math
 import os
 import re
 import sys
@@ -145,8 +148,8 @@ def http(method, url, headers=None, data=None, timeout=30):
     except HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
         code = e.code
-    except URLError as e:
-        die(f"Errore di rete: {e.reason}")
+    except OSError as e:                 # URLError, timeout, connessione caduta a meta' lettura
+        die(f"Errore di rete: {getattr(e, 'reason', None) or e}")
     try:
         return code, (json.loads(raw) if raw.strip() else {})
     except ValueError:
@@ -239,6 +242,17 @@ def find_ehs(cfg):
     return items, ehs
 
 
+def _device_id(cfg, args):
+    """Il dispositivo su cui lavorare: --device, oppure quello in config.json, oppure l'unica pdc trovata sull'account."""
+    device_id = args.device or cfg["smartthings"].get("device_id")
+    if not device_id:
+        _, ehs = find_ehs(cfg)
+        if len(ehs) != 1:
+            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
+        device_id = ehs[0]["deviceId"]
+    return device_id
+
+
 def cmd_st_devices(cfg, args):
     items, ehs = find_ehs(cfg)
     say(f"\nDispositivi trovati: {len(items)}")
@@ -254,12 +268,7 @@ def cmd_st_devices(cfg, args):
 
 
 def cmd_st_dump(cfg, args):
-    device_id = args.device or cfg["smartthings"].get("device_id")
-    if not device_id:
-        _, ehs = find_ehs(cfg)
-        if len(ehs) != 1:
-            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
-        device_id = ehs[0]["deviceId"]
+    device_id = _device_id(cfg, args)
     say(f"\nLeggo lo stato completo del dispositivo {device_id} ...")
     status = st_get(cfg, f"/devices/{device_id}/status")
     device = st_get(cfg, f"/devices/{device_id}")
@@ -278,12 +287,7 @@ def cmd_st_dump(cfg, args):
 def cmd_st_capacita(cfg, args):
     """Chiede a SmartThings la definizione di ogni funzione della pdc (comandi e argomenti): serve a capire COME si
     comandano cose come i programmi dell'acqua calda, il boost o gli FSV. Non cambia niente sulla pompa."""
-    device_id = args.device or cfg["smartthings"].get("device_id")
-    if not device_id:
-        _, ehs = find_ehs(cfg)
-        if len(ehs) != 1:
-            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
-        device_id = ehs[0]["deviceId"]
+    device_id = _device_id(cfg, args)
     say(f"\nLeggo l'elenco delle funzioni del dispositivo {device_id} ...")
     device = st_get(cfg, f"/devices/{device_id}")
     trovate = {}
@@ -312,17 +316,12 @@ def cmd_st_capacita(cfg, args):
 def cmd_st_osserva(cfg, args):
     """Guarda lo stato della pdc ogni pochi secondi e annota ogni attributo che CAMBIA, con l'ora: serve a scoprire
     cosa succede quando da Dwellsee / app Samsung si preme Boost o si crea un programma. Legge soltanto."""
-    device_id = args.device or cfg["smartthings"].get("device_id")
-    if not device_id:
-        _, ehs = find_ehs(cfg)
-        if len(ehs) != 1:
-            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
-        device_id = ehs[0]["deviceId"]
+    device_id = _device_id(cfg, args)
     rumore = () if args.tutto else ("samsungce.ehsCycleData", "powerConsumptionReport", "temperatureMeasurement")
     fine = time.time() + args.minuti * 60
     say(f"\nOsservo la pdc per {args.minuti} minuti (una lettura ogni {args.ogni} s). Ctrl+C per fermarmi prima.")
     say("Adesso fai le prove (Boost, programma...) e SEGNATI l'ora di ogni cosa che premi.\n")
-    prima, cambi, errori = None, [], 0
+    prima, cambi, errori, iniziale = None, [], 0, {}
     try:
         while time.time() < fine:
             try:
@@ -354,7 +353,7 @@ def cmd_st_osserva(cfg, args):
     except KeyboardInterrupt:
         say("\nFermato.")
     say(f"\n{len(cambi)} cambi annotati.")
-    write_dump("dump_smartthings_osserva.json", {"device": device_id, "iniziale": locals().get("iniziale", {}), "cambi": cambi})
+    write_dump("dump_smartthings_osserva.json", {"device": device_id, "iniziale": iniziale, "cambi": cambi})
     say("\nFatto. Allega a Claude questo file (NON config.json):\n  dump_smartthings_osserva.json")
 
 
@@ -394,12 +393,7 @@ def cmd_st_prova_refresh(cfg, args):
     Fa tanti giri in ordine casuale: alcuni con il refresh, altri SENZA (controllo). Se i dati nuovi arrivano
     quasi sempre e subito solo nei giri col refresh, e' il refresh; se arrivano uguale anche senza, e' il caso."""
     import random
-    device_id = args.device or cfg["smartthings"].get("device_id")
-    if not device_id:
-        _, ehs = find_ehs(cfg)
-        if len(ehs) != 1:
-            die("Non riesco a capire quale sia la pdc: lancia 'st-devices' oppure usa --device <id>.")
-        device_id = ehs[0]["deviceId"]
+    device_id = _device_id(cfg, args)
     giri = max(2, args.giri + args.giri % 2)           # numero pari: meta' con refresh, meta' senza
     tipi = ["refresh"] * (giri // 2) + ["controllo"] * (giri // 2)
     random.shuffle(tipi)
@@ -564,6 +558,18 @@ def _trova_db(esplicito=None):
                "  python pdc_strumenti.py rip-diag --db C:\\pdc\\dati\\pdc.db")
 
 
+def _carica_pannello(obbligatorio=True):
+    """Il modulo pdc_pannello.py che sta accanto a questo script (per usare i suoi stessi calcoli). Se manca: errore, oppure None."""
+    sys.path.insert(0, str(HERE))
+    try:
+        import pdc_pannello as pp
+    except Exception as e:                                   # noqa: BLE001
+        if obbligatorio:
+            die(f"Non riesco a caricare pdc_pannello.py (deve stare nella stessa cartella di questo script): {e}")
+        return None
+    return pp
+
+
 class _DbSolaLettura:
     """Quanto basta del database del pannello per le sue funzioni di calcolo: solo _c(), aperto in sola lettura."""
 
@@ -576,7 +582,8 @@ class _DbSolaLettura:
 
 
 def _db_leggibile(path):
-    """Apre il database in sola lettura (anche con il pannello acceso); se non si riesce, lavora su una copia temporanea."""
+    """Apre il database in sola lettura (anche con il pannello acceso); se non si riesce, lavora su una copia temporanea,
+    che sparisce da sola alla fine del comando. Ritorna (database, cartella della copia oppure None)."""
     import shutil
     import sqlite3
     import tempfile
@@ -606,15 +613,11 @@ def _fmt_gg(s):
 
 def cmd_rip_diag(cfg, args):
     """Perche' la «ripartenza prevista» c'e' o non c'e': usa le STESSE funzioni del pannello (pdc_pannello.py, stessa cartella)."""
-    sys.path.insert(0, str(HERE))
-    try:
-        import pdc_pannello as pp
-    except Exception as e:                                   # noqa: BLE001
-        die(f"Non riesco a caricare pdc_pannello.py (deve stare nella stessa cartella di questo script): {e}")
+    pp = _carica_pannello()
     if "diag" not in getattr(getattr(pp.stima_ripartenza, "__code__", None), "co_varnames", ()):
         die("Questo pdc_pannello.py e' troppo vecchio per la diagnostica: sostituiscilo con l'ultimo (versione 0.19 piu' recente).")
     db_path = _trova_db(args.db)
-    db, tmp = _db_leggibile(db_path)
+    db, _ = _db_leggibile(db_path)
     ora = int(time.time())
     say(f"Diagnostica ripartenza prevista - {datetime.fromtimestamp(ora):%d/%m/%Y %H:%M}")
     say(f"Database: {db_path}  ({db_path.stat().st_size // (1024 * 1024)} MB)")
@@ -681,22 +684,15 @@ def cmd_rip_diag(cfg, args):
     if args.salva:
         write_dump("rip_diag.json", {"ora": ora, "db": db_path.name, "t_casa": t_casa, "ts_casa": ts_casa, "esterna": esterna, "target": target,
                                      "richiesta": richiesta, "stima": eta, "diag": diag})
-    if tmp:
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def cmd_sbrinamenti(cfg, args):
     """Sbrinamenti nel database: i cambi di stato grezzi e l'elenco che ne ricava il pannello (stessa funzione del pannello)."""
-    sys.path.insert(0, str(HERE))
-    try:
-        import pdc_pannello as pp
-    except Exception as e:                                   # noqa: BLE001
-        die(f"Non riesco a caricare pdc_pannello.py (deve stare nella stessa cartella di questo script): {e}")
+    pp = _carica_pannello()
     if not hasattr(pp, "elenco_sbrinamenti"):
         die("Questo pdc_pannello.py e' troppo vecchio: sostituiscilo con l'ultimo (versione 0.19 piu' recente).")
     db_path = _trova_db(args.db)
-    db, tmp = _db_leggibile(db_path)
+    db, _ = _db_leggibile(db_path)
     ora = int(time.time())
     da = ora - int(args.giorni) * 86400
     say(f"Sbrinamenti - ultimi {args.giorni} giorni - {datetime.fromtimestamp(ora):%d/%m/%Y %H:%M}")
@@ -748,9 +744,6 @@ def cmd_sbrinamenti(cfg, args):
     say("\n".join("   - " + d for d in dubbi) if dubbi else "   niente di strano.")
     if args.salva:
         write_dump("sbrinamenti.json", {"ora": ora, "db": db_path.name, "giorni": args.giorni, "cambi": cambi, "elenco": r})
-    if tmp:
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -1009,7 +1002,7 @@ WH_SALTA = ("last_seen", "time_server", "wifi_strength", "rf_strength", "last_us
 
 def wh_stato_piatto(home):
     """Lo stato di casa come {campo: valore}, senza i campi che cambiano a ogni lettura."""
-    return {k: v for k, v in walk(home) if not k.split(".")[-1].split("[")[0] in WH_SALTA}
+    return {k: v for k, v in walk(home) if k.split(".")[-1].split("[")[0] not in WH_SALTA}
 
 
 def wh_sonda(token, home_id, prima, rapporto):
@@ -1374,8 +1367,15 @@ def _stat(vals):
             "p95": _arr(q(.95)), "max": _arr(vs[-1]), "media": _arr(sum(vs) / n)}
 
 
+@functools.lru_cache(maxsize=None)
+def _giorno_blocco(blocco):
+    return time.strftime("%Y-%m-%d", time.localtime(blocco * 900))
+
+
 def _giorno(ts):
-    return time.strftime("%Y-%m-%d", time.localtime(ts))
+    """Il giorno locale 'AAAA-MM-GG' di un istante. Si calcola una volta per blocco di 15 minuti (tutti i fusi orari, ora legale compresa,
+    cambiano giorno su un multiplo di 15 minuti): con centinaia di migliaia di misure fa la differenza."""
+    return _giorno_blocco(int(ts) // 900)
 
 
 def _ore(ts):
@@ -1384,7 +1384,6 @@ def _ore(ts):
 
 def _val_a(serie, ts, tempo_max=None):
     """Valore (ts, v) di una serie ordinata [(ts, v)] nell'ultimo istante <= ts (None se piu' vecchio di tempo_max secondi)."""
-    import bisect
     i = bisect.bisect_right(serie, (ts, float("inf"))) - 1
     if i < 0:
         return None
@@ -1395,7 +1394,6 @@ def _val_a(serie, ts, tempo_max=None):
 
 def _fra(serie, t0, t1):
     """I valori di una serie ordinata tra t0 e t1 (estremi compresi)."""
-    import bisect
     i, j = bisect.bisect_left(serie, (t0, float("-inf"))), bisect.bisect_right(serie, (t1, float("inf")))
     return [v for _, v in serie[i:j]]
 
@@ -1564,7 +1562,7 @@ def _profilo_per_esterna(S, modo_a):
 def _profilo_orario(S):
     """Media per ora del giorno (0-23): com'e' una giornata tipica."""
     out = {}
-    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("potenza_w", "pot.watt"),
+    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("umidita_esterna", "esterna.umidita"), ("radiazione_w_m2", "meteo.radiazione"), ("potenza_w", "pot.watt"),
                         ("richiesta_calore_pct", "casa.richiesta_calore"), ("compressore_hz", "ciclo.freq_compressore"), ("mandata", "ciclo.mandata"),
                         ("acqua_calda", "acs.temperatura")):
         acc = {h: [] for h in range(24)}
@@ -1574,13 +1572,33 @@ def _profilo_orario(S):
     return {"nota": "Lista di 24 valori: ora 0, 1, ... 23 (ora locale).", **out}
 
 
+def _acqua_aria(S, serie_t, serie_u):
+    """{giorno: media dell'acqua nell'aria in g/m3}: per ogni misura di umidita' si usa la temperatura piu' vicina (entro 15 minuti)."""
+    T = S.get(serie_t) or []
+    tt = [x[0] for x in T]
+    somma = {}
+    for ts, u in S.get(serie_u) or []:
+        k = bisect.bisect_left(tt, ts)
+        vicini = [T[j] for j in (k - 1, k) if 0 <= j < len(T) and abs(T[j][0] - ts) <= 900]
+        if not vicini:
+            continue
+        t = min(vicini, key=lambda x: abs(x[0] - ts))[1]
+        somma.setdefault(_giorno(ts), []).append(6.112 * math.exp(17.62 * t / (243.12 + t)) * u * 2.1674 / (273.15 + t))
+    return {g: round(sum(v) / len(v), 2) for g, v in somma.items()}
+
+
 def _giornaliero(S, kwh_giorno):
     giorni = {}
-    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("setpoint", "casa.setpoint"),
+    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("umidita_esterna", "esterna.umidita"), ("setpoint", "casa.setpoint"),
                         ("mandata", "ciclo.mandata"), ("ritorno", "ciclo.ritorno"), ("acqua_calda", "acs.temperatura"), ("potenza_w", "pot.watt"),
                         ("freq_hz", "ciclo.freq_compressore")):
         for ts, v in S.get(serie, []):
             giorni.setdefault(_giorno(ts), {}).setdefault(nome, []).append(v)
+    acqua = {nome: _acqua_aria(S, st, su) for nome, (st, su) in (("acqua_aria_casa_g_m3", ("casa.temperatura", "casa.umidita")),
+                                                                    ("acqua_aria_esterna_g_m3", ("ciclo.esterna", "esterna.umidita")))}
+    radiazione = {}
+    for ts, v in S.get("meteo.radiazione", []):
+        radiazione.setdefault(_giorno(ts), []).append(v)
     out = {}
     for g in sorted(giorni):
         d = {}
@@ -1591,6 +1609,12 @@ def _giornaliero(S, kwh_giorno):
                 d["freq_media_acceso"] = _arr(sum(att) / len(att), 1) if att else None
             else:
                 d[nome] = {"min": _arr(min(vals), 1), "media": _arr(sum(vals) / len(vals), 2), "max": _arr(max(vals), 1)}
+        for nome, per_giorno in acqua.items():
+            if per_giorno.get(g) is not None:
+                d[nome] = per_giorno[g]
+        rad = radiazione.get(g, [])
+        if len(rad) >= 20:      # giorno quasi completo (Open-Meteo, dato orario): somma W/m2 orari = Wh/m2
+            d["radiazione_kwh_m2"] = round(sum(rad) / 1000, 2)
         d["energia_kwh_contatore"] = kwh_giorno.get(g)
         d["campioni"] = sum(len(v) for v in giorni[g].values())
         out[g] = d
@@ -1667,7 +1691,6 @@ def _raffreddamento_acs(S, stati, ora, finestre_testo, dal_ts):
     if ini is not None:
         cicli.append((ini, ora))
     tts = [t for t, _ in temp]
-    import bisect
 
     def t_at(t, tol=1800):
         i = bisect.bisect_right(tts, t) - 1
@@ -1714,14 +1737,11 @@ def _raffreddamento_acs(S, stati, ora, finestre_testo, dal_ts):
 def cmd_analisi(cfg, args):
     """Un solo file con tutto quello che il database sa: impostazioni, statistiche, cicli, sbrinamenti, serie nel tempo. Per l'analisi di Claude."""
     import platform
-    sys.path.insert(0, str(HERE))
-    try:
-        import pdc_pannello as pp
-    except Exception:                                            # noqa: BLE001
-        pp = None
+    pp = _carica_pannello(obbligatorio=False)
+    if pp is None:
         say("  (pdc_pannello.py non trovato accanto a questo script: salto le sezioni che usano i suoi calcoli)")
     db_path = _trova_db(args.db)
-    db, tmp = _db_leggibile(db_path)
+    db, _ = _db_leggibile(db_path)
     ora = int(time.time())
     giorni = max(1, min(120, int(args.giorni)))
     da = ora - giorni * 86400
@@ -1732,7 +1752,7 @@ def cmd_analisi(cfg, args):
         nomi = [r[0] for r in c.execute("SELECT DISTINCT serie FROM misure").fetchall()]
         S = {n: c.execute("SELECT ts, valore FROM misure WHERE serie=? AND ts BETWEEN ? AND ? ORDER BY ts", (n, da, ora)).fetchall() for n in nomi}
         primo_ts = c.execute("SELECT MIN(ts) FROM misure").fetchone()[0]
-        ultimo = [r for r in c.execute("SELECT serie, ts, num, txt FROM ultimo ORDER BY serie").fetchall()]
+        ultimo = c.execute("SELECT serie, ts, num, txt FROM ultimo ORDER BY serie").fetchall()
         stati = c.execute("SELECT serie, ts, valore FROM stati WHERE ts>=? ORDER BY serie, ts", (da - 86400,)).fetchall()
         try:
             eventi = c.execute("SELECT ts, codice, livello, testo, chiuso_ts FROM eventi WHERE ts>=? ORDER BY ts", (da,)).fetchall()
@@ -1762,7 +1782,6 @@ def cmd_analisi(cfg, args):
             mod = pp.calcola_modi(db, da, ora, 150, ora)["segmenti"]
         except Exception as e:                                   # noqa: BLE001
             out.setdefault("errori", {})["calcola_modi"] = str(e)
-    import bisect
     ini_mod = [s[0] for s in mod] if mod else []
 
     def modo_a(ts):
@@ -1797,8 +1816,6 @@ def cmd_analisi(cfg, args):
                         trovati[p + k] = v
                     else:
                         giu(v, p + k + ".")
-            elif isinstance(o, list):
-                pass
         giu(j)
         return trovati
     _sezione(out, "configurazione_pannello", configurazione)
@@ -1921,9 +1938,6 @@ def cmd_analisi(cfg, args):
         say("  Alcune sezioni non sono riuscite (l'errore e' scritto nel file): mandalo comunque.")
     if kb > 8000:
         say("  Il file e' grande: se la chat non lo accetta, rilancia con meno giorni, per esempio:  python pdc_strumenti.py analisi --giorni 14 --grezzi 0")
-    if tmp:
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -1989,13 +2003,14 @@ def main():
         return
     cfg = load_cfg()
     if args.cmd == "nt-webhook-prova" and args.elimina:
+        token = wh_token(cfg, 0, args.rinnova)
         if args.metodo == "nuovo":
-            c, js = wh_chiama(wh_token(cfg, 0, args.rinnova), "DELETE", "/webhooks/v1/")
+            c, js = wh_chiama(token, "DELETE", "/webhooks/v1/")
             say(f"DELETE /webhooks/v1/: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
         else:
-            c, js = wh_chiama(wh_token(cfg, 0, args.rinnova), "POST", "/api/dropwebhook", {})
+            c, js = wh_chiama(token, "POST", "/api/dropwebhook", {})
             say(f"dropwebhook: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
-        c, js = wh_chiama(wh_token(cfg, 0, args.rinnova), "GET", "/webhooks/v1/")
+        c, js = wh_chiama(token, "GET", "/webhooks/v1/")
         say(f"webhook rimasti: HTTP {c}: {json.dumps(js, ensure_ascii=False)[:300]}")
         return
     {"st-devices": cmd_st_devices, "st-oauth": cmd_st_oauth,

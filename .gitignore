@@ -10,3 +10,4 @@ cloudflared/
 *.log
 __pycache__/
 plugin/
+dump/

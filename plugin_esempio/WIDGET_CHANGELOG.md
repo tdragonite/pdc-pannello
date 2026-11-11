@@ -1,5 +1,8 @@
 # Plugin Widget iPhone — changelog
 
+## 1.1.1 — 11 novembre 2026
+- Il riquadro della ripartenza dice sempre «Riparte alle 00:15», anche quando è dopo mezzanotte: con «domani» la scritta non entrava e l'ora veniva tagliata. Lo script di Scriptable non cambia.
+
 ## Script Scriptable (senza cambio di versione del plugin) — 4 novembre 2026
 - Toccando la riga in basso a destra (l'ora di aggiornamento) parte il Comando rapido **Aggiorna widget** (costante `COMANDO_AGGIORNA`: nell'app Comandi, azione Scriptable «Refresh All Widgets» + «Vai alla schermata Home»); il resto del widget continua ad aprire il pannello. iOS decide da solo quando aggiornare davvero (la richiesta dello script è ogni 15 minuti).
 

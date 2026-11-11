@@ -18,12 +18,14 @@ import time
 
 INFO = {
     "titolo": "Widget iPhone",
-    "versione": "1.1.0",
+    "versione": "1.1.1",
     "interfaccia": 1,
     "descrizione": "Indirizzo di sola lettura per il widget dell'iPhone (app Scriptable): casa, termostato, pompa di calore, acqua calda e fuori, "
                    "già pronti da mostrare. Non può comandare niente.",
 }
 CHANGELOG = [
+    {"v": "1.1.1", "data": "2026-11-11T14:35", "titolo": "Ripartenza senza «domani»", "righe": [
+        ["m", "Riquadro della ripartenza", "Dice sempre «Riparte alle 00:15», anche quando è dopo mezzanotte: con «domani» la scritta non entrava nel riquadro e l’ora veniva tagliata."]]},
     {"v": "1.1.0", "data": "2026-11-04T18:00", "titolo": "Token del widget", "righe": [
         ["n", "Token", "Campo nuovo in Impostazioni: se lo imposti, senza il token l’indirizzo risponde 404 anche a chi conosce il segreto. Aprirlo da un browser non mostra niente."]]},
     {"v": "1.0.0", "data": "2026-11-04T16:00", "titolo": "Primo rilascio", "righe": [
@@ -93,10 +95,7 @@ def riepilogo(d, ora=None):
     elif c.get("richiesta"):
         chip = {"testo": "Il termostato chiama", "tipo": "chiama"}
     elif c.get("riparte"):
-        t = time.localtime(c["riparte"])
-        oggi = time.localtime(ora)
-        domani = (t.tm_year, t.tm_yday) != (oggi.tm_year, oggi.tm_yday)
-        chip = {"testo": ("Riparte domani " if domani else "Riparte alle ") + hhmm(c["riparte"]), "tipo": "riparte"}
+        chip = {"testo": "Riparte alle " + hhmm(c["riparte"]), "tipo": "riparte"}      # senza «domani»: dall'ora si capisce, e la scritta entra nel riquadro
     else:
         chip = {"testo": "Non chiama", "tipo": "fermo"}
 

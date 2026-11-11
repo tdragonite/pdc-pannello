@@ -62,6 +62,7 @@ def mac_da_ip(ip):
         return c[1]
     mac = None
     try:
+        ip = str(ipaddress.IPv4Address(ip))          # finisce tra gli argomenti di «arp»: solo un indirizzo vero (config.json si scrive anche a mano)
         # una "bussata" UDP fa popolare la tabella ARP anche se il dispositivo non risponde
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.3)
@@ -622,9 +623,10 @@ def _cronologia_fsv(storia, richieste, nomi, unita, adesso):
     return voci[:60]
 
 
-def impostazioni_installatore(app, ult):
+def impostazioni_installatore(app, ult, cron_regolazioni=None):
     """Tutti i parametri FSV letti dalla pompa, raggruppati per menu, con la cronologia dei cambi.
-    Le modifiche partono da /api/fsv (8_controlli.py); qui si legge soltanto."""
+    Le modifiche partono da /api/fsv (8_controlli.py); qui si legge soltanto.
+    cron_regolazioni: la cronologia delle regolazioni, se chi chiama l'ha gia' calcolata (altrimenti si legge qui)."""
     codici = sorted(k[4:] for k in ult if k.startswith("fsv."))
     with closing(app.db._c()) as c:
         righe = c.execute("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'fsv.%' ORDER BY serie, ts").fetchall()
@@ -673,7 +675,8 @@ def impostazioni_installatore(app, ult):
             "cambiati": sum(1 for r in tutte if r["cambio"]), "fuori": sum(1 for r in tutte if r["fuori"]),
             "letto": letto,
             "cronologia": sorted(_cronologia_fsv(storia, richieste, nomi, unita, adesso)
-                                 + regolazioni_dati(app, ult, adesso)[1], key=lambda v: -v["ts"])[:60]}
+                                 + (regolazioni_dati(app, ult, adesso)[1] if cron_regolazioni is None else cron_regolazioni),
+                                 key=lambda v: -v["ts"])[:60]}
 
 
 # --------------------------------------------------------------------------
@@ -768,11 +771,12 @@ def api_dispositivi(app, q):
         boost_riprendi(app)
     except Exception:
         log.exception("boost: ripresa del controllo")
+    regolazioni, cron_regolazioni = regolazioni_dati(app, ult, ora)        # una lettura sola: serve sia qui sia alla cronologia
     out.update({
         "schede": [_scheda_pdc(app, ult, cfg, ora, tol), _scheda_smarther(app, ult, cfg, ora, tol)],
         "storico": storico_versioni(app),
-        "installatore": impostazioni_installatore(app, ult),
-        "regolazioni": regolazioni_dati(app, ult, ora)[0],
+        "installatore": impostazioni_installatore(app, ult, cron_regolazioni),
+        "regolazioni": regolazioni,
         "boost": boost_dati(app, ult, ora),
         "da_casa": (q.get("_casa") or ["1"])[0] == "1",
         "comandi": elenco_comandi(app),

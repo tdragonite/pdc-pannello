@@ -50,25 +50,7 @@ def _comando_st(app, cosa, acceso):
     dev = cfg.get("device_id") or (sv._trova_device() if sv else None)
     if not dev:
         raise ErroreAPI("richiesta", 0, "SmartThings: non trovo la pompa di calore.")
-    corpo = json.dumps({"commands": [{"component": comp, "capability": "switch",
-                                      "command": "on" if acceso else "off"}]}).encode()
-    for tentativo in (1, 2):
-        token = app.token_st.get()
-        code, js = http_json("POST", f"{ST_API}/devices/{dev}/commands",
-                             {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                              "Accept": "application/json"}, corpo)
-        if code == 401 and tentativo == 1 and not app.token_st.usa_pat():
-            app.token_st.invalida()
-            continue
-        break
-    if code in (401, 403):
-        raise ErroreAPI("auth", code, "Il token SmartThings non ha il permesso di COMANDO (serve lo scope x:devices:*): "
-                                      "rigeneralo come spiegato in docs/comandi-e-regolazioni.md.")
-    if code >= 400:
-        raise classifica("SmartThings", code, js)
-    esiti = [str(r.get("status", "")).upper() for r in (js.get("results") or []) if isinstance(r, dict)]
-    if esiti and not any(e in ("ACCEPTED", "COMPLETED") for e in esiti):
-        raise ErroreAPI("richiesta", code, "SmartThings ha rifiutato il comando (" + ", ".join(esiti) + ").")
+    _posta_st(app, dev, {"component": comp, "capability": "switch", "command": "on" if acceso else "off"})
     _rileggi_dopo(app, "st")
 
 
@@ -179,7 +161,7 @@ def _comando_nt(app, acceso):
 
 def _scrivi_stato(app, serie, valore):
     """Una riga nel registro dei cambi (tabella stati): e' li' che stanno comandi, modifiche FSV e regolazioni."""
-    with closing(app.db._c()) as c, c:
+    with app.db.lock, closing(app.db._c()) as c, c:
         c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", (serie, int(time.time()), valore))
 
 
@@ -331,6 +313,7 @@ def _registra_fsv(app, codice, prima, dopo, ip, esito):
 
 
 def _posta_st(app, dev, comando):
+    """Manda UN comando alla pompa tramite SmartThings (unico punto: accensioni, FSV, regolazioni, boost). ErroreAPI se non va."""
     corpo = json.dumps({"commands": [comando]}).encode()
     for tentativo in (1, 2):
         token = app.token_st.get()
@@ -342,7 +325,8 @@ def _posta_st(app, dev, comando):
             continue
         break
     if code in (401, 403):
-        raise ErroreAPI("auth", code, "Il token SmartThings non ha il permesso di COMANDO (serve lo scope x:devices:*).")
+        raise ErroreAPI("auth", code, "Il token SmartThings non ha il permesso di COMANDO (serve lo scope x:devices:*): "
+                                      "rigeneralo come spiegato in docs/comandi-e-regolazioni.md.")
     if code >= 400:
         raise classifica("SmartThings", code, js)
     esiti = [str(r.get("status", "")).upper() for r in (js.get("results") or []) if isinstance(r, dict)]
@@ -366,7 +350,7 @@ def modifica_fsv(app, codice, valore, ip):
         return {"ok": False, "errore": "E' gia' a questo valore."}
     if app.demo:   # nella demo il valore cambia davvero nel database finto, cosi' si vede tutto il giro
         t = int(time.time())
-        with closing(app.db._c()) as c, c:
+        with app.db.lock, closing(app.db._c()) as c, c:
             c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", (f"fsv.{codice}", t, str(n)))
             c.execute("INSERT INTO ultimo(serie,ts,num,txt) VALUES(?,?,NULL,?) ON CONFLICT(serie) DO UPDATE SET "
                       "ts=excluded.ts, txt=excluded.txt", (f"fsv.{codice}", t, str(n)))
@@ -467,21 +451,14 @@ def modifica_regolazione(app, cosa, valore, ip):
     if _reg_uguali(cosa, prima, v):
         return {"ok": False, "errore": "E' gia' a questo valore."}
     if app.demo:
-        t = int(time.time())
-        rec = Rec()
-        if d["tipo"] == "num":
-            rec.num.append((d["serie"], t, float(v), True))
-        else:
-            rec.stati[d["serie"]] = str(v)
-        app.db.salva(rec, t)
+        _reg_manda(app, None, cosa, v)
         _registra_reg(app, cosa, prima, v, ip, "inviato (demo)")
         return {"ok": True, "demo": True}
     if _troppo_presto("reg", 3):
         return {"ok": False, "errore": "Un attimo: la modifica precedente e' appena partita."}
     try:
         sv, dev = _dispositivo_st(app)
-        _posta_st(app, dev, {"component": d["comp"], "capability": d["cap"], "command": d["cmd"],
-                             "arguments": [v]})
+        _reg_manda(app, dev, cosa, v)
     except ErroreAPI as e:
         _registra_reg_rifiutata(app, cosa, prima, v, ip, e.messaggio)
         return {"ok": False, "errore": e.messaggio}
@@ -523,13 +500,13 @@ def _boost_leggi(app):
 
 
 def _boost_scrivi(app, d):
-    with closing(app.db._c()) as c, c:
+    with app.db.lock, closing(app.db._c()) as c, c:
         c.execute("DELETE FROM stati WHERE serie='boost.attivo'")      # la chiave e' (serie, ts): si tiene una riga sola
         c.execute("INSERT OR REPLACE INTO stati VALUES(?,?,?)", ("boost.attivo", int(time.time()), json.dumps(d) if d else ""))
 
 
-def _boost_manda(app, sv, dev, cosa, v):
-    """Un comando del boost (setpoint o modo). In demo scrive il valore nel database."""
+def _reg_manda(app, dev, cosa, v):
+    """Manda una regolazione (setpoint o modo): la usano la pagina e il boost. In demo scrive il valore nel database finto."""
     d = REGOLAZIONI[cosa]
     if app.demo:
         t = int(time.time())
@@ -570,10 +547,10 @@ def _boost_ripristina(app, motivo, ip="pannello"):
             sv, dev = _dispositivo_st(app)
             ora_sp = app.db.ultimi_dict().get("acs.setpoint")
             if b.get("modo_prima"):
-                _boost_manda(app, sv, dev, "acs_modo", b["modo_prima"])
+                _reg_manda(app, dev, "acs_modo", b["modo_prima"])
                 _registra_reg(app, "acs_modo", "force", b["modo_prima"], ip, f"inviato (fine boost: {motivo})")
             if b.get("sp_prima") is not None:
-                _boost_manda(app, sv, dev, "acs_setpoint", int(b["sp_prima"]))
+                _reg_manda(app, dev, "acs_setpoint", int(b["sp_prima"]))
                 _registra_reg(app, "acs_setpoint", ora_sp[2] if ora_sp else "", int(b["sp_prima"]), ip,
                               f"inviato (fine boost: {motivo})")
         except (ErroreAPI, ErroreConfig) as e:
@@ -671,14 +648,14 @@ def boost_avvia(app, obiettivo, ip):
     try:
         sv, dev = _dispositivo_st(app)
         if n != prima_sp:
-            _boost_manda(app, sv, dev, "acs_setpoint", n)       # prima il setpoint...
+            _reg_manda(app, dev, "acs_setpoint", n)       # prima il setpoint...
             _registra_reg(app, "acs_setpoint", prima_sp, n, ip, "inviato (boost)")
         try:
-            _boost_manda(app, sv, dev, "acs_modo", "force")     # ...poi il modo, come Dwellsee
+            _reg_manda(app, dev, "acs_modo", "force")     # ...poi il modo, come Dwellsee
         except (ErroreAPI, ErroreConfig):
             if n != prima_sp:                                    # il boost non e' partito: rimette il setpoint
                 try:
-                    _boost_manda(app, sv, dev, "acs_setpoint", prima_sp)
+                    _reg_manda(app, dev, "acs_setpoint", prima_sp)
                 except (ErroreAPI, ErroreConfig):
                     log.warning("boost: setpoint non rimesso dopo il rifiuto del modo")
             raise

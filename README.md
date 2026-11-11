@@ -26,6 +26,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 | [Plugin, Alexa e widget](docs/plugin.md) | Integrazioni, Routine Alexa, widget per iPhone |
 | [Strumenti di diagnostica](docs/strumenti.md) | `pdc_strumenti.py`: ID, OAuth, dump, analisi, prove |
 | [Per chi modifica il codice](docs/sviluppo.md) | Come si costruisce il file dai sorgenti |
+| [«Puoi chiudere»: come toglierlo](docs/ventilazione-rimozione.md) | Se la prova delle finestre aperte non ti serve, come toglierla |
 | [Piano e stato del progetto](docs/PIANO.md) | Architettura, decisioni, cose aperte |
 
 ## Crediti

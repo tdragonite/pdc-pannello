@@ -27,6 +27,7 @@ PLUGIN = globals().get("PLUGIN") or {}               # nome -> Plug (sopravvive 
 PLUGIN_ROTTE = globals().get("PLUGIN_ROTTE") or {}   # "/plugin/nome/percorso" -> (nome, funzione, metodi)
 _lock_plugin = globals().get("_lock_plugin") or threading.RLock()
 _ritmo_plugin = globals().get("_ritmo_plugin") or {}  # (nome, ip) -> orari delle ultime richieste
+_lock_ritmo = globals().get("_lock_ritmo") or threading.Lock()     # le richieste pubbliche arrivano da piu' thread insieme
 
 
 class Plug:
@@ -279,15 +280,16 @@ def sezioni_plugin():
 
 def _troppo_veloce(nome, ip):
     ora = time.time()
-    q = _ritmo_plugin.setdefault((nome, ip), [])
-    while q and q[0] < ora - 60:
-        q.pop(0)
-    if len(q) >= PLUGIN_RICHIESTE_MIN:
-        return True
-    q.append(ora)
-    if len(_ritmo_plugin) > 2000:       # non cresce senza limite
-        for k in [k for k, v in _ritmo_plugin.items() if not v or v[-1] < ora - 60]:
-            del _ritmo_plugin[k]
+    with _lock_ritmo:
+        q = _ritmo_plugin.setdefault((nome, ip), [])
+        while q and q[0] < ora - 60:
+            q.pop(0)
+        if len(q) >= PLUGIN_RICHIESTE_MIN:
+            return True
+        q.append(ora)
+        if len(_ritmo_plugin) > 2000:       # non cresce senza limite
+            for k in [k for k, v in _ritmo_plugin.items() if not v or v[-1] < ora - 60]:
+                del _ritmo_plugin[k]
     return False
 
 
