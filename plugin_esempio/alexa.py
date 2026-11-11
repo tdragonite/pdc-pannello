@@ -25,12 +25,14 @@ from datetime import datetime, timezone
 
 INFO = {
     "titolo": "Alexa",
-    "versione": "1.4.1",
+    "versione": "1.4.2",
     "interfaccia": 1,
     "descrizione": "Skill personale per Alexa: risponde su temperatura e umidità (in casa e fuori), pompa di calore, acqua calda, mandata e ripartenza, "
                    "e accende o spegne lo Smarther. Si usa con le Routine di Alexa, senza pronunciare il nome della skill.",
 }
 CHANGELOG = [
+    {"v": "1.4.2", "data": "2026-11-11T14:30", "titolo": "Richieste malformate", "righe": [
+        ["s", "Richieste strane", "Una richiesta scritta male (non un oggetto, o con un intento senza nome) ora riceve la risposta giusta invece di un errore interno nel registro."]]},
     {"v": "1.4.1", "data": "2026-11-09T23:45", "titolo": "Firma «Attiva» più severa", "righe": [
         ["s", "Firma non verificabile", "Con «Attiva», se la firma non si può controllare (manca la libreria cryptography o i certificati di sistema) la richiesta ora viene rifiutata, invece di passare."]]},
     {"v": "1.4.0", "data": "2026-11-04T15:00", "titolo": "Temperatura e umidità di fuori", "righe": [
@@ -291,7 +293,8 @@ def risposte(ctx):
     return {
         "TemperaturaIntent": temperatura, "UmiditaIntent": umidita, "StatoPdcIntent": stato_pdc,
         "AcquaCaldaIntent": acqua_calda, "MandataIntent": mandata, "RiscaldamentoAccesoIntent": riscaldamento_acceso,
-        "RipartenzaIntent": ripartenza, "TemperaturaFuoriIntent": temperatura_fuori, "UmidFuoriIntent": umidita_fuori_f, "AccendiTermostatoIntent": termostato(True), "SpegniTermostatoIntent": termostato(False),
+        "RipartenzaIntent": ripartenza, "TemperaturaFuoriIntent": temperatura_fuori, "UmidFuoriIntent": umidita_fuori_f,
+        "AccendiTermostatoIntent": termostato(True), "SpegniTermostatoIntent": termostato(False),
     }
 
 
@@ -327,34 +330,31 @@ def _radici():
         return _radici_cache["r"]
     from cryptography import x509
     lista = []
-    ctx = ssl.create_default_context()
+
+    def aggiungi(carica, dati):
+        try:
+            lista.append(carica(dati))
+        except ValueError:               # in una versione futura le radici con numero di serie fuori norma daranno errore: si saltano
+            pass
     with warnings.catch_warnings():        # qualche radice vecchia di Windows ha un numero di serie fuori norma: la libreria avvisa, ma e' innocua
         warnings.filterwarnings("ignore", message="Parsed a serial number")
-        for der in ctx.get_ca_certs(binary_form=True):
-            try:
-                lista.append(x509.load_der_x509_certificate(der))
-            except ValueError:               # in una versione futura quelle radici daranno errore: si saltano
-                pass
-    if not lista:                                    # Linux: i certificati stanno in un file, non in una cartella caricata
-        import os
-        percorsi = ssl.get_default_verify_paths()
-        file = percorsi.cafile or percorsi.openssl_cafile
-        if not (file and os.path.isfile(file)):
-            try:
-                import certifi
-                file = certifi.where()
-            except ImportError:
-                file = None
-        if file and os.path.isfile(file):
-            with open(file, "rb") as f:
-                testo = f.read()
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="Parsed a serial number")
+        for der in ssl.create_default_context().get_ca_certs(binary_form=True):
+            aggiungi(x509.load_der_x509_certificate, der)
+        if not lista:                                    # Linux: i certificati stanno in un file, non in una cartella caricata
+            import os
+            percorsi = ssl.get_default_verify_paths()
+            file = percorsi.cafile or percorsi.openssl_cafile
+            if not (file and os.path.isfile(file)):
+                try:
+                    import certifi
+                    file = certifi.where()
+                except ImportError:
+                    file = None
+            if file and os.path.isfile(file):
+                with open(file, "rb") as f:
+                    testo = f.read()
                 for blocco in re.findall(rb"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", testo, re.S):
-                    try:
-                        lista.append(x509.load_pem_x509_certificate(blocco))
-                    except ValueError:
-                        pass
+                    aggiungi(x509.load_pem_x509_certificate, blocco)
     _radici_cache["r"] = lista
     return lista
 
@@ -497,6 +497,8 @@ def richiesta(rich):
     try:
         corpo = rich.json()
     except ValueError:
+        corpo = None
+    if not isinstance(corpo, dict):
         return 400, {"errore": "richiesta non valida"}
     modo = str(ctx.config().get("verifica_firma") or "spenta")
     if modo in ("avviso", "attiva"):
@@ -545,7 +547,8 @@ def richiesta(rich):
         return {"version": "1.0", "response": {}}
     if tipo != "IntentRequest":
         return _risposta("Non ho capito.")
-    nome = str(((req.get("intent") or {}).get("name")) or "")
+    intento = req.get("intent")
+    nome = str(intento.get("name") or "") if isinstance(intento, dict) else ""
     if nome in ("AMAZON.StopIntent", "AMAZON.CancelIntent", "AMAZON.NavigateHomeIntent"):
         return _risposta("D'accordo.")
     if nome == "AMAZON.HelpIntent":

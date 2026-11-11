@@ -197,7 +197,7 @@ class Telegram:
             valori.update(extra)
         try:
             return modello.format_map(_Sicuro(valori))
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, AttributeError, KeyError, TypeError):     # modello scritto male in config.json: il messaggio parte lo stesso
             return f"{valori['impianto']}: {valori['testo']}"
 
     # ----- coda -----
@@ -467,7 +467,7 @@ class Sentinella(threading.Thread):
             r = al.get(nome)
             return isinstance(r, dict) and r.get("attivo", True)
 
-        tol = max(150, int(app.intervallo_pdc() * 1.5))
+        tol = tolleranza(app)
         modo = modo_corrente(db, ora, tol)
         pdc_on, risc_on = txt("pdc.acceso") == "on", txt("risc.acceso") == "on"
 
@@ -500,8 +500,7 @@ class Sentinella(threading.Thread):
         # umidita' (Smarther): scatta sopra la soglia per N minuti, rientra 2 punti sotto la soglia (isteresi)
         umid = num("casa.umidita", 1800)
         cu = app.cfg.leggi().get("umidita") or {}
-        for cod, livello, soglia in (("umidita_alta", "avviso", soglie_umidita(app)[0]),
-                                     ("umidita_molto_alta", "errore", soglie_umidita(app)[1])):
+        for (cod, livello), soglia in zip((("umidita_alta", "avviso"), ("umidita_molto_alta", "errore")), soglie_umidita(app), strict=True):
             if on(cod):
                 aperto = db.evento_aperto(cod)
                 cond = umid is not None and (umid > soglia or (aperto and umid > soglia - float(cu.get("rientro_punti", 2))))
@@ -607,8 +606,7 @@ class Sentinella(threading.Thread):
                     "durata": f"{minuti} min",
                     "consumo": f"consumo circa {num_it(kwh, 2)} kWh" if kwh is not None else "consumo non disponibile"}, muto=True)
 
-    # ----- riepilogo del mattino -----
-    # ----- cosa e' successo durante il silenzio notturno -----
+    # ----- riepilogo del mattino: cosa e' successo durante il silenzio notturno -----
     def _finestra_notte(self, ora):
         """(inizio, fine) dell'ultima notte silenziosa gia' finita, oppure None."""
         s = self.app.telegram.cfg()["silenzio_notturno"]
@@ -670,7 +668,7 @@ class Sentinella(threading.Thread):
         oggi0 = _ore_locali(lt)
         ieri0 = oggi0 - 86400
         ora = int(time.time())
-        tol = max(150, int(self.app.intervallo_pdc() * 1.5))
+        tol = tolleranza(self.app)
         e = calcola_efficienza(self.app.db, ieri0, oggi0, tol, ora)
         g = e["giorni"][0] if e["giorni"] else None
         if not g:

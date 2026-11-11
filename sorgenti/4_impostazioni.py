@@ -2,6 +2,8 @@
 # PEZZO 5: PAGINA IMPOSTAZIONI (stato dei collegamenti + modifica di config.json dal pannello)
 # ==========================================================================
 
+import string
+
 AVVIO = time.time()
 
 # Tipi di campo: testo, segreto (si scrive ma non si rilegge), bool, int, float, ora (HH:MM), lungo (testo su piu' righe),
@@ -318,8 +320,11 @@ def _valida(c, v):
     if t == "lungo":
         try:
             s.format_map(_Sicuro({}))
-        except (ValueError, IndexError):
+            campi = [nome for _, nome, _, _ in string.Formatter().parse(s) if nome is not None]
+        except (ValueError, IndexError, AttributeError, KeyError, TypeError):
             return None, "Le parentesi graffe non tornano: i segnaposto vanno scritti come {testo}"
+        if not all(re.fullmatch(r"\w+", nome) for nome in campi):       # niente {testo.qualcosa} o {testo[0]}: solo il nome
+            return None, "I segnaposto vanno scritti come {testo}: solo il nome tra le graffe"
         return s, None
     s = s.strip()
     if c["chiave"] == "stazione.url" and s and not stazione_url_valido(s):
@@ -450,10 +455,7 @@ def leggi_coda_log(percorso, n=120, max_byte=300_000):
 
 @api("/api/registro")
 def api_registro(app, q):
-    try:
-        n = max(20, min(400, int(q.get("righe", ["150"])[0])))
-    except ValueError:
-        n = 150
+    n = q_int(q, "righe", 150, 20, 400)
     base = app.base
 
     def peso(p):

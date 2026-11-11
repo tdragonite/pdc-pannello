@@ -168,7 +168,7 @@ def cmd_backup(app):
 def _info_copia(percorso):
     """(righe di misure, ultimo dato) di una copia del database, aprendola in sola lettura; None se non e' valida."""
     try:
-        with closing(sqlite3.connect("file:" + str(percorso).replace("\\", "/") + "?mode=ro&immutable=1", uri=True)) as c:
+        with closing(sqlite3.connect(Path(percorso).resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as c:
             if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 return None
             nomi = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}

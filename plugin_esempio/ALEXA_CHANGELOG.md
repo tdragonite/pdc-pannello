@@ -1,5 +1,9 @@
 # Plugin Alexa — changelog
 
+## 1.4.2 — 11 novembre 2026
+- Una richiesta scritta male (corpo che non è un oggetto, intento senza nome) riceve la risposta giusta (400 o «Non ho capito») invece di finire come errore interno nel registro.
+- Pulizia: la lettura dei certificati radice ha un solo blocco per gli avvisi.
+
 ## 1.4.1 — 9 novembre 2026
 - Con «Verifica firma Amazon = Attiva», se la firma non si può controllare (manca la libreria `cryptography` o i certificati di sistema) la richiesta viene **rifiutata** (prima passava). Con «Solo avviso» e «Spenta» non cambia nulla.
 

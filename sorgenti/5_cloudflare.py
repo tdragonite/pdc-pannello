@@ -459,7 +459,10 @@ def cf_crea(app, corpo, h):
             raise ErroreCF("Il nome del sottodominio può contenere solo lettere minuscole, numeri e trattini (es. pdc).")
         if not re.fullmatch(r"[A-Za-z0-9 _.-]{1,60}", nome):
             raise ErroreCF("Il nome del tunnel può contenere solo lettere, numeri, spazi, trattino, punto e underscore.")
-        zona = cf_chiama(tok, "GET", f"/zones/{corpo.get('zone_id', '')}")
+        zona_id = str(corpo.get("zone_id", ""))
+        if not re.fullmatch(r"[0-9a-f]{32}", zona_id):          # finisce dentro l'indirizzo della richiesta a Cloudflare: solo un identificativo vero
+            raise ErroreCF("Dominio non valido: riparti dal primo passo della procedura.")
+        zona = cf_chiama(tok, "GET", f"/zones/{zona_id}")
         account = (zona.get("account") or {}).get("id")
         if not account:
             raise ErroreCF("Non riesco a capire a quale account appartiene il dominio.")

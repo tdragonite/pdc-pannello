@@ -32,10 +32,12 @@ const ICONE = {
 };
 const COL = {casa: '#ff6b57', acs: '#4da3ff', riposo: '#3a4558', nodati: 'url(#tratti)'};
 const NOMI = {casa: 'Riscaldamento casa', acs: 'Acqua calda', riposo: 'Riposo', nodati: 'Nessun dato'};
+const FIN_PATH = 'M-3.2 -4.7H3.2V4.7H-3.2zM-3.2 -4.7L-7.2 -5.8V5.8L-3.2 4.7M-7.2 0H-3.2M3.2 -4.7L7.2 -5.8V5.8L3.2 4.7M7.2 0H3.2';   // disegno della finestrella (icona nei grafici e nei riquadri)
 
+const leggiHash = () => location.hash.replace('#/', '').split('/');     // «#/impostazioni/avvisi» -> ['impostazioni', 'avvisi']
 const S = {
-  pagina: (location.hash.replace('#/', '').split('/')[0] in TITOLI) ? location.hash.replace('#/', '').split('/')[0] : 'dashboard',
-  sub: location.hash.replace('#/', '').split('/')[1] || '',
+  pagina: (leggiHash()[0] in TITOLI) ? leggiHash()[0] : 'dashboard',
+  sub: leggiHash()[1] || '',
   range: ls.get('range', '24h'), rangeEff: ls.get('rangeEff', '7g'), custom: ls.get('custom', null),
   dati: null, sse: false, off: 0, solo: false,
 };
@@ -213,6 +215,7 @@ function disegna() {
     c.temp == null ? '' : (c.richiesta ? 'Lo Smarther sta chiedendo di scaldare la casa' : 'Lo Smarther non chiede calore: casa a temperatura o fuori fascia oraria'));
   html('c-sp', spark(c.spark));
   html('c-n', c.temp == null ? avviso('Smarther non collegato', 'bad') : (c.ts && d.ora - c.ts > 900) ? avviso('Ultimo dato delle ' + hhmm(c.ts), 'warn')
+    : c.vent ? ventBox(c.vent)   // VENT
     : c.riparte ? `<span class="ora-n"><i class="ck"></i><span class="badge on">Riparte intorno alle ${hhmm(c.riparte)}</span></span>` : '');
 
   timeline(d.modi, d.da, d.a);
@@ -237,13 +240,23 @@ function timeline(m, da, a) {
   w._m = {m, da, span};
 }
 
+// VENT-INIZIO  («puoi chiudere» dopo una finestra aperta: si toglie con tutto cio' che e' marcato VENT, vedi docs/ventilazione-rimozione.md)
+const VENT_COL = {corso: 'on', chiudi: 'acceso'};      // colori dei badge esistenti: tinta come la ripartenza = in corso, verde pieno = puoi chiudere
+function ventBox(v) {
+  const ic = `<svg viewBox="-8 -6.5 16 13" width="16" height="13" fill="none" stroke="#fff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${FIN_PATH}"/></svg>`;
+  const t = v.s === 'chiudi' ? 'Puoi chiudere' : 'Finestre aperte';      // senza la percentuale: c'e' gia' sopra, nella card
+  const tip = v.s === 'chiudi' ? `L'umidità in casa è ferma da circa ${v.min} min (−${v.calo} punti da quando hai aperto): ormai non scende più.` : `Umidità in casa ${num(v.um, 0)}%, −${v.calo} punti da quando hai aperto: sta ancora scendendo.`;
+  return `<span class="ora-n" title="${tip}">${ic}<span class="badge ${VENT_COL[v.s]}">${t}</span></span>`;
+}
+// VENT-FINE
+
 function tooltipTimeline(e) {
   const w = $('#tlw'); if (!w || !w._m) return;
   const {m, da, span} = w._m, r = w.getBoundingClientRect();
   const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), t = da + f * span;
-  const s = m.segmenti.find(x => t >= x[0] && t <= x[1]); if (!s) return;
-  const tip = $('#tip');
-  tip.innerHTML = `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(s[0])}–${hhmm(s[1])} (${durata(Math.round((s[1] - s[0]) / 60))})`;
+  const i = m.segmenti.findIndex(x => t >= x[0] && t <= x[1]); if (i < 0) return;
+  const s = m.segmenti[i], re = (m.reali || [])[i] || [s[0], s[1]], tip = $('#tip');   // orario e durata veri: il primo e l'ultimo tratto possono iniziare prima / finire dopo la finestra
+  tip.innerHTML = `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(re[0])}–${hhmm(re[1])} (${durata(Math.round((re[1] - re[0]) / 60))})`;
   tip.hidden = false;
   const mezzo = tip.offsetWidth / 2 + 2;   // larghezza vera del tooltip: sta sempre dentro la barra
   tip.style.left = Math.max(mezzo, Math.min(r.width - mezzo, f * r.width)) + 'px';
@@ -497,7 +510,7 @@ function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
   return fin.map((f, i) => {
     if (f.a <= da || f.da >= a) return '';
     const x = Math.min(Math.max(X((Math.max(f.da, da) + Math.min(f.a, a)) / 2), xmin), xmax), ok = f.stato === 'si';
-    return `<g data-fin="${i}" role="button" tabindex="0" aria-label="${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}" transform="translate(${x.toFixed(1)} ${y})"><circle r="13" fill="transparent"/><circle r="12" fill="${ok ? COLS.fin : 'var(--card)'}" stroke="${COLS.fin}" stroke-width="1.2"/><g transform="scale(1.2)" fill="none" stroke="${ok ? '#06101d' : COLS.fin}" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M-3.2 -4.7H3.2V4.7H-3.2zM-3.2 -4.7L-7.2 -5.8V5.8L-3.2 4.7M-7.2 0H-3.2M3.2 -4.7L7.2 -5.8V5.8L3.2 4.7M7.2 0H3.2"/></g></g>`;
+    return `<g data-fin="${i}" role="button" tabindex="0" aria-label="${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}" transform="translate(${x.toFixed(1)} ${y})"><circle r="13" fill="transparent"/><circle r="12" fill="${ok ? COLS.fin : 'var(--card)'}" stroke="${COLS.fin}" stroke-width="1.2"/><g transform="scale(1.2)" fill="none" stroke="${ok ? '#06101d' : COLS.fin}" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="${FIN_PATH}"/></g></g>`;
   }).join('');
 }
 
@@ -624,7 +637,10 @@ function graficoLineare(g, d, W, H) {
   }));
   (S.vuoti = S.vuoti || {})[g.id] = vuoti;
   s += `<defs><pattern id="tr-${g.id}" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#8793a8" stroke-opacity=".22" stroke-width="1"/></pattern></defs>`;
-  s += vuoti.map(([s0, s1]) => `<rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="rgba(135,147,168,.05)"/><rect x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}" fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('')).join('');
+  s += vuoti.map(([s0, s1]) => {
+    const r = `x="${X(Math.max(s0, d.da)).toFixed(1)}" y="${T}" width="${Math.max(1, X(Math.min(s1, d.a)) - X(Math.max(s0, d.da))).toFixed(1)}" height="${ph}"`;
+    return `<rect ${r} fill="rgba(135,147,168,.05)"/><rect ${r} fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('');
+  }).join('');
   s += g.id === 'casa' ? fasceRichiesta(d.richiesta || [], d.da, d.a, X, T, ph) : fasce(d.modi.segmenti, d.da, d.a, X, T, ph);
   if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph);
   if (g.id === 'casa') s += fasceRichiesta(d.richiesta || [], d.da, d.a, X, T + ph - 7, 7, .9);   // striscia piena in basso: quando lo Smarther chiede caldo
@@ -645,14 +661,19 @@ function graficoLineare(g, d, W, H) {
   s += g.linee.map((l, i) => `<circle class="cur-d" data-i="${i}" data-a="${l.asse || 0}" r="4.5" cx="0" cy="0" fill="${COLS[l.col]}" stroke="var(--card)" stroke-width="2" visibility="hidden"/>`).join('');
   s += `<line class="cur" x1="0" x2="0" y1="${T}" y2="${T + ph}" visibility="hidden"/>
     <g class="cur-t" visibility="hidden"><rect class="cur-bg" rx="6" height="19"/><text class="cur-tx"></text></g>
-    <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/>${g.id === 'casa' ? iconeFinestre(d.finestre || [], d.da, d.a, X, L + 13, W - R - 13, T + 14) : ''}</svg>`;
+    <rect class="cattura" x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent"/>${g.id === 'casa' ? iconeFinestre(d.finestre || [], d.da, d.a, X, L + 13, W - R - 13, T + ph - 24) : ''}</svg>`;
   return s;
 }
 
-function valoreA(punti, t, tol) {
+// posizione del primo punto con tempo >= t (i punti sono in ordine di tempo; con l'elenco vuoto torna 0)
+function primoDa(punti, t) {
   let lo = 0, hi = punti.length - 1;
-  if (hi < 0) return null;
   while (lo < hi) { const m = (lo + hi) >> 1; if (punti[m][0] < t) lo = m + 1; else hi = m; }
+  return lo;
+}
+function valoreA(punti, t, tol) {
+  if (!punti.length) return null;
+  const lo = primoDa(punti, t);
   let best = punti[lo]; if (lo > 0 && Math.abs(punti[lo - 1][0] - t) < Math.abs(best[0] - t)) best = punti[lo - 1];
   return Math.abs(best[0] - t) <= tol ? best[1] : null;
 }
@@ -675,9 +696,9 @@ function legenda(g, t) {
 }
 // valore sulla linea al tempo t (interpolato fra i due punti vicini; null se lì c'e' un buco)
 function valoreInterp(punti, t, buco) {
-  let lo = 0, hi = punti.length - 1;
+  const hi = punti.length - 1;
   if (hi < 0 || t < punti[0][0] - buco / 2 || t > punti[hi][0] + buco / 2) return null;
-  while (lo < hi) { const m = (lo + hi) >> 1; if (punti[m][0] < t) lo = m + 1; else hi = m; }
+  const lo = primoDa(punti, t);
   const b = punti[lo], a = lo > 0 ? punti[lo - 1] : null;
   if (!a || b[0] === t) return Math.abs(b[0] - t) <= buco / 2 ? b[1] : null;
   if (b[0] - a[0] > buco) return Math.abs(t - a[0]) <= Math.abs(b[0] - t) && t - a[0] <= buco / 2 ? a[1] : (b[0] - t <= buco / 2 ? b[1] : null);
@@ -685,14 +706,20 @@ function valoreInterp(punti, t, buco) {
 }
 // valore di una linea a gradini al tempo t: quello del punto piu' vicino, se non c'e' un buco
 function valoreGradino(punti, t, buco, mezzo) {
-  let lo = 0, hi = punti.length - 1;
-  if (hi < 0) return null;
-  while (lo < hi) { const m = (lo + hi) >> 1; if (punti[m][0] < t) lo = m + 1; else hi = m; }
+  if (!punti.length) return null;
+  const lo = primoDa(punti, t);
   let i = lo; if (lo > 0 && Math.abs(punti[lo - 1][0] - t) < Math.abs(punti[lo][0] - t)) i = lo - 1;
   const dist = Math.abs(punti[i][0] - t);
   if (dist <= mezzo) return punti[i][1];
   const vic = punti[i + (t > punti[i][0] ? 1 : -1)];
   return vic && Math.abs(vic[0] - punti[i][0]) <= buco ? punti[i][1] : null;
+}
+// etichetta del cursore (riquadro + testo): centrata su x, senza uscire dall'area del grafico
+function piazzaEtichetta(tx, x, L, pw, T) {
+  const txt = tx.querySelector('.cur-tx'), bg = tx.querySelector('.cur-bg');
+  const w = txt.getComputedTextLength() + 16, bx = Math.max(L, Math.min(L + pw - w, x - w / 2));
+  bg.setAttribute('x', bx.toFixed(1)); bg.setAttribute('y', T + 3); bg.setAttribute('width', w.toFixed(1));
+  txt.setAttribute('x', (bx + 8).toFixed(1)); txt.setAttribute('y', T + 16);
 }
 function cursore(t) {
   const d = S.dati; if (!d || S.dpag !== 'analisi') return;
@@ -711,15 +738,13 @@ function cursore(t) {
       });
     }
     const vuoto = ((S.vuoti || {})[svg.dataset.id] || []).find(v => t >= v[0] && t < v[1]);     // sulle righe oblique: «nessun dato» + durata del buco
-    const T0 = +svg.dataset.t0, txt = tx.querySelector('.cur-tx'), bg = tx.querySelector('.cur-bg'), NS = 'http://www.w3.org/2000/svg';
+    const T0 = +svg.dataset.t0, txt = tx.querySelector('.cur-tx'), NS = 'http://www.w3.org/2000/svg';
     txt.textContent = '';
     [[dm(t), ''], ...(vuoto ? [[' · nessun dato' + (vuoto[1] - vuoto[0] >= 120 ? ' · ' + durata(Math.round((vuoto[1] - vuoto[0]) / 60)) : ''), 'nd']] : [])].forEach(([tt, cl]) => {
       const ts = document.createElementNS(NS, 'tspan'); if (cl) ts.setAttribute('class', cl); ts.textContent = tt; txt.appendChild(ts);
     });
     tx.setAttribute('visibility', 'visible');
-    const w = txt.getComputedTextLength() + 16, bx = Math.max(L, Math.min(L + pw - w, x - w / 2));
-    bg.setAttribute('x', bx.toFixed(1)); bg.setAttribute('y', T0 + 3); bg.setAttribute('width', w.toFixed(1));
-    txt.setAttribute('x', (bx + 8).toFixed(1)); txt.setAttribute('y', T0 + 16);
+    piazzaEtichetta(tx, x, L, pw, T0);
     c.setAttribute('y1', T0 + 22);
   });
   (S.grafici || []).forEach(g => legenda(g, t));
@@ -750,7 +775,7 @@ function cursoreEf(svg, e) {
   const k = svg.dataset.ef, c = EF[k]; if (!c || !c.xs.length) return;
   const r = svg.getBoundingClientRect(), x0 = (e.clientX - r.left) * (+svg.getAttribute('width') / r.width);
   let i = 0; c.xs.forEach((x, j) => { if (Math.abs(x - x0) < Math.abs(c.xs[i] - x0)) i = j; });
-  const x = c.xs[i], ln = svg.querySelector('.cur'), tx = svg.querySelector('.cur-t'), txt = tx.querySelector('.cur-tx'), bg = tx.querySelector('.cur-bg');
+  const x = c.xs[i], ln = svg.querySelector('.cur'), tx = svg.querySelector('.cur-t'), txt = tx.querySelector('.cur-tx');
   ln.setAttribute('x1', x); ln.setAttribute('x2', x); ln.setAttribute('y1', c.T + 22); ln.setAttribute('visibility', 'visible');
   const ys = c.dots ? c.dots(i) : [];
   svg.querySelectorAll('.cur-d').forEach((p, j) => {
@@ -762,10 +787,7 @@ function cursoreEf(svg, e) {
   if (et == null) tx.setAttribute('visibility', 'hidden');
   else { txt.textContent = et; tx.setAttribute('visibility', 'visible'); }
   ln.setAttribute('y1', et == null ? c.T : c.T + 22);
-  if (et == null) { const lg0 = document.getElementById('lg-' + k); if (lg0) lg0.innerHTML = legEf(k, i); return; }
-  const w = txt.getComputedTextLength() + 16, bx = Math.max(c.L, Math.min(c.L + c.pw - w, x - w / 2));
-  bg.setAttribute('x', bx.toFixed(1)); bg.setAttribute('y', c.T + 3); bg.setAttribute('width', w.toFixed(1));
-  txt.setAttribute('x', (bx + 8).toFixed(1)); txt.setAttribute('y', c.T + 16);
+  if (et != null) piazzaEtichetta(tx, x, c.L, c.pw, c.T);
   const lg = document.getElementById('lg-' + k); if (lg) lg.innerHTML = legEf(k, i);
 }
 function togliCursoreEf() {
@@ -890,6 +912,7 @@ function vistaImp() {
   $('#imp').hidden = reg; $('#reg').hidden = !reg;
   document.querySelectorAll('#imp .imp-tab').forEach(g => { g.hidden = g.dataset.t !== (cur || 'stato'); });
   if (reg) caricaRegistro();
+  else if (cur === 'accesso') cfCarica(false);      // appena apri la scheda, senza aspettare il giro dei 5 secondi
 }
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
@@ -899,9 +922,10 @@ async function caricaRegistro() {
   } catch { box.innerHTML = '<article class="card"><div class="vuoto">Non riesco a leggere il registro: il pannello non risponde.</div></article>'; }
 }
 const pesoTxt = b => b >= 1e6 ? num(b / 1e6, 1) + ' MB' : num(b / 1e3, 0) + ' KB';
+const righeRegistro = d => d.righe.filter(r => !S.solo || ['WARNING', 'ERROR', 'CRITICAL'].includes(r.livello));   // con «Solo avvisi ed errori» spuntato
 function disegnaRegistro() {
   const box = $('#reg'), d = S.reg; if (!box || !d) return;
-  const righe = d.righe.filter(r => !S.solo || r.livello === 'WARNING' || r.livello === 'ERROR' || r.livello === 'CRITICAL');
+  const righe = righeRegistro(d);
   const bk = !d.backup_attivo ? 'spento' : d.backup_ts ? `${esc(dataLunga(d.backup_ts))} · ${d.backup_copie} copie` : 'ancora nessuno';
   const sc = box.querySelector('.reg-log'), inFondo = !sc || sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 24;
   box.innerHTML = `<article class="card"><div class="ch"><h2>Registro del pannello</h2>
@@ -922,7 +946,7 @@ document.addEventListener('click', async e => {
   if (t.closest('#reg-agg')) { caricaRegistro(); return; }
   if (t.closest('#reg-copia')) {
     const d = S.reg; if (!d) return;
-    const ok = await copiaTesto(d.righe.filter(r => !S.solo || ['WARNING', 'ERROR', 'CRITICAL'].includes(r.livello)).map(r => r.testo).join('\n'));
+    const ok = await copiaTesto(righeRegistro(d).map(r => r.testo).join('\n'));
     toast(ok ? 'Registro copiato' : 'Non riesco a copiare', !ok);
   }
 });
@@ -966,11 +990,11 @@ function meteoBreve(m) {
   if (m.livello !== 'certa' && m.livello !== 'possibile') return '';
   return (m.testo || '').replace(/^(possibile )?pioggia\s*/, '').replace('per il resto della giornata', 'tutto il giorno').replace(/^(\d+)–(\d+)$/, 'dalle $1 alle $2');
 }
+const gradi = v => v == null ? '—' : Math.round(v) + '°';     // gradi interi del meteo
 function meteoRiga(m) {
   const el = document.getElementById('e-mt');
   if (!el) return;
   if (!m) { el.hidden = true; chiudiMeteo(); return; }
-  const gradi = v => v == null ? '—' : Math.round(v) + '°';
   el.hidden = false;
   const breve = meteoBreve(m).replace(/(\d)–(\d)/g, '$1⁠–⁠$2');
   el.title = m.testo ? m.testo.charAt(0).toUpperCase() + m.testo.slice(1) : '';
@@ -979,7 +1003,6 @@ function meteoRiga(m) {
   if (S.meteoAperto) disegnaPannelloMeteo(m);
 }
 function pannelloMeteoHtml(m) {
-  const gradi = v => v == null ? '—' : Math.round(v) + '°';
   const righe = (m.ore || []).map(o => {
     const mm = o.mm > 0 ? (o.mm < 0.1 ? '<0,1' : o.mm.toFixed(1).replace('.', ',')) + ' mm' : '';
     const pioggia = o.p === 'certa' ? (mm || 'pioggia') : o.p === 'possibile' ? 'possibile' + (mm ? ' · ' + mm : '') : 'asciutto';
@@ -987,7 +1010,7 @@ function pannelloMeteoHtml(m) {
   }).join('');
   const NOMI = {italia_meteo_arpae_icon_2i: 'ICON-2I', ecmwf_ifs025: 'ECMWF'};
   const mod = (m.modelli_nomi || []).map(n => NOMI[n] || n).join(' + ');
-  const agg = m.agg ? new Date(m.agg * 1000).toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'}) : '';
+  const agg = m.agg ? hhmm(m.agg) : '';
   return `<div class="eti">${esc(m.giorno)} · ogni 3 ore</div>${righe || '<div class="mt-r"><span class="mt-h">Nessun dettaglio orario</span></div>'}` +
     `<div class="mt-fo"><span>${esc(mod)}${agg ? ' · agg. ' + agg : ''}</span><span>Dati: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0)</span></div>`;
 }
@@ -1010,8 +1033,6 @@ document.addEventListener('click', ev => {
     if (S.dati && S.dati.meteo) { S.meteoAperto = true; disegnaPannelloMeteo(S.dati.meteo); }
   } else if (S.meteoAperto && !(ev.target.closest && ev.target.closest('#mt-pan'))) chiudiMeteo();
 });
-document.addEventListener('keydown', ev => { if (ev.key === 'Escape') chiudiMeteo(); });
-window.addEventListener('scroll', () => { if (S.meteoAperto) chiudiMeteo(); }, {passive: true});
 
 // finestre aperte: tocco sull'icona -> pannellino per confermare; «＋ Finestra» per segnarne una a mano
 function finRidisegna() { const b = $('#grafici'); if (b) b.dataset.f = ''; carica(); }
@@ -1022,17 +1043,17 @@ async function finInvia(url, corpo) {
 }
 function finPannello(ic) {
   const f = ((S.dati || {}).finestre || [])[+ic.dataset.fin]; if (!f) return;
-  const inf = (S.dati || {}).finestre_info || {}, ora2 = t => new Date(t * 1000).toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'});
+  const inf = (S.dati || {}).finestre_info || {};
   const ok = f.stato === 'si', righe = (e, v) => `<div class="riga"><span>${e}</span><b>${v}</b></div>`;
   const p = document.createElement('div'); p.id = 'fin-pan'; p.className = 'mt-pan';
   p.innerHTML = `<div class="eti">${ok ? 'Finestra aperta' : 'Possibile finestra aperta'}</div>
-    ${righe('Orario', `${ora2(f.da)}–${ora2(f.a)}`)}
+    ${righe('Orario', `${hhmm(f.da)}–${hhmm(f.a)}`)}
     ${f.calo != null ? righe('Calo di temperatura', `−${num(f.calo, 1)} °C`) : ''}
-    ${f.ah != null ? righe('Umidità assoluta', `${f.ah > 0 ? '+' : '−'}${num(Math.abs(f.ah), 1)} g/m³`) : ''}
-    <div class="sub">${ok ? (f.manuale ? 'Segnata da te.' : 'Confermata da te.') : 'Era una finestra aperta?'}</div>
-    <div class="azioni-t" id="fin-az">${ok ? `<button type="button" class="sec" data-az="annulla">${f.manuale ? 'Elimina' : 'Togli la conferma'}</button>`
-      : '<button type="button" class="sec" data-az="si">Sì</button><button type="button" class="sec" data-az="no">No</button>'}</div>
-    <div class="mt-fo">${inf.tarato ? `Soglie tarate su ${inf.n} risposte.` : `Risposte date: ${inf.risposte || 0} su 10 per tarare.`}</div>`;
+    ${f.ah != null ? righe('Umidità assoluta', `${Math.abs(f.ah) < 0.05 ? '' : f.ah > 0 ? '+' : '−'}${num(Math.abs(f.ah), 1)} g/m³`) : ''}
+    <div class="riga rg-az"><span>${ok ? (f.manuale ? 'Segnalata da te.' : 'Confermata da te.') : 'Era una finestra aperta?'}</span>
+      <div class="azioni-t" id="fin-az">${ok ? `<button type="button" class="sec" data-az="annulla">${f.manuale ? 'Elimina' : 'Togli la conferma'}</button>`
+        : '<button type="button" class="sec" data-az="si">Sì</button><button type="button" class="sec" data-az="no">No</button>'}</div></div>
+    <div class="mt-fo">${inf.tarato ? `Soglie tarate su ${inf.n} risposte.` : `Risposte date: ${inf.risposte || 0}<br>Per tarare servono 2 «sì» e 2 «no».`}</div>`;
   document.body.appendChild(p);
   const r = ic.getBoundingClientRect(), w = Math.min(280, window.innerWidth - 20); p.style.width = w + 'px';
   p.style.left = Math.max(10, Math.min(window.innerWidth - w - 10, r.left + r.width / 2 - w / 2)) + 'px';
@@ -1061,8 +1082,10 @@ document.addEventListener('click', ev => {
   if (vecchio && !(t.closest && t.closest('#fin-pan')) && !ic) vecchio.remove();
   if (ic) { if (vecchio) vecchio.remove(); finPannello(ic); }
 });
-document.addEventListener('keydown', ev => { if (ev.key === 'Escape') { const v = document.getElementById('fin-pan'); if (v) v.remove(); } });
-window.addEventListener('scroll', () => { const v = document.getElementById('fin-pan'); if (v) v.remove(); }, {passive: true});
+// Esc o lo scorrimento della pagina chiudono i pannellini sospesi (meteo e finestra)
+function chiudiPannelli() { if (S.meteoAperto) chiudiMeteo(); const v = document.getElementById('fin-pan'); if (v) v.remove(); }
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') chiudiPannelli(); });
+window.addEventListener('scroll', chiudiPannelli, {passive: true});
 
 // ---------- Changelog ----------
 // Una voce per ogni versione, la piu' recente in alto; le sotto-versioni stanno nella versione madre.
@@ -1076,7 +1099,29 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.6', quando: '11 novembre 2026', titolo: 'Controllo generale', righe: [
+    ['s', 'Esci con la sessione scaduta', 'Premere «Esci» quando la sessione era già scaduta dava «errore interno»: ora porta alla pagina di accesso.'],
+    ['s', 'Modelli dei messaggi Telegram', 'Un modello scritto male (per esempio {testo.x}) bloccava la coda dei messaggi, che riprovava all’infinito: ora viene rifiutato quando salvi, con il motivo.'],
+    ['s', 'Richieste con il corpo non letto', 'Dopo una richiesta rifiutata prima di leggerne il contenuto la connessione si chiude: la richiesta successiva non si confonde più (contava soprattutto da fuori casa).'],
+    ['s', 'Dopo un errore del server', 'Se il pannello rispondeva con un errore, la pagina poteva smettere di aggiornarsi fino al ricaricamento: ora tiene gli ultimi dati buoni e riprende da sola.'],
+    ['s', 'Editor del Boost', 'Bloccando le modifiche con l’editor del Boost aperto, al prossimo sblocco ricompariva da solo: ora si chiude, e in Regolazioni resta aperto un editor alla volta.'],
+    ['s', 'Neve a zero gradi', 'Con 0,0 °C esatti e pioggia l’icona del meteo non mostrava la neve.'],
+    ['m', 'Accesso da internet più leggero', 'Lo stato del tunnel si rilegge ogni 5 secondi solo mentre guardi la scheda Accesso, non in tutte le Impostazioni.'],
+    ['m', 'Qualche controllo in più', 'L’ID della zona Cloudflare e l’indirizzo dei dispositivi si controllano prima di usarli, e il limite di richieste dei plugin regge anche con più richieste insieme.'],
+    ['m', 'Analisi completa più veloce', 'Il comando «analisi» degli strumenti ricalcolava gli stessi dati per ogni giorno: sul database di prova passa da 1,6 a 0,6 secondi, con lo stesso identico risultato.'],
+    ['m', 'Alexa 1.4.2', 'Una richiesta scritta male riceve la risposta giusta invece di un errore interno nel registro.'],
+    ['m', 'Codice più snello', 'Uniti i pezzi doppi di Python, JavaScript e CSS (icona del meteo, cursore dei grafici, editor delle regolazioni, elenchi a pagine): a vista non cambia niente.'],
+  ]},
+  {v: '0.25.5', quando: '11 novembre 2026', titolo: 'Puoi chiudere le finestre', righe: [   // VENT (la riga di changelog si toglie con il resto)
+    ['n', 'Finestre aperte: «Puoi chiudere»', 'Nella card Smarther, durante e dopo una finestra aperta, un riquadro con l’iconcina della finestra dice «Finestre aperte» mentre l’umidità scende e «Puoi chiudere» quando è ferma da qualche minuto (o quando fuori c’è la stessa acqua che in casa). Sta nello stesso posto della ripartenza e la sostituisce solo finché serve. Si toglie con tutto ciò che è marcato VENT.'],
+    ['s', 'Anche dopo la fine rilevata', 'Il calo di temperatura finisce prima di quando chiudi davvero: l’indicazione resta per 45 minuti dopo la fine della finestra rilevata.'],
+  ]},
   {v: '0.25.4', quando: '9 novembre 2026', titolo: 'Controllo generale', righe: [
+    ['m', 'Umidità esterna nello storico', 'Il pannello ora salva anche l’umidità letta dalla stazione meteo vicina: così, in Analisi completa, si può confrontare con quella di casa e capire da dove arriva l’umidità. Lo storico parte da adesso.'],
+    ['m', 'Radiazione solare nello storico', 'Ogni notte il pannello salva da Open-Meteo la radiazione solare oraria del giorno appena finito (e rilegge gli ultimi 8 giorni, quando Open-Meteo sostituisce i dati provvisori con quelli definitivi). Non si vede in Dashboard: serve solo in Analisi completa, per capire quanto il sole scalda casa. Parte da adesso.'],
+    ['s', 'Una finestra, non due', 'Se la temperatura fa un piccolo calo, risale un attimo e poi scende di nuovo, il pannello lo segna come un’unica finestra aperta: prima ne proponeva due di fila.'],
+    ['s', 'Durata vera nel tooltip', 'Passando sulla barra dei cicli in Analisi, il primo e l’ultimo tratto mostrano orario e durata veri anche se iniziano prima (o finiscono dopo) la finestra: prima si vedeva solo il pezzo tagliato.'],
+    ['s', 'Icona finestra in basso', 'Nel grafico della temperatura ambiente l’iconcina della finestra aperta sta ora in basso, sopra le barrette della richiesta caldo: prima in alto copriva l’etichetta dell’orario quando ci passavi sopra.'],
     ['s', 'Numeri strani nei campi', 'Scrivere «nan», «inf» o un numero enorme in un campo di FSV, regolazioni o Boost dava «errore interno»: ora risponde con il solito messaggio, senza mandare nulla alla pompa.'],
     ['s', 'Tunnel che si ferma di continuo', 'Se cloudflared non riusciva a ripartire, Avvia, Ferma e Riavvia restavano bloccati fino a 5 minuti: ora rispondono subito.'],
     ['s', 'Boost non ripristinato', 'Se dopo 30 tentativi il Boost non riesce a rimettere i valori di prima, il pannello apre un’anomalia (con avviso Telegram) invece di rinunciare in silenzio.'],
@@ -1302,7 +1347,7 @@ async function caricaChangelogPlugin() {
   try {
     const r = await leggiJson('/api/plugin/changelog'); if (!r) return;
     clDati = r.ok ? await r.json() : {plugin: []};
-  } catch (e) { clDati = {plugin: []}; }
+  } catch { clDati = {plugin: []}; }
   if (S.pagina === 'changelog' && S.sub === 'plugin') { const y = window.scrollY; vistaChangelog(); window.scrollTo(0, y); }
 }
 document.addEventListener('click', e => {
@@ -1323,8 +1368,7 @@ function diffPerc(ora_, prima, minimo = 0.5) {
 }
 function rigaConf(d, ora_, prima, fmt, meglio, minimo) {
   // meglio: 'su' (piu' alto e' meglio, es. COP), 'giu' (piu' basso e' meglio, es. consumo), '' (neutro)
-  if (!S.confronto || !d.prec) return '';
-  if (!d.prec.completo) return '';
+  if (!S.confronto || !d.prec || !d.prec.completo) return '';
   const p = diffPerc(ora_, prima, minimo);
   const segno = p == null ? '' : (p > 0.5 ? '▲' : p < -0.5 ? '▼' : '=');
   const buono = p == null || Math.abs(p) <= 0.5 || !meglio ? '' : ((p > 0) === (meglio === 'su') ? 'buono' : 'cattivo');
@@ -1449,7 +1493,7 @@ function sbrinamentiTile(s) {
 }
 function sbrinamentiElenco(s) {
   if (!s || !s.n) return '';
-  const gr = v => num(Math.round(v) + 0, 0) + ' °C', quando = t => { const d = new Date(t * 1000); return d.toLocaleDateString('it-IT', {day: 'numeric', month: 'short'}) + ' · ' + d.toLocaleTimeString('it-IT', {hour: '2-digit', minute: '2-digit'}); };
+  const gr = v => num(Math.round(v) + 0, 0) + ' °C', quando = t => new Date(t * 1000).toLocaleDateString('it-IT', {day: 'numeric', month: 'short'}) + ' · ' + hhmm(t);
   const riga = x => `<div class="sr"><span>${quando(x.ts)}</span><span>${x.incorso ? 'in corso' : x.min + ' min'}</span><span>${x.kwh != null ? '~' + num(x.kwh, 2) : '—'}</span><span>${x.esterna != null ? gr(x.esterna) : '—'}</span></div>`;
   const v = [s.media_min != null ? num(s.media_min, 0) + ' min' : '', s.kwh != null && s.n ? '~' + num(s.kwh / s.n, 2) + ' kWh' : '', s.esterna != null ? gr(s.esterna) : ''].filter(Boolean).map(t => `<span class="pill">${t}</span>`);
   const testa = `<div class="tiles"><div class="tile"><span class="mut">Media</span> ${v.join(' ')}</div></div>`;
@@ -1622,9 +1666,13 @@ document.addEventListener('toggle', e => {
 // la matita ✎ sulla riga: attiva solo con le modifiche sbloccate e da casa
 const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo da casa' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
 S.sbloccoFsv = S.sbloccoFsv || 0; S.fsvMod = S.fsvMod || null; S.fsvVal = S.fsvVal || ''; S.fsvErr = S.fsvErr || ''; S.fsvOcc = false;
-function armaSbloccoFsv() { clearTimeout(S.tLockFsv); S.sbloccoFsv = Date.now() + 30000; S.tLockFsv = setTimeout(() => { S.sbloccoFsv = 0; S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = false; S.boostErr = ''; ridisegnaInstallatore(); }, 30200); }
+// chiude gli editor aperti nella scheda Regolazioni (FSV, regolazione, boost): se ne tiene aperto uno alla volta
+function chiudiEditor() { S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = false; S.boostErr = ''; }
+function armaSbloccoFsv() { clearTimeout(S.tLockFsv); S.sbloccoFsv = Date.now() + 30000; S.tLockFsv = setTimeout(() => { S.sbloccoFsv = 0; chiudiEditor(); ridisegnaInstallatore(); }, 30200); }
 function ridisegnaInstallatore() { if (S.dati && S.pagina === 'dispositivi' && S.sub === 'installatore') disegnaDispositivi(S.dati); }
 function trovaFsv(id) { const i = S.dati && S.dati.installatore; if (!i) return null; for (const g of i.gruppi) { const r = g.righe.find(x => x.id === id); if (r) return r; } return null; }
+const bottoniEditor = (k, conferma) => `<div class="fe-b"><button type="button" class="sec piccolo" data-${k}-annulla ${S[k + 'Occ'] ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-${k}-conf ${S[k + 'Occ'] ? 'disabled' : ''}>${S[k + 'Occ'] ? 'Invio…' : conferma}</button></div>`;
+const numero = s => Number(String(s).replace(',', '.'));     // «21,5» o «21.5» -> 21.5 (NaN se non e' un numero)
 function editorFsv(r) {
   const campo = r.opzioni
     ? `<select data-fsv-val aria-label="Nuovo valore di ${esc(r.id)}">${r.opzioni.map(([k, t]) => `<option value="${k}" ${String(k) === String(S.fsvVal) ? 'selected' : ''}>${esc(t)} · ${k}</option>`).join('')}</select>`
@@ -1636,7 +1684,7 @@ function editorFsv(r) {
     ${r.limiti ? `<small class="mut">Limiti del manuale: ${esc(r.limiti)}</small>` : ''}
     <small class="mut">Il valore parte dal pannello alla pompa tramite SmartThings. Poi va riletto: finché la pompa non lo conferma, la riga dice «in attesa».</small>
     ${S.fsvErr ? `<div class="fe-err">${esc(S.fsvErr)}</div>` : ''}
-    <div class="fe-b"><button type="button" class="sec piccolo" data-fsv-annulla ${S.fsvOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-fsv-conf ${S.fsvOcc ? 'disabled' : ''}>${S.fsvOcc ? 'Invio…' : 'Cambia nella pompa'}</button></div></div>`;
+    ${bottoniEditor('fsv', 'Cambia nella pompa')}</div>`;
 }
 function rigaFsv(r) {
   const sbl = Date.now() < S.sbloccoFsv;
@@ -1652,15 +1700,13 @@ function rigaFsv(r) {
 const PER_PAG_FSV = 6;
 function cronologiaFsv(lista) {
   if (!lista || !lista.length) return `<article class="card dev"><div class="ch"><h2>Cronologia modifiche</h2></div><p class="nota-sez">Nessun cambio visto da quando il pannello osserva.</p></article>`;
-  const pagine = Math.ceil(lista.length / PER_PAG_FSV);
-  S.pagFsv = Math.min(Math.max(S.pagFsv || 0, 0), pagine - 1);
-  const righe = lista.slice(S.pagFsv * PER_PAG_FSV, (S.pagFsv + 1) * PER_PAG_FSV).map(v => {
+  const [pagina, nav] = paginaDi(lista, 'pagFsv', PER_PAG_FSV);
+  const righe = pagina.map(v => {
     const fonte = v.fonte === 'pannello'
       ? (v.stato === 'in attesa' ? `chiesto dal pannello, in attesa della pompa` : v.stato === 'non confermata' ? `chiesto dal pannello, la pompa non l’ha confermato` : v.stato ? 'chiesto dal pannello (già a quel valore)' : `cambiato dal pannello${v.ip ? ' (' + esc(v.ip) + ')' : ''}`)
       : 'letto dalla pompa';
     return `<div class="riga"><span>${esc(dataLunga(v.ts))}</span><b>${esc(v.id)} · ${esc(v.nome)}<small class="mut nota-r">${esc(v.prima)} → ${esc(v.dopo)}</small><small class="mut nota-r">${fonte}</small></b></div>`;
   }).join('');
-  const nav = pagNav('pagFsv', pagine);
   return `<article class="card dev"><div class="ch"><h2>Cronologia modifiche</h2></div>
     <p class="nota-sez">I cambi che il pannello ha visto nelle impostazioni, con il valore di prima. La data è quella in cui il pannello ha visto il valore nuovo: SmartThings può essere in ritardo rispetto alla pompa.</p>${righe}${nav}</article>`;
 }
@@ -1678,6 +1724,12 @@ function disegnaInstallatore(d) {
 }
 // pagine «‹ 1 di N ›» (cronologia FSV e registro comandi): chiave = campo di S che tiene la pagina corrente
 const pagNav = (k, tot) => tot > 1 ? `<div class="pager"><button type="button" data-pag="${k}:-1" ${S[k] === 0 ? 'disabled' : ''} aria-label="Più recenti">‹</button><span>${S[k] + 1} di ${tot}</span><button type="button" data-pag="${k}:1" ${S[k] >= tot - 1 ? 'disabled' : ''} aria-label="Meno recenti">›</button></div>` : '';
+// una pagina di un elenco lungo: [righe della pagina corrente, barra «‹ 1 di N ›»]
+function paginaDi(lista, k, per) {
+  const pagine = Math.ceil(lista.length / per);
+  S[k] = Math.min(Math.max(S[k] || 0, 0), pagine - 1);
+  return [lista.slice(S[k] * per, (S[k] + 1) * per), pagNav(k, pagine)];
+}
 document.addEventListener('click', e => {
   const b = e.target.closest && e.target.closest('[data-pag]'); if (!b || b.disabled) return;
   const [k, d] = b.dataset.pag.split(':'); S[k] = (S[k] || 0) + Number(d);
@@ -1688,13 +1740,13 @@ document.addEventListener('click', e => {
   if (!t.closest) return;
   if (t.closest('#b-lock-fsv')) {
     clearTimeout(S.tLockFsv);
-    if (Date.now() < S.sbloccoFsv) { S.sbloccoFsv = 0; S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; } else armaSbloccoFsv();
+    if (Date.now() < S.sbloccoFsv) { S.sbloccoFsv = 0; chiudiEditor(); } else armaSbloccoFsv();
     ridisegnaInstallatore(); return;
   }
   const m = t.closest('[data-fsv-mod]');
   if (m && !m.disabled) {
     const r = trovaFsv(m.dataset.fsvMod); if (!r) return;
-    S.regMod = null; S.regErr = ''; S.fsvMod = r.id; S.fsvErr = ''; S.fsvVal = r.n == null ? '' : String(r.n);
+    chiudiEditor(); S.fsvMod = r.id; S.fsvVal = r.n == null ? '' : String(r.n);
     armaSbloccoFsv(); ridisegnaInstallatore(); return;
   }
   if (t.closest('[data-fsv-annulla]')) { S.fsvMod = null; S.fsvErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
@@ -1702,7 +1754,7 @@ document.addEventListener('click', e => {
 });
 async function confermaFsv() {
   const r = trovaFsv(S.fsvMod); if (!r || S.fsvOcc) return;
-  const nuovo = Number(String(S.fsvVal).replace(',', '.'));
+  const nuovo = numero(S.fsvVal);
   const err = m => { S.fsvErr = m; armaSbloccoFsv(); ridisegnaInstallatore(); };
   if (S.fsvVal === '' || !Number.isFinite(nuovo)) return err('Scrivi o scegli un valore.');
   if (nuovo !== Math.round(nuovo)) return err('Queste impostazioni vanno a numeri interi.');
@@ -1739,7 +1791,7 @@ function editorReg(r) {
     ${opz && opz[2] ? `<small class="avviso-reg">${esc(opz[2])}</small>` : ''}
     <small class="mut">Il comando parte dal pannello alla pompa tramite SmartThings. Poi va riletto: finché la pompa non lo conferma, la riga dice «in attesa».</small>
     ${S.regErr ? `<div class="fe-err">${esc(S.regErr)}</div>` : ''}
-    <div class="fe-b"><button type="button" class="sec piccolo" data-reg-annulla ${S.regOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-reg-conf ${S.regOcc ? 'disabled' : ''}>${S.regOcc ? 'Invio…' : 'Cambia nella pompa'}</button></div></div>`;
+    ${bottoniEditor('reg', 'Cambia nella pompa')}</div>`;
 }
 function rigaReg(r) {
   if (!r) return '';
@@ -1769,7 +1821,7 @@ async function confermaReg() {
     descr = o[1]; avviso = o[2] || '';
     if (String(o[0]) === String(r.valore)) return err('È già a questo valore.');
   } else {
-    const n = Number(String(valore).replace(',', '.'));
+    const n = numero(valore);
     if (valore === '' || !Number.isFinite(n)) return err('Scrivi un valore.');
     if (n !== Math.round(n)) return err('La temperatura va a gradi interi.');
     if (n < r.lo || n > r.hi) return err(`Fuori dai limiti della pompa (da ${r.lo} a ${r.hi} ${r.unita}).`);
@@ -1785,7 +1837,7 @@ document.addEventListener('click', e => {
   const m = t.closest('[data-reg-mod]');
   if (m && !m.disabled) {
     const r = trovaReg(m.dataset.regMod); if (!r) return;
-    S.fsvMod = null; S.fsvErr = ''; S.boostApri = false; S.regMod = r.cosa; S.regErr = '';
+    chiudiEditor(); S.regMod = r.cosa;
     S.regVal = r.opzioni ? String(r.valore) : (r.valore == null ? '' : String(r.valore));
     armaSbloccoFsv(); ridisegnaInstallatore(); return;
   }
@@ -1816,19 +1868,19 @@ function rigaBoost(b) {
     <div class="fe-r"><span class="mut">Temperatura obiettivo</span><span><input type="number" inputmode="numeric" step="1" data-boost-val value="${esc(S.boostVal)}" aria-label="Temperatura obiettivo del boost"> <span class="mut">°C</span></span></div>
     <small class="mut">Come Dwellsee: il pannello alza il setpoint a questo valore e mette il modo «Forzato». Finito il boost (acqua arrivata all’obiettivo, o dopo ${b.massimo_min} minuti al massimo) rimette il modo e il setpoint di adesso. Il ripristino riparte anche se il pannello si riavvia.</small>
     ${S.boostErr ? `<div class="fe-err">${esc(S.boostErr)}</div>` : ''}
-    <div class="fe-b"><button type="button" class="sec piccolo" data-boost-annulla ${S.boostOcc ? 'disabled' : ''}>Annulla</button><button type="button" class="piccolo cambia" data-boost-conf ${S.boostOcc ? 'disabled' : ''}>${S.boostOcc ? 'Invio…' : 'Avvia il boost'}</button></div></div>`;
+    ${bottoniEditor('boost', 'Avvia il boost')}</div>`;
 }
 const inviaBoost = (corpo, okMsg) => inviaOp('boost', '/api/boost', corpo, okMsg, () => { S.boostApri = false; }, 'Comando non riuscito', 'il comando è partito, controlla più tardi');
 document.addEventListener('click', e => {
   const t = e.target; if (!t.closest) return;
   const b = S.dati && S.dati.boost;
   if (t.closest('[data-boost-apri]')) {
-    S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = true; S.boostErr = '';
+    chiudiEditor(); S.boostApri = true;
     S.boostVal = String(b && b.predefinito != null ? b.predefinito : 50); armaSbloccoFsv(); ridisegnaInstallatore(); return;
   }
   if (t.closest('[data-boost-annulla]')) { S.boostApri = false; S.boostErr = ''; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
   if (t.closest('[data-boost-conf]')) {
-    const n = Number(String(S.boostVal).replace(',', '.'));
+    const n = numero(S.boostVal);
     if (S.boostVal === '' || !Number.isFinite(n) || n !== Math.round(n)) { S.boostErr = 'Scrivi una temperatura a gradi interi.'; armaSbloccoFsv(); ridisegnaInstallatore(); return; }
     armaSbloccoFsv();
     if (!window.confirm(`Stai per avviare un BOOST dell’acqua calda.\n\nObiettivo: ${n} °C\nModo: Forzato (poi torna a quello di prima)\n\nConfermi?`)) return;
@@ -1862,10 +1914,8 @@ function disegnaDispositivi(d) {
 const PER_PAG = 5;
 function cardComandi(lista) {
   if (!lista || !lista.length) return '';
-  const pagine = Math.ceil(lista.length / PER_PAG);
-  S.pagCmd = Math.min(Math.max(S.pagCmd || 0, 0), pagine - 1);
-  const righe = lista.slice(S.pagCmd * PER_PAG, (S.pagCmd + 1) * PER_PAG).map(c => `<div class="riga"><span>${esc(dataLunga(c.ts))}</span><b>${esc(c.cosa)} · ${c.testo ? esc(c.testo) : c.acceso ? 'acceso' : 'spento'}<small class="mut nota-r">da ${esc(c.ip)} · ${esc(c.esito)}</small></b></div>`).join('');
-  const nav = pagNav('pagCmd', pagine);
+  const [pagina, nav] = paginaDi(lista, 'pagCmd', PER_PAG);
+  const righe = pagina.map(c => `<div class="riga"><span>${esc(dataLunga(c.ts))}</span><b>${esc(c.cosa)} · ${c.testo ? esc(c.testo) : c.acceso ? 'acceso' : 'spento'}<small class="mut nota-r">da ${esc(c.ip)} · ${esc(c.esito)}</small></b></div>`).join('');
   return `<article class="card dev"><div class="ch"><h2>Comandi dati dal pannello</h2></div>${righe}${nav}</article>`;
 }
 async function copiaTesto(t) {
@@ -2031,7 +2081,8 @@ function disegnaImpostazioni(d) {
   vistaImp();
   aggCarica();
   cfCarica(true);
-  clearInterval(S.cfTimer); S.cfTimer = setInterval(() => { if (S.pagina === 'impostazioni') cfCarica(false); else clearInterval(S.cfTimer); }, 5000);
+  clearInterval(S.cfTimer);      // lo stato del tunnel si rilegge ogni 5 s, ma solo mentre guardi la scheda Accesso
+  S.cfTimer = setInterval(() => { if (S.pagina !== 'impostazioni') clearInterval(S.cfTimer); else if (S.sub === 'accesso' && !document.hidden) cfCarica(false); }, 5000);
 }
 
 function segnaModifica(e) {
@@ -2128,7 +2179,6 @@ async function cfCarica(forza) {
   const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
   let st; try { st = await cfLeggi(); } catch { return; }
   if (!st) return;
-  S.cfStato = st;
   if (!st.configurato) { if (forza || !el.dataset.wiz) { el.dataset.wiz = '1'; el.innerHTML = cfWizard(st); } return; }
   el.dataset.wiz = '';
   if (CFS.occupato && !forza) return;
@@ -2282,6 +2332,7 @@ async function carica() {
       let gia = null; try { gia = sessionStorage.getItem('pdc_build'); } catch { /* niente */ }
       if (gia !== nuova) { try { sessionStorage.setItem('pdc_build', nuova); } catch { /* niente */ } location.reload(); return; }
     }
+    if (!r.ok) throw new Error('risposta ' + r.status);      // errore del server: restano a schermo gli ultimi dati buoni
     const dati = await r.json();
     if (pag !== S.pagina) return;
     S.dati = dati; S.dpag = pag; S.off = S.dati.ora - Math.floor(Date.now() / 1000); S.fetchedAt = Date.now();
@@ -2323,7 +2374,7 @@ function avvia() {
   costruisci();
   mostraPagina();
   window.addEventListener('hashchange', () => {
-    const [p, sub = ''] = location.hash.replace('#/', '').split('/');
+    const [p, sub = ''] = leggiHash();
     if (p in TITOLI && p !== S.pagina) { S.pagina = p; S.sub = sub; mostraPagina(); carica(); }
     else if (p === S.pagina && sub !== S.sub) {
       S.sub = sub;
@@ -2333,12 +2384,17 @@ function avvia() {
     }
   });
   // i movimenti si elaborano una volta per fotogramma (l'ultimo di ogni dito), non a ogni evento: il browser ne manda anche piu' di uno per fotogramma
-  const muoviPunt = e => {
-    if (spostaMuovi(e) || zoomaMuovi(e) || dita.size > 1) return;
+  // barra dei modi o curva climatica sotto il puntatore: mostra il loro tooltip e torna true
+  const tooltipSotto = e => {
     const cv = e.target.closest && e.target.closest('#curva svg'); if (!cv) togliTipCurva();
     if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e);
     else if (cv) tooltipCurva(e);
-    else { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
+    else return false;
+    return true;
+  };
+  const muoviPunt = e => {
+    if (spostaMuovi(e) || zoomaMuovi(e) || dita.size > 1) return;
+    if (!tooltipSotto(e)) { const t = $('#tip'); if (t) t.hidden = true; if (!muoviCursore(e)) togliCursore(); }
   };
   const inAttesa = new Map();
   document.addEventListener('pointermove', e => {
@@ -2347,13 +2403,13 @@ function avvia() {
   });
   document.addEventListener('pointerleave', togliCursore);
   document.addEventListener('input', segnaModifica); document.addEventListener('change', segnaModifica);
-  document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') { 
+  document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') {
     Promise.resolve(e.target.id.startsWith('cf-') ? cfAzione(e) : azioniImpostazioni(e))
       .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; CFS.occupato = false; }); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
-  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; const cv = e.target.closest && e.target.closest('#curva svg'); if (!cv) togliTipCurva(); if (e.target.closest && e.target.closest('#tlw')) tooltipTimeline(e); else if (cv) tooltipCurva(e); else muoviCursore(e); });
-  document.addEventListener('pointerup', e => { spostaSu(); zoomaSu(e); }); document.addEventListener('pointercancel', e => { spostaSu(); zoomaSu(e); });
+  document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (!tooltipSotto(e)) muoviCursore(e); });
+  for (const ev of ['pointerup', 'pointercancel']) document.addEventListener(ev, e => { spostaSu(); zoomaSu(e); });
   if (S.range === 'custom' && S.pagina !== 'efficienza') { $('#custom').hidden = false; if (S.custom) { $('#c-da').value = loc(S.custom.da); $('#c-a').value = loc(S.custom.a); } }
   ricordaFinestra();
   datiIniziali() || carica();

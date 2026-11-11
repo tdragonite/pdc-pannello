@@ -16,7 +16,7 @@ Le integrazioni opzionali sono file nella cartella `plugin`, accanto a `pdc_pann
 
 ## Alexa (il plugin per le Routine)
 
-Plugin `alexa.py`, versione 1.4.1. Con una **skill personale** di Alexa (visibile solo al tuo account Amazon) e le **Routine** puoi chiedere al pannello cose come «che temperatura c'è» o «il riscaldamento è acceso», e accendere o spegnere lo Smarther, senza pronunciare il nome della skill: è la Routine a dirlo per te. I file stanno nella cartella `plugin_esempio`: `alexa.py` (il plugin), `alexa_modello_it.json` (il modello della skill), `ALEXA_FRASI.md` (l'elenco completo di frasi e risposte) e `ALEXA_CHANGELOG.md` (la cronologia del plugin).
+Plugin `alexa.py`, versione 1.4.2. Con una **skill personale** di Alexa (visibile solo al tuo account Amazon) e le **Routine** puoi chiedere al pannello cose come «che temperatura c'è» o «il riscaldamento è acceso», e accendere o spegnere lo Smarther, senza pronunciare il nome della skill: è la Routine a dirlo per te. I file stanno nella cartella `plugin_esempio`: `alexa.py` (il plugin), `alexa_modello_it.json` (il modello della skill), `ALEXA_FRASI.md` (l'elenco completo di frasi e risposte) e `ALEXA_CHANGELOG.md` (la cronologia del plugin).
 
 **Cosa serve**: il pannello raggiungibile da internet ([telegram-e-cloudflare.md](telegram-e-cloudflare.md)) e un account sviluppatore Amazon gratuito (developer.amazon.com; chiede la verifica dell'identità).
 
@@ -62,7 +62,7 @@ Il pannello limita comunque dimensione e frequenza delle richieste (vedi [manute
 
 ## Widget per iPhone (plugin e script Scriptable)
 
-Il plugin `widget.py` (versione 1.1.0) crea un indirizzo pubblico, di sola lettura, con i pochi dati che servono al widget: temperatura e umidità di casa, termostato (chiama / riparte / non chiama), stato della pompa di calore e acqua calda, temperatura e umidità di fuori. Lo script `widget_scriptable.js` li disegna come widget medio nell'app gratuita **Scriptable**. Si installa come gli altri plugin (Impostazioni → Integrazioni), si copia l'indirizzo in «Indirizzi pubblici» e si incolla nello script.
+Il plugin `widget.py` (versione 1.1.1) crea un indirizzo pubblico, di sola lettura, con i pochi dati che servono al widget: temperatura e umidità di casa, termostato (chiama / riparte / non chiama), stato della pompa di calore e acqua calda, temperatura e umidità di fuori. Lo script `widget_scriptable.js` li disegna come widget medio nell'app gratuita **Scriptable**. Si installa come gli altri plugin (Impostazioni → Integrazioni), si copia l'indirizzo in «Indirizzi pubblici» e si incolla nello script.
 
 **Sicurezza**: l'indirizzo contiene un segreto casuale; in più il campo **Token del widget** (da 24 a 64 caratteri) va scritto uguale anche nello script (costante `TOKEN`): senza il token l'indirizzo risponde 404, quindi aprirlo da un browser non mostra niente. Il widget può solo leggere. Per cambiare segreto o token basta scriverne uno nuovo, ricaricare i plugin e aggiornare lo script. La cronologia del plugin sta in `WIDGET_CHANGELOG.md`.
 

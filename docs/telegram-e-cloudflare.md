@@ -55,7 +55,7 @@ Per spegnere un allarme: `"attivo": false`. Per spegnere intere famiglie, in `al
 - Massimo 20 messaggi all'ora (`max_messaggi_ora`): oltre, ne salta alcuni e te lo dice.
 - **Silenzio notturno** (spento di default): di notte i messaggi arrivano senza suoneria.
 - **Riepilogo del mattino** (spento di default): ogni giorno all'ora scelta, un messaggio con energia, COP, ore di funzionamento e temperature di ieri. Se il silenzio notturno è acceso, aggiunge una sezione **«Di notte»** solo quando è successo qualcosa durante il silenzio: temperatura in casa variata di almeno 2 °C (cambia in Impostazioni), umidità sopra la soglia gialla, avvisi scattati e già rientrati.
-- I **testi** si personalizzano in Impostazioni → *Testi dei messaggi* (segnaposto come `{testo}`, `{ora}`, `{durata}`); per cambiare il testo di un solo allarme usa `per_codice` in `config.json`.
+- I **testi** si personalizzano in Impostazioni → *Testi dei messaggi* (segnaposto come `{testo}`, `{ora}`, `{durata}`; un modello scritto male, per esempio con `{testo.x}`, viene rifiutato quando salvi, con il motivo); per cambiare il testo di un solo allarme usa `per_codice` in `config.json`.
 
 
 ---

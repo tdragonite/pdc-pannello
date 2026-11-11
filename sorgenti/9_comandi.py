@@ -93,13 +93,14 @@ def indirizzi(host, porta, app=None):
     gli adattatori virtuali di WSL/Hyper-V/VPN."""
     ip = None
     if host not in ("127.0.0.1", "localhost", "::1"):  # in ascolto solo su questo computer: la rete di casa non arriva
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("10.255.255.255", 1))
             ip = s.getsockname()[0]
-            s.close()
         except OSError:
             pass
+        finally:
+            s.close()
         if ip and ip.startswith(("127.", "169.254.")):
             ip = None
     out = [f"Rete di casa:    http://{ip}:{porta}" if ip else f"Su questo computer: http://localhost:{porta}"]
