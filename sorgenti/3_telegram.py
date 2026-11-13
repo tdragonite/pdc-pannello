@@ -38,6 +38,7 @@ TITOLI = {
     "sbrinamenti_frequenti": "Sbrinamenti frequenti",
     "sbrinamento_inizio": "Sbrinamento iniziato",
     "sbrinamento_fine": "Sbrinamento finito",
+    "finestre_chiudi": "Puoi chiudere le finestre",   # VENT
 }
 
 MESSAGGI_DEFAULT = {
@@ -55,6 +56,7 @@ MESSAGGI_DEFAULT = {
     "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
     "sbrinamento_inizio": "🧊 <b>{impianto}</b>\nSbrinamento iniziato: esterna {esterna}\n<i>dalle {ora}</i>",
     "sbrinamento_fine": "✅ <b>{impianto}</b>\nSbrinamento finito\n<i>dopo {durata}, {consumo}</i>",
+    "finestre_chiudi": "🪟 <b>{impianto}</b>\nPuoi chiudere le finestre\n<i>umidità scesa di {calo} punti, ora {um}</i>",   # VENT
     "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
     "per_codice": {},
 }
@@ -77,6 +79,7 @@ ALLARMI_DEFAULT = {
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
     "sbrinamento_inizio": {"attivo": True},     # non sono anomalie: avvisi informativi, sempre senza suoneria
     "sbrinamento_fine": {"attivo": True},
+    "finestre_chiudi": {"attivo": True},        # VENT: informativo, ma con suoneria (serve proprio quando non guardi il telefono)
 }
 
 TELEGRAM_DEFAULT = {
@@ -407,6 +410,7 @@ class Sentinella(threading.Thread):
         self.ult_cop = 0
         self.cop_cond = False
         self.sbr_primo = True   # primo controllo dopo l'avvio: uno sbrinamento gia' in corso non si riannuncia
+        self.vent_primo = True  # VENT: idem per un «puoi chiudere» gia' comparso prima dell'avvio
 
     def run(self):
         self.fermo.wait(45)    # lascia partire i raccoglitori
@@ -414,6 +418,7 @@ class Sentinella(threading.Thread):
             try:
                 self.valuta()
                 self.avvisa_sbrinamento()
+                self.avvisa_finestre()   # VENT
                 self.app.eventi.chiudi("pannello_script")
                 if getattr(self.app, "telegram", None):
                     self.app.telegram.promemoria_aperti()
@@ -605,6 +610,27 @@ class Sentinella(threading.Thread):
                 tg.accoda("sbrinamento_fine", "sbrinamento_fine", "info", "", extra={
                     "durata": f"{minuti} min",
                     "consumo": f"consumo circa {num_it(kwh, 2)} kWh" if kwh is not None else "consumo non disponibile"}, muto=True)
+
+    # VENT-INIZIO  (messaggio «puoi chiudere»: si toglie con tutto cio' che e' marcato VENT)
+    def avvisa_finestre(self):
+        """Quando l'indicazione della Dashboard passa a «Puoi chiudere», un solo messaggio per ogni apertura (si riconosce dall'istante
+        in cui e' iniziata). Dopo un riavvio un «puoi chiudere» gia' comparso non si riannuncia. Non e' un'anomalia: niente eventi."""
+        db, tg = self.app.db, self.app.telegram
+        ora = int(time.time())
+        primo, self.vent_primo = self.vent_primo, False
+        ult = db.ultimi_dict()
+        stz = stazione_info(self.app)
+        num = lambda k: (ult.get(k) or (None, None, None))[2]
+        v = vent_stato(db, ora, (stz or {}).get("umidita"), num("ciclo.esterna"), num("casa.temperatura"))
+        if not v or v["s"] != "chiudi":
+            return
+        if str(db.meta_get("tg_vent_da", "")) == str(v["da"]):
+            return
+        db.meta_set("tg_vent_da", str(v["da"]))
+        if primo or not tg.allarme_attivo("finestre_chiudi"):
+            return
+        tg.accoda("finestre_chiudi", "finestre_chiudi", "info", "", extra={"calo": str(v["calo"]), "um": f"{num_it(v['um'], 0)}%"})
+    # VENT-FINE
 
     # ----- riepilogo del mattino: cosa e' successo durante il silenzio notturno -----
     def _finestra_notte(self, ora):

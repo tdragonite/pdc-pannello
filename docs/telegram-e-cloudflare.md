@@ -43,6 +43,7 @@ Tutte le anomalie compaiono sempre anche nel pannello (banner in alto); qui deci
 | `cop_basso` | COP stimato delle ultime 24 ore sotto 2 |
 | `sbrinamenti_frequenti` | 6 o più sbrinamenti in 3 ore |
 | `sbrinamento_inizio` / `sbrinamento_fine` | **avvisi informativi**: la pompa inizia / finisce uno sbrinamento (alla fine: durata e consumo). Arrivano **sempre in silenzio** (senza suono), non si ripetono e non hanno “rientro”. Hanno lo stile degli altri messaggi (emoji e «Pompa di calore» in grassetto sulla prima riga). Si spengono o si riscrivono in *Impostazioni → Avvisi* (segnaposto `{impianto} {esterna} {ora}` / `{impianto} {durata} {consumo}`) |
+| `finestre_chiudi` | **avviso informativo** (0.25.9): dopo una finestra aperta, quando nella Dashboard compare «Puoi chiudere» arriva un messaggio (calo di umidità e umidità di adesso). **Con suoneria** (di notte vale il silenzio notturno), una sola volta per apertura; dopo un riavvio del pannello un «Puoi chiudere» già comparso non si riannuncia. Si spegne o si riscrive in *Impostazioni → Avvisi* (segnaposto `{impianto} {calo} {um}`). Fa parte della prova marcata VENT: vedi [ventilazione-rimozione.md](ventilazione-rimozione.md). |
 
 **Le soglie sono un punto di partenza, non verità**: dopo qualche settimana guardale con i tuoi dati e ritoccale.
 

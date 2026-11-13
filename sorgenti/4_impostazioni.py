@@ -42,9 +42,10 @@ DESCRIZIONI_ALLARME = {
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
     "sbrinamento_inizio": "Un messaggio, senza suoneria, quando la pompa entra in sbrinamento.",
     "sbrinamento_fine": "Un messaggio, senza suoneria, quando lo sbrinamento finisce (durata e consumo).",
+    "finestre_chiudi": "Un messaggio, con suoneria, quando dopo una finestra aperta compare «Puoi chiudere» nella Dashboard.",   # VENT
 }
 
-AVVISI_INFORMATIVI = ("sbrinamento_inizio", "sbrinamento_fine")     # non sono anomalie: solo interruttore, niente soglie né ritardo
+AVVISI_INFORMATIVI = ("sbrinamento_inizio", "sbrinamento_fine", "finestre_chiudi")    # non sono anomalie: solo interruttore, niente soglie né ritardo
 
 
 MODELLI_SMARTHER = [
@@ -97,6 +98,7 @@ def schema_impostazioni():
             _c("telegram.messaggi.riepilogo", "lungo", "Riepilogo del mattino"),
             _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {impianto} {esterna} {ora}."),
             _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {impianto} {durata} {consumo}."),
+            _c("telegram.messaggi.finestre_chiudi", "lungo", "Puoi chiudere le finestre", "Segnaposto: {impianto} {calo} {um}."),   # VENT
         ]},
         {"id": "collegamenti", "titolo": "SmartThings (pompa di calore)", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
          "campi": [

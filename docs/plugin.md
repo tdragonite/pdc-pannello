@@ -9,7 +9,25 @@ Le integrazioni opzionali sono file nella cartella `plugin`, accanto a `pdc_pann
 - Un errore dentro un plugin non ferma mai il pannello: il plugin va in «errore» e il motivo è scritto lì (e nel registro).
 - Un plugin gira con gli stessi permessi del pannello: metti nella cartella solo file di cui ti fidi.
 - Un plugin può esporre indirizzi **senza login** (`/plugin/nome/…`) solo da acceso; il pannello limita dimensione e frequenza delle richieste, ma l'autenticazione è compito del plugin.
-- `plugin_esempio/esempio.py` è un plugin di prova: copialo in `plugin` e provalo (`/plugin/esempio/ping`). `plugin_esempio/alexa.py` è il plugin Alexa (vedi sotto).
+- `plugin_esempio/esempio.py` è un plugin di prova: copialo in `plugin` e provalo (`/plugin/esempio/ping`). `plugin_esempio/alexa.py` è il plugin Alexa e `plugin_esempio/analisi.py` quello che permette di leggere i dati senza esportarli a mano (vedi sotto).
+
+---
+
+## Analisi dei dati (leggere i dati senza esportare il file)
+
+Il plugin `analisi.py` (versione 1.0.0) mette a disposizione, su un indirizzo di sola lettura, gli stessi dati del comando `python pdc_strumenti.py analisi` (capitolo 9 di [strumenti.md](strumenti.md)), così chi li deve analizzare non ha bisogno del file esportato a mano. Non può comandare né scrivere niente. Per non pesare sul pannello lancia il comando come programma a parte (con mesi di storico l'analisi usa qualche centinaio di MB e qualche secondo) e lo ferma se supera i 3 minuti; il database si apre in sola lettura e, come per il comando, nel risultato non ci sono token, password, indirizzi né identificativi.
+
+**Installazione**: copia `analisi.py` nella cartella `plugin` (`pdc_strumenti.py` deve stare accanto a `pdc_pannello.py`), premi *Ricarica i plugin* in *Impostazioni → Integrazioni*, scrivi un **Token** tuo (da 24 a 64 caratteri tra lettere, numeri, trattino e underscore) e accendi l'interruttore. Senza un token valido il plugin non risponde a nessuno. Il segreto dell'indirizzo lo genera da solo.
+
+**Sicurezza**: funziona solo se sono vere tutte e quattro queste cose, altrimenti risponde 404 (senza dire quale controllo è fallito):
+1. la richiesta arriva dalla **rete di casa**: quelle che passano dal tunnel Cloudflare o da un altro proxy, o da un indirizzo non privato, sono rifiutate come per le regolazioni della pompa. L'indirizzo con il dominio Cloudflare che compare in *Indirizzi pubblici* quindi non funziona da fuori, di proposito: da casa si usa l'indirizzo del PC con la porta;
+2. l'indirizzo contiene il **segreto**;
+3. la richiesta porta il **token** nell'intestazione `X-Analisi-Token`;
+4. è una richiesta **GET**.
+
+**Come si legge**: `GET /plugin/analisi/<segreto>?giorni=45&grezzi=1&ciclo=7` (i tre numeri sono quelli del comando `analisi`: giorni di storico, giorni di misure grezze, giorni di campioni grezzi del ciclo; tutti facoltativi). La risposta è il JSON compresso (gzip), circa un decimo del file: per un database di 45 giorni qualche secondo di calcolo, e la stessa richiesta entro un minuto riusa il risultato. Un'analisi alla volta: se ne arriva un'altra nel frattempo risponde 429. Il pannello deve avere già la password (come sempre).
+
+Per cambiare segreto o token basta scriverne uno nuovo e ricaricare i plugin.
 
 
 ---
