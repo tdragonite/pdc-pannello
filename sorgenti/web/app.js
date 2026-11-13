@@ -1099,6 +1099,19 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.9', quando: '13 novembre 2026', titolo: 'Puoi chiudere su Telegram', righe: [   // VENT
+    ['n', 'Messaggio «Puoi chiudere»', 'Quando dopo una finestra aperta nella Dashboard compare «Puoi chiudere», ti arriva anche un messaggio Telegram, con suoneria, una sola volta per apertura. Lo spegni o ne cambi il testo dalle impostazioni, in «Quando avvisarti».'],   // VENT
+  ]},   // VENT
+  {v: '0.25.8', quando: '12 novembre 2026', titolo: 'Target della mandata', righe: [
+    ['s', 'Target del riscaldamento giusto', 'Il «Target» della scheda Riscaldamento era sempre 25°: è il setpoint della modalità a temperatura fissa, che la pompa non usa. Ora è la mandata che chiede la curva climatica alla temperatura esterna di adesso.'],
+    ['s', 'Linea «Target mandata» in Analisi', 'Da adesso la linea tratteggiata segue la curva climatica, con i valori FSV di quel momento: se cambi la curva si vede un gradino. I giorni già registrati restano com’erano (25° fissi).'],
+  ]},
+  {v: '0.25.7', quando: '12 novembre 2026', titolo: 'Finestre e analisi', righe: [
+    ['s', '«Finestre aperte» dopo aver chiuso', 'Dopo aver chiuso, la stanza si scalda e l’umidità cala ancora un po’: l’indicazione tornava su «Finestre aperte». Ora sparisce quando la temperatura di casa risale, e un «Puoi chiudere» già comparso non torna più indietro.'],   // VENT
+    ['s', 'Indicazione che spariva a metà', 'Mentre aeravi, una breve risalita dell’umidità faceva sparire l’indicazione per un attimo: una risalita conta come «hai chiuso» solo dopo che è comparso «Puoi chiudere».'],   // VENT
+    ['n', 'Plugin «Analisi dei dati»', 'Plugin opzionale: un indirizzo di sola lettura, solo dalla rete di casa e con token, con i dati dell’analisi completa, per leggerli senza esportare il file a mano (vedi la documentazione dei plugin).'],
+    ['m', 'Strumenti', 'Il comando «analisi» ha l’opzione --uscita, per scrivere il file dove vuoi.'],
+  ]},
   {v: '0.25.6', quando: '11 novembre 2026', titolo: 'Controllo generale', righe: [
     ['s', 'Esci con la sessione scaduta', 'Premere «Esci» quando la sessione era già scaduta dava «errore interno»: ora porta alla pagina di accesso.'],
     ['s', 'Modelli dei messaggi Telegram', 'Un modello scritto male (per esempio {testo.x}) bloccava la coda dei messaggi, che riprovava all’infinito: ora viene rifiutato quando salvi, con il motivo.'],

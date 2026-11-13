@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.25.6"
+VERSIONE = "0.25.9"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -2989,6 +2989,19 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
 const CHANGELOG = [
+  {v: '0.25.9', quando: '13 novembre 2026', titolo: 'Puoi chiudere su Telegram', righe: [   // VENT
+    ['n', 'Messaggio «Puoi chiudere»', 'Quando dopo una finestra aperta nella Dashboard compare «Puoi chiudere», ti arriva anche un messaggio Telegram, con suoneria, una sola volta per apertura. Lo spegni o ne cambi il testo dalle impostazioni, in «Quando avvisarti».'],   // VENT
+  ]},   // VENT
+  {v: '0.25.8', quando: '12 novembre 2026', titolo: 'Target della mandata', righe: [
+    ['s', 'Target del riscaldamento giusto', 'Il «Target» della scheda Riscaldamento era sempre 25°: è il setpoint della modalità a temperatura fissa, che la pompa non usa. Ora è la mandata che chiede la curva climatica alla temperatura esterna di adesso.'],
+    ['s', 'Linea «Target mandata» in Analisi', 'Da adesso la linea tratteggiata segue la curva climatica, con i valori FSV di quel momento: se cambi la curva si vede un gradino. I giorni già registrati restano com’erano (25° fissi).'],
+  ]},
+  {v: '0.25.7', quando: '12 novembre 2026', titolo: 'Finestre e analisi', righe: [
+    ['s', '«Finestre aperte» dopo aver chiuso', 'Dopo aver chiuso, la stanza si scalda e l’umidità cala ancora un po’: l’indicazione tornava su «Finestre aperte». Ora sparisce quando la temperatura di casa risale, e un «Puoi chiudere» già comparso non torna più indietro.'],   // VENT
+    ['s', 'Indicazione che spariva a metà', 'Mentre aeravi, una breve risalita dell’umidità faceva sparire l’indicazione per un attimo: una risalita conta come «hai chiuso» solo dopo che è comparso «Puoi chiudere».'],   // VENT
+    ['n', 'Plugin «Analisi dei dati»', 'Plugin opzionale: un indirizzo di sola lettura, solo dalla rete di casa e con token, con i dati dell’analisi completa, per leggerli senza esportare il file a mano (vedi la documentazione dei plugin).'],
+    ['m', 'Strumenti', 'Il comando «analisi» ha l’opzione --uscita, per scrivere il file dove vuoi.'],
+  ]},
   {v: '0.25.6', quando: '11 novembre 2026', titolo: 'Controllo generale', righe: [
     ['s', 'Esci con la sessione scaduta', 'Premere «Esci» quando la sessione era già scaduta dava «errore interno»: ora porta alla pagina di accesso.'],
     ['s', 'Modelli dei messaggi Telegram', 'Un modello scritto male (per esempio {testo.x}) bloccava la coda dei messaggi, che riprovava all’infinito: ora viene rifiutato quando salvi, con il motivo.'],
@@ -5483,7 +5496,8 @@ def _celle_sql(db, serie, da, a, funz):
 VENT_DOPO = 2700       # secondi: l'indicazione resta ancora 45 minuti dopo la fine della finestra rilevata (il calo di temperatura finisce prima di quando si chiude davvero)
 VENT_FERMA = 600       # secondi di umidita' ferma (a meno di 1 punto dal minimo) dopo i quali si puo' chiudere (10 minuti)
 VENT_CALO = 2          # punti di umidita' persi dall'apertura: sotto, non c'e' niente da dire
-VENT_MARGINE = 0.4     # g/m3: se in casa l'acqua nell'aria e' a questo punto da quella esterna, ventilare non asciuga piu'
+VENT_CALDO = 0.2       # °C: se la temperatura di casa risale di tanto dal suo minimo dall'apertura, le finestre sono chiuse
+VENT_MARGINE = 0.4    # g/m3: se in casa l'acqua nell'aria e' a questo punto da quella esterna, ventilare non asciuga piu'
 
 
 def vent_stato(db, ora, um_est=None, t_est=None, t_casa=None):
@@ -5501,17 +5515,25 @@ def vent_stato(db, ora, um_est=None, t_est=None, t_casa=None):
     serie = [(da, v0)] + camp
     minimo = min(v for _, v in serie)
     ora_v = serie[-1][1]
-    if v0 - minimo < VENT_CALO or ora_v >= minimo + 2:         # niente calo, oppure l'umidita' e' gia' risalita (finestre chiuse)
+    if v0 - minimo < VENT_CALO:                                # niente calo: non c'e' niente da dire
         return None
-    ok = da
-    for k in range(len(serie) - 1, -1, -1):
-        if serie[k][1] > minimo + 1:
-            ok = serie[k + 1][0] if k + 1 < len(serie) else ora
-            break
-    ferma = max(0, ora - ok)
+    T = [x[1] for x in q_serie(db, "casa.temperatura", da, ora)]
+    if len(T) > 1 and T[-1] >= min(T) + VENT_CALDO:            # la temperatura e' risalita: finestre chiuse (l'umidita' intanto puo' calare ancora, perche' l'aria si scalda)
+        return None
+    ferma, n = 0, len(serie)
+    for i in range(n):                                         # il tratto fermo (meno di 1 punto di differenza) piu' lungo, vicino al minimo: raggiunti i 10 minuti non si torna piu' a «Finestre aperte»
+        lo = hi = serie[i][1]
+        j = i
+        while j + 1 < n and max(hi, serie[j + 1][1]) - min(lo, serie[j + 1][1]) <= 1:
+            j += 1
+            lo, hi = min(lo, serie[j][1]), max(hi, serie[j][1])
+        if lo <= minimo + 1:
+            ferma = max(ferma, (ora if j == n - 1 else serie[j][0]) - serie[i][0])
+    if ora_v >= minimo + 2 and ferma >= VENT_FERMA:            # l'umidita' e' risalita dopo il «Puoi chiudere»: finestre chiuse (prima e' solo rumore: l'aria che entra e esce)
+        return None
     pari = (um_est is not None and t_est is not None and t_casa is not None
             and umidita_assoluta(t_casa, ora_v) <= umidita_assoluta(t_est, um_est) + VENT_MARGINE)
-    return {"s": "chiudi" if ferma >= VENT_FERMA or pari else "corso", "um": ora_v, "calo": round(v0 - ora_v), "min": int(ferma // 60)}
+    return {"s": "chiudi" if ferma >= VENT_FERMA or pari else "corso", "um": ora_v, "calo": round(v0 - ora_v), "min": int(ferma // 60), "da": da}
 # VENT-FINE
 
 
@@ -5640,7 +5662,9 @@ def api_dashboard(app, q):
         "refresh": info_refresh(app),
         "meteo": meteo_info(app),
         "riscaldamento": {
-            "stato": stato_risc, "temp": acqua, "target": num("risc.setpoint"), "ritorno": ritorno,
+            "stato": stato_risc, "temp": acqua,
+            "target": ((curva or {}).get("ora") or {}).get("mandata"),   # dalla curva climatica: il setpoint salvato (25) e' quello della modalita' a temperatura fissa
+            "ritorno": ritorno,
             "delta": round(acqua - ritorno, 1) if acqua is not None and ritorno is not None else None,
             "spark": q_griglia(db, "risc.acqua", da, a, 60)[0]},
         "acs": {
@@ -6061,6 +6085,39 @@ def api_fin_annulla(app, corpo, h):
     return {"ok": True}
 
 
+def target_mandata_punti(db, vecchi, da, a, n):
+    """Linea «Target mandata» di Analisi. Il setpoint salvato (risc.setpoint, sempre 25: e' quello della modalita' a temperatura
+    fissa) resta com'era per i giorni gia' registrati; dal momento in cui il pannello e' passato a questa versione la linea
+    segue la curva climatica, con i valori FSV che c'erano in quell'istante (un cambio di curva si vede come un gradino)."""
+    dal = db.meta_get("target_curva_dal")
+    if dal is None:
+        dal = int(time.time())
+        db.meta_set("target_curva_dal", dal)
+    dal = int(dal)
+    prima = [p for p in vecchi if p[0] < dal]
+    if a <= dal:
+        return prima
+    ult = db.ultimi_dict()
+    zona, _ = zona_curva(ult)
+    codici = ("2011", "2012") + (("2021", "2022") if zona == 1 else ("2031", "2032"))
+    da2 = max(int(da), dal)
+    cambi = {c: q_cambi(db, f"fsv.{c}", da2, a) for c in codici}
+    adesso = {c: _fsv(ult, c) for c in codici}
+    nuovi = []
+    for t, est in q_griglia(db, "ciclo.esterna", da2, a, n)[0]:
+        v = []
+        for c in codici:
+            s = stato_a(cambi[c], t)
+            try:
+                v.append(float(s) if s is not None else adesso[c])
+            except ValueError:
+                v.append(adesso[c])
+        if None in v or v[1] <= v[0]:
+            continue
+        nuovi.append([t, mandata_calcolata((v[0], v[2], v[1], v[3]), est)])
+    return prima + nuovi
+
+
 @api("/api/analisi")
 def api_analisi(app, q):
     ora = int(time.time())
@@ -6074,6 +6131,8 @@ def api_analisi(app, q):
         for nome, et, col, tr, *extra in serie:
             u, asse, area = extra if extra else (unita, 0, 0)
             pts, dim = q_griglia(app.db, nome, da, a, n)
+            if nome == "risc.setpoint":
+                pts = target_mandata_punti(app.db, pts, da, a, n)
             if nome == "pot.watt" and (a - da) <= 3 * 86400:
                 gr = q_potenza_a_gradini(app.db, da, a)
                 if gr:
@@ -7128,6 +7187,7 @@ TITOLI = {
     "sbrinamenti_frequenti": "Sbrinamenti frequenti",
     "sbrinamento_inizio": "Sbrinamento iniziato",
     "sbrinamento_fine": "Sbrinamento finito",
+    "finestre_chiudi": "Puoi chiudere le finestre",   # VENT
 }
 
 MESSAGGI_DEFAULT = {
@@ -7145,6 +7205,7 @@ MESSAGGI_DEFAULT = {
     "prova": "👋 <b>{impianto}</b>\nProva riuscita! Da qui arriveranno gli avvisi del pannello.",
     "sbrinamento_inizio": "🧊 <b>{impianto}</b>\nSbrinamento iniziato: esterna {esterna}\n<i>dalle {ora}</i>",
     "sbrinamento_fine": "✅ <b>{impianto}</b>\nSbrinamento finito\n<i>dopo {durata}, {consumo}</i>",
+    "finestre_chiudi": "🪟 <b>{impianto}</b>\nPuoi chiudere le finestre\n<i>umidità scesa di {calo} punti, ora {um}</i>",   # VENT
     "troppi": "🤐 <b>{impianto}</b>\nStanno arrivando troppi messaggi: per un po' ne salto alcuni (li trovi sempre nel pannello).",
     "per_codice": {},
 }
@@ -7167,6 +7228,7 @@ ALLARMI_DEFAULT = {
     "sbrinamenti_frequenti": {"attivo": True, "quanti": 6, "ore": 3},
     "sbrinamento_inizio": {"attivo": True},     # non sono anomalie: avvisi informativi, sempre senza suoneria
     "sbrinamento_fine": {"attivo": True},
+    "finestre_chiudi": {"attivo": True},        # VENT: informativo, ma con suoneria (serve proprio quando non guardi il telefono)
 }
 
 TELEGRAM_DEFAULT = {
@@ -7497,6 +7559,7 @@ class Sentinella(threading.Thread):
         self.ult_cop = 0
         self.cop_cond = False
         self.sbr_primo = True   # primo controllo dopo l'avvio: uno sbrinamento gia' in corso non si riannuncia
+        self.vent_primo = True  # VENT: idem per un «puoi chiudere» gia' comparso prima dell'avvio
 
     def run(self):
         self.fermo.wait(45)    # lascia partire i raccoglitori
@@ -7504,6 +7567,7 @@ class Sentinella(threading.Thread):
             try:
                 self.valuta()
                 self.avvisa_sbrinamento()
+                self.avvisa_finestre()   # VENT
                 self.app.eventi.chiudi("pannello_script")
                 if getattr(self.app, "telegram", None):
                     self.app.telegram.promemoria_aperti()
@@ -7696,6 +7760,27 @@ class Sentinella(threading.Thread):
                     "durata": f"{minuti} min",
                     "consumo": f"consumo circa {num_it(kwh, 2)} kWh" if kwh is not None else "consumo non disponibile"}, muto=True)
 
+    # VENT-INIZIO  (messaggio «puoi chiudere»: si toglie con tutto cio' che e' marcato VENT)
+    def avvisa_finestre(self):
+        """Quando l'indicazione della Dashboard passa a «Puoi chiudere», un solo messaggio per ogni apertura (si riconosce dall'istante
+        in cui e' iniziata). Dopo un riavvio un «puoi chiudere» gia' comparso non si riannuncia. Non e' un'anomalia: niente eventi."""
+        db, tg = self.app.db, self.app.telegram
+        ora = int(time.time())
+        primo, self.vent_primo = self.vent_primo, False
+        ult = db.ultimi_dict()
+        stz = stazione_info(self.app)
+        num = lambda k: (ult.get(k) or (None, None, None))[2]
+        v = vent_stato(db, ora, (stz or {}).get("umidita"), num("ciclo.esterna"), num("casa.temperatura"))
+        if not v or v["s"] != "chiudi":
+            return
+        if str(db.meta_get("tg_vent_da", "")) == str(v["da"]):
+            return
+        db.meta_set("tg_vent_da", str(v["da"]))
+        if primo or not tg.allarme_attivo("finestre_chiudi"):
+            return
+        tg.accoda("finestre_chiudi", "finestre_chiudi", "info", "", extra={"calo": str(v["calo"]), "um": f"{num_it(v['um'], 0)}%"})
+    # VENT-FINE
+
     # ----- riepilogo del mattino: cosa e' successo durante il silenzio notturno -----
     def _finestra_notte(self, ora):
         """(inizio, fine) dell'ultima notte silenziosa gia' finita, oppure None."""
@@ -7838,9 +7923,10 @@ DESCRIZIONI_ALLARME = {
     "sbrinamenti_frequenti": "Troppi sbrinamenti ravvicinati.",
     "sbrinamento_inizio": "Un messaggio, senza suoneria, quando la pompa entra in sbrinamento.",
     "sbrinamento_fine": "Un messaggio, senza suoneria, quando lo sbrinamento finisce (durata e consumo).",
+    "finestre_chiudi": "Un messaggio, con suoneria, quando dopo una finestra aperta compare «Puoi chiudere» nella Dashboard.",   # VENT
 }
 
-AVVISI_INFORMATIVI = ("sbrinamento_inizio", "sbrinamento_fine")     # non sono anomalie: solo interruttore, niente soglie né ritardo
+AVVISI_INFORMATIVI = ("sbrinamento_inizio", "sbrinamento_fine", "finestre_chiudi")    # non sono anomalie: solo interruttore, niente soglie né ritardo
 
 
 MODELLI_SMARTHER = [
@@ -7893,6 +7979,7 @@ def schema_impostazioni():
             _c("telegram.messaggi.riepilogo", "lungo", "Riepilogo del mattino"),
             _c("telegram.messaggi.sbrinamento_inizio", "lungo", "Sbrinamento iniziato", "Segnaposto: {impianto} {esterna} {ora}."),
             _c("telegram.messaggi.sbrinamento_fine", "lungo", "Sbrinamento finito", "Segnaposto: {impianto} {durata} {consumo}."),
+            _c("telegram.messaggi.finestre_chiudi", "lungo", "Puoi chiudere le finestre", "Segnaposto: {impianto} {calo} {um}."),   # VENT
         ]},
         {"id": "collegamenti", "titolo": "SmartThings (pompa di calore)", "nota": "I token che si rinnovano da soli (OAuth) non si modificano qui.",
          "campi": [

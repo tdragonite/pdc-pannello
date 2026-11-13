@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.25.6"
+VERSIONE = "0.25.9"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse

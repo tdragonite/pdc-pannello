@@ -1101,7 +1101,8 @@ def _celle_sql(db, serie, da, a, funz):
 VENT_DOPO = 2700       # secondi: l'indicazione resta ancora 45 minuti dopo la fine della finestra rilevata (il calo di temperatura finisce prima di quando si chiude davvero)
 VENT_FERMA = 600       # secondi di umidita' ferma (a meno di 1 punto dal minimo) dopo i quali si puo' chiudere (10 minuti)
 VENT_CALO = 2          # punti di umidita' persi dall'apertura: sotto, non c'e' niente da dire
-VENT_MARGINE = 0.4     # g/m3: se in casa l'acqua nell'aria e' a questo punto da quella esterna, ventilare non asciuga piu'
+VENT_CALDO = 0.2       # °C: se la temperatura di casa risale di tanto dal suo minimo dall'apertura, le finestre sono chiuse
+VENT_MARGINE = 0.4    # g/m3: se in casa l'acqua nell'aria e' a questo punto da quella esterna, ventilare non asciuga piu'
 
 
 def vent_stato(db, ora, um_est=None, t_est=None, t_casa=None):
@@ -1119,17 +1120,25 @@ def vent_stato(db, ora, um_est=None, t_est=None, t_casa=None):
     serie = [(da, v0)] + camp
     minimo = min(v for _, v in serie)
     ora_v = serie[-1][1]
-    if v0 - minimo < VENT_CALO or ora_v >= minimo + 2:         # niente calo, oppure l'umidita' e' gia' risalita (finestre chiuse)
+    if v0 - minimo < VENT_CALO:                                # niente calo: non c'e' niente da dire
         return None
-    ok = da
-    for k in range(len(serie) - 1, -1, -1):
-        if serie[k][1] > minimo + 1:
-            ok = serie[k + 1][0] if k + 1 < len(serie) else ora
-            break
-    ferma = max(0, ora - ok)
+    T = [x[1] for x in q_serie(db, "casa.temperatura", da, ora)]
+    if len(T) > 1 and T[-1] >= min(T) + VENT_CALDO:            # la temperatura e' risalita: finestre chiuse (l'umidita' intanto puo' calare ancora, perche' l'aria si scalda)
+        return None
+    ferma, n = 0, len(serie)
+    for i in range(n):                                         # il tratto fermo (meno di 1 punto di differenza) piu' lungo, vicino al minimo: raggiunti i 10 minuti non si torna piu' a «Finestre aperte»
+        lo = hi = serie[i][1]
+        j = i
+        while j + 1 < n and max(hi, serie[j + 1][1]) - min(lo, serie[j + 1][1]) <= 1:
+            j += 1
+            lo, hi = min(lo, serie[j][1]), max(hi, serie[j][1])
+        if lo <= minimo + 1:
+            ferma = max(ferma, (ora if j == n - 1 else serie[j][0]) - serie[i][0])
+    if ora_v >= minimo + 2 and ferma >= VENT_FERMA:            # l'umidita' e' risalita dopo il «Puoi chiudere»: finestre chiuse (prima e' solo rumore: l'aria che entra e esce)
+        return None
     pari = (um_est is not None and t_est is not None and t_casa is not None
             and umidita_assoluta(t_casa, ora_v) <= umidita_assoluta(t_est, um_est) + VENT_MARGINE)
-    return {"s": "chiudi" if ferma >= VENT_FERMA or pari else "corso", "um": ora_v, "calo": round(v0 - ora_v), "min": int(ferma // 60)}
+    return {"s": "chiudi" if ferma >= VENT_FERMA or pari else "corso", "um": ora_v, "calo": round(v0 - ora_v), "min": int(ferma // 60), "da": da}
 # VENT-FINE
 
 
@@ -1258,7 +1267,9 @@ def api_dashboard(app, q):
         "refresh": info_refresh(app),
         "meteo": meteo_info(app),
         "riscaldamento": {
-            "stato": stato_risc, "temp": acqua, "target": num("risc.setpoint"), "ritorno": ritorno,
+            "stato": stato_risc, "temp": acqua,
+            "target": ((curva or {}).get("ora") or {}).get("mandata"),   # dalla curva climatica: il setpoint salvato (25) e' quello della modalita' a temperatura fissa
+            "ritorno": ritorno,
             "delta": round(acqua - ritorno, 1) if acqua is not None and ritorno is not None else None,
             "spark": q_griglia(db, "risc.acqua", da, a, 60)[0]},
         "acs": {
@@ -1679,6 +1690,39 @@ def api_fin_annulla(app, corpo, h):
     return {"ok": True}
 
 
+def target_mandata_punti(db, vecchi, da, a, n):
+    """Linea «Target mandata» di Analisi. Il setpoint salvato (risc.setpoint, sempre 25: e' quello della modalita' a temperatura
+    fissa) resta com'era per i giorni gia' registrati; dal momento in cui il pannello e' passato a questa versione la linea
+    segue la curva climatica, con i valori FSV che c'erano in quell'istante (un cambio di curva si vede come un gradino)."""
+    dal = db.meta_get("target_curva_dal")
+    if dal is None:
+        dal = int(time.time())
+        db.meta_set("target_curva_dal", dal)
+    dal = int(dal)
+    prima = [p for p in vecchi if p[0] < dal]
+    if a <= dal:
+        return prima
+    ult = db.ultimi_dict()
+    zona, _ = zona_curva(ult)
+    codici = ("2011", "2012") + (("2021", "2022") if zona == 1 else ("2031", "2032"))
+    da2 = max(int(da), dal)
+    cambi = {c: q_cambi(db, f"fsv.{c}", da2, a) for c in codici}
+    adesso = {c: _fsv(ult, c) for c in codici}
+    nuovi = []
+    for t, est in q_griglia(db, "ciclo.esterna", da2, a, n)[0]:
+        v = []
+        for c in codici:
+            s = stato_a(cambi[c], t)
+            try:
+                v.append(float(s) if s is not None else adesso[c])
+            except ValueError:
+                v.append(adesso[c])
+        if None in v or v[1] <= v[0]:
+            continue
+        nuovi.append([t, mandata_calcolata((v[0], v[2], v[1], v[3]), est)])
+    return prima + nuovi
+
+
 @api("/api/analisi")
 def api_analisi(app, q):
     ora = int(time.time())
@@ -1692,6 +1736,8 @@ def api_analisi(app, q):
         for nome, et, col, tr, *extra in serie:
             u, asse, area = extra if extra else (unita, 0, 0)
             pts, dim = q_griglia(app.db, nome, da, a, n)
+            if nome == "risc.setpoint":
+                pts = target_mandata_punti(app.db, pts, da, a, n)
             if nome == "pot.watt" and (a - da) <= 3 * 86400:
                 gr = q_potenza_a_gradini(app.db, da, a)
                 if gr:

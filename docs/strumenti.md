@@ -187,10 +187,13 @@ python pdc_strumenti.py analisi                      ultimi 45 giorni, 1 giorno 
 python pdc_strumenti.py analisi --giorni 14          meno storico (file piu' piccolo)
 python pdc_strumenti.py analisi --grezzi 3           3 giorni di misure non mediate
 python pdc_strumenti.py analisi --ciclo 0            senza i campioni grezzi del ciclo (file piu' piccolo)
+python pdc_strumenti.py analisi --uscita C:\altro\dati.json   scrive il file dove dici tu invece che in diagnostica (lo usa il plugin «analisi»)
 python pdc_strumenti.py analisi --ricircolo-off "13:30-17:00,21:30-08:00" --ricircolo-dal "2026-11-05 14:30"   fasce a ricircolo spento e da quando valgono (all'avvio le stampa)
 ```
 
 Crea `diagnostica/analisi_AAAAMMGG_HHMM.json`. Dentro: impostazioni (FSV, dispositivi), qualita' dei dati e buchi, riepilogo per giorno (con l'acqua nell'aria in g/m³ di casa e, se c'è la stazione meteo, di fuori), giornata tipica per ora, ogni ciclo dello Smarther (durata, quanto la casa sale oltre il target, isteresi vera), ogni avvio del compressore, profilo della PdC per temperatura esterna, curva climatica contro mandata misurata, efficienza, bollitore, sbrinamenti, ripartenza prevista, cambi di stato, allarmi, e tutte le serie mediate nel tempo (5 minuti gli ultimi 14 giorni, 30 minuti prima), più i byte grezzi del ciclo del compressore degli ultimi 7 giorni (`--ciclo`), che servono a cercare valori non ancora decodificati.
+
+Gli stessi dati, senza esportare il file a mano, li dà anche il plugin `analisi` (solo dalla rete di casa, con token: vedi plugin.md).
 
 Come si usa: lancialo da PowerShell nella cartella del pannello (anche con il pannello acceso), poi allega in chat il file nuovo di `diagnostica`. Se il file è troppo grande per la chat: `--giorni 14`. Il valore dell'isteresi impostato nello Smarther **non** c'è nel database: scrivilo tu insieme al file. Serve `pdc_pannello.py` nella stessa cartella (per i calcoli di efficienza, sbrinamenti e ripartenza; senza, le altre sezioni ci sono lo stesso).
 

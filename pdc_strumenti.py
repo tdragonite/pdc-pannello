@@ -1927,13 +1927,16 @@ def cmd_analisi(cfg, args):
     out["sezioni"] = [k for k in out if k not in ("file", "errori")]
 
     nome = f"analisi_{datetime.fromtimestamp(ora):%Y%m%d_%H%M}.json"
-    cart = HERE / "diagnostica"
-    cart.mkdir(exist_ok=True)
-    path = cart / nome
+    if args.uscita:                                              # lo usa il plugin «analisi»: scrive dove gli viene detto
+        path, nome = Path(args.uscita), args.uscita
+    else:
+        cart = HERE / "diagnostica"
+        cart.mkdir(exist_ok=True)
+        path, nome = cart / nome, "diagnostica/" + nome
     testo = json.dumps(sanitize(out), ensure_ascii=False, separators=(",", ":"), default=str)
     path.write_text(testo, encoding="utf-8")
     kb = path.stat().st_size // 1024 + 1
-    say(f"\nFatto. File salvato: diagnostica/{nome}  ({kb} KB)")
+    say(f"\nFatto. File salvato: {nome}  ({kb} KB)")
     if out.get("errori"):
         say("  Alcune sezioni non sono riuscite (l'errore e' scritto nel file): mandalo comunque.")
     if kb > 8000:
@@ -1991,6 +1994,7 @@ def main():
     an.add_argument("--grezzi", type=int, default=1, help="quanti giorni di misure GREZZE (non mediate) includere, gli ultimi (default 1, 0 = nessuna)")
     an.add_argument("--ricircolo-off", default="13:30-17:00,21:30-08:00", help="fasce a ricircolo SPENTO, tipo 13:30-17:00,21:30-08:00 "
                     "(default: quelle del timer del 5/11/2026; se lo cambi, indicale qui)")
+    an.add_argument("--uscita", help="scrive il file in questo percorso invece che in diagnostica/ (lo usa il plugin «analisi»)")
     an.add_argument("--ricircolo-dal", default="2026-11-05 14:30", help="da quando valgono quelle fasce, 'AAAA-MM-GG HH:MM' (default 2026-11-05 14:30)")
     mp = sub.add_parser("meteo-prova", help="prova a leggere umidita' e temperatura da una pagina WeatherLink 'embeddable' (nessuna chiave, config.json non serve)")
     mp.add_argument("url", help="indirizzo della pagina, tipo https://www.weatherlink.com/embeddablePage/show/<codice>/summary")
