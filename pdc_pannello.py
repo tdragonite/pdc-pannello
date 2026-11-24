@@ -49,7 +49,7 @@ import time
 import traceback
 import types
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -4960,9 +4960,9 @@ def q_serie(db, serie, da, a):
     return db.tutti("SELECT ts, valore FROM misure WHERE serie=? AND ts BETWEEN ? AND ? ORDER BY ts", serie, int(da), int(a))
 
 
-def q_primo_ts(db):
-    """Quando e' il primo dato di pompa che il pannello ha (per sapere se il periodo di confronto e' coperto)."""
-    r = db.uno("SELECT MIN(ts) FROM misure WHERE serie='ciclo.freq_compressore'")
+def q_primo_ts(db, serie="ciclo.freq_compressore"):
+    """Quando e' il primo dato di una serie (di predefinito il compressore: serve a sapere se il periodo di confronto e' coperto)."""
+    r = db.uno("SELECT MIN(ts) FROM misure WHERE serie=?", serie)
     return r[0] if r and r[0] is not None else None
 
 
@@ -5401,8 +5401,6 @@ def meteo_riassumi(raw, ora):
         mm_blocco = sum(max(mm(nome, i) for nome in nomi) for i in idx)
         dettaglio.append({"h": ora_h(idx[0]), "t": prim["temperature_2m"][idx[0]], "mm": round(mm_blocco, 1),
                           "p": nomi_liv[p], "i": _icona_blocco(prim, idx, p)})
-        if len(dettaglio) >= 3:
-            break
     return {"giorno": "Oggi", "tmin": min(temps), "tmax": max(temps),
             "icona": icona, "testo": testo, "livello": lvl, "ore": dettaglio, "modelli": n}
 
@@ -5692,53 +5690,50 @@ def _med_pesata(vals, pesi):
     return coppie[-1][0]
 
 
+def _tratti_richiesta(R):
+    """Le celle di R (dict cella -> richiesta) in tratti di celle CONSECUTIVE con la stessa richiesta: [[prima, ultima, acceso]].
+    Un buco nei dati (cella mancante) chiude il tratto."""
+    tratti = []
+    for b in sorted(R):
+        acceso = R[b] >= 0.5
+        if tratti and tratti[-1][1] == b - 1 and tratti[-1][2] == acceso:
+            tratti[-1][1] = b
+        else:
+            tratti.append([b, b, acceso])
+    return tratti
+
+
 def ripartenza_campioni(T, R, E, S, ok, fine, diag=None):
     """Cerca nelle celle (dict cella -> valore) le discese a riscaldamento fermo e ne ricava i campioni.
     T temperatura casa, R richiesta calore (0/1), E esterna, S target, ok(cella) -> True se lo Smarther era in programma.
     Un campione = una pausa della richiesta, tra due accensioni, di almeno un'ora, con dati completi.
     diag (opzionale, per 'pdc_strumenti.py rip-diag'): lista in cui annotare ogni pausa trovata e perche' e' valida o scartata."""
     campioni = []
-    celle = sorted(R)
-    if not celle:
-        return campioni
-    i = 0
-    n = len(celle)
-    while i < n:
-        b = celle[i]
-        # acceso da almeno 3 celle consecutive, poi spento: e' la fine di un ciclo di riscaldamento
-        if R[b] >= 0.5:
-            j = i
-            while j + 1 < n and celle[j + 1] == celle[j] + 1 and R[celle[j + 1]] >= 0.5:
-                j += 1
-            if j - i + 1 >= 3 and j + 1 < n and celle[j + 1] == celle[j] + 1 and R[celle[j + 1]] < 0.5:
-                s = celle[j + 1]                     # prima cella spenta
-                k = j + 1
-                while k + 1 < n and celle[k + 1] == celle[k] + 1 and R[celle[k + 1]] < 0.5:
-                    k += 1
-                # k = ultima cella spenta; la pausa e' valida solo se poi lo Smarther RIPARTE (cella successiva accesa)
-                riparte = k + 1 < n and celle[k + 1] == celle[k] + 1 and R[celle[k + 1]] >= 0.5
-                if riparte and celle[k] - s + 1 >= 12:
-                    e = celle[k + 1]
-                    mot = []
-                    c = _campione(T, E, S, ok, s, e, mot)
-                    if c:
-                        c["cella"] = e
-                        campioni.append(c)
-                    if diag is not None:
-                        diag.append({"da": s * RIP_PASSO, "a": e * RIP_PASSO, "valida": bool(c), "motivo": None if c else (mot[0] if mot else "scartata"),
-                                     "k": c["k"] if c else None, "sovra": c["sovra"] if c else None, "scarto": c["scarto"] if c else None})
-                elif diag is not None:
-                    if not riparte:
-                        mot = "la pausa non e' finita (lo Smarther non e' ancora ripartito) o ci sono buchi nei dati"
-                    else:
-                        mot = "pausa troppo corta (%d min, ne servono almeno 60)" % ((celle[k] - s + 1) * RIP_PASSO // 60)
-                    diag.append({"da": s * RIP_PASSO, "a": (celle[k] + 1) * RIP_PASSO, "valida": False, "motivo": mot,
-                                 "k": None, "sovra": None, "scarto": None})
-                i = k + 1
-                continue
-            i = j + 1
+    tratti = _tratti_richiesta(R)
+    for x, (prima, ultima, acceso) in enumerate(tratti):
+        # un riscaldamento di almeno 3 celle, subito seguito da una pausa: e' la fine di un ciclo di riscaldamento
+        if not acceso or ultima - prima + 1 < 3 or x + 1 >= len(tratti) or tratti[x + 1][2] or tratti[x + 1][0] != ultima + 1:
             continue
-        i += 1
+        s, k = tratti[x + 1][0], tratti[x + 1][1]        # prima e ultima cella spenta
+        # la pausa e' valida solo se poi lo Smarther RIPARTE (cella successiva accesa)
+        riparte = x + 2 < len(tratti) and tratti[x + 2][0] == k + 1
+        if riparte and k - s + 1 >= 12:
+            e = tratti[x + 2][0]
+            mot = []
+            c = _campione(T, E, S, ok, s, e, mot)
+            if c:
+                c["cella"] = e
+                campioni.append(c)
+            if diag is not None:
+                diag.append({"da": s * RIP_PASSO, "a": e * RIP_PASSO, "valida": bool(c), "motivo": None if c else (mot[0] if mot else "scartata"),
+                             "k": c["k"] if c else None, "sovra": c["sovra"] if c else None, "scarto": c["scarto"] if c else None})
+        elif diag is not None:
+            if not riparte:
+                mot = "la pausa non e' finita (lo Smarther non e' ancora ripartito) o ci sono buchi nei dati"
+            else:
+                mot = "pausa troppo corta (%d min, ne servono almeno 60)" % ((k - s + 1) * RIP_PASSO // 60)
+            diag.append({"da": s * RIP_PASSO, "a": (k + 1) * RIP_PASSO, "valida": False, "motivo": mot,
+                         "k": None, "sovra": None, "scarto": None})
     return campioni
 
 
@@ -6014,12 +6009,10 @@ def api_dashboard(app, q):
     curva = dati_curva(db, ult, da, a, num("ciclo.esterna"))
     stz = stazione_info(app)
     kwh_per, prezzo = energia_kwh(db, da, a), prezzo_kwh(app)
-    servizi = [{"nome": NOMI[s.sigla], "ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]}
-               for s in app.servizi]
-    return {
-        "ora": ora, "da": da, "a": a, "demo": app.demo, "intervallo": app.intervallo_pdc(),
-        "ultimo_ok": max([s["ultimo_ok"] or 0 for s in servizi] + [ts_("acs.temperatura") or 0]),
-        "modo": modo, "servizi": servizi, "accesso_st": info_accesso_st(app),
+    out = cornice(app, ora)
+    out.update({
+        "da": da, "a": a,
+        "modo": modo, "accesso_st": info_accesso_st(app),
         "refresh": info_refresh(app),
         "meteo": meteo_info(app),
         "riscaldamento": {
@@ -6058,9 +6051,8 @@ def api_dashboard(app, q):
         "loghi": elenco_loghi(app), "loghi_bianchi": bool(app.cfg.leggi().get("dispositivi", {}).get("loghi_bianchi")),
         "modi": calcola_modi(db, da, a, tol, ora),
         "curva": curva,
-        "eventi": [{"ts": e[0], "codice": e[1], "livello": e[2], "testo": e[3]}
-                   for e in db.eventi_recenti(30) if e[4] is None],
-    }
+    })
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -6140,25 +6132,30 @@ def _ripartisci(tot, euro):
     return {k: round(euro * v / somma, 2) for k, v in parti.items()} if somma > 0 else None
 
 
+def _tot_efficienza(app, da, a, ora):
+    """I totali di calcola_efficienza(da, a), tenuti in memoria 5 minuti per periodo (si chiedono a ogni aggiornamento della Dashboard e
+    per il costo del mese). None se il calcolo fallisce: il costo diviso per uso allora non si mostra, e l'errore resta nel registro."""
+    cache = app.__dict__.setdefault("det_cache", {})
+    voce = cache.get(round(da))
+    if voce and ora - voce["ts"] < 300:
+        return voce["tot"]
+    try:
+        tot = calcola_efficienza(app.db, da, a, tolleranza(app), ora)["tot"]
+    except Exception:
+        log.exception("calcolo dei totali di efficienza non riuscito")
+        tot = None
+    if len(cache) > 8:
+        del cache[min(cache, key=lambda k: cache[k]["ts"])]      # via la voce piu' vecchia, non tutte (prima si svuotava l'intera cache)
+    cache[round(da)] = {"ts": ora, "tot": tot}
+    return tot
+
+
 def dettaglio_costo(app, da, a, kwh, prezzo, ora):
     """Costo del periodo diviso in riscaldamento, acqua calda e standby (euro), stesse proporzioni di Efficienza applicate
     al totale del contatore. None se manca il prezzo o i dati. Calcolo tenuto in memoria 5 minuti per periodo."""
     if prezzo <= 0 or not kwh or kwh <= 0:
         return None
-    cache = app.__dict__.setdefault("det_cache", {})
-    voce = cache.get(round(da))
-    if voce and ora - voce["ts"] < 300:
-        tot = voce["tot"]
-    else:
-        try:
-            tol = tolleranza(app)
-            tot = calcola_efficienza(app.db, da, a, tol, ora)["tot"]
-        except Exception:
-            tot = None
-        if len(cache) > 8:
-            cache.clear()
-        cache[round(da)] = {"ts": ora, "tot": tot}
-    return _ripartisci(tot, kwh * prezzo)
+    return _ripartisci(_tot_efficienza(app, da, a, ora), kwh * prezzo)
 
 
 def costo_mese(app, ora):
@@ -6169,11 +6166,10 @@ def costo_mese(app, ora):
         return None
     db = app.db
     adesso = datetime.fromtimestamp(ora)
-    inizio = datetime(adesso.year, adesso.month, 1)
-    prec = datetime(adesso.year - (adesso.month == 1), 12 if adesso.month == 1 else adesso.month - 1, 1)
-    fine = datetime(adesso.year + (adesso.month == 12), 1 if adesso.month == 12 else adesso.month + 1, 1)
-    r = db.uno("SELECT MIN(ts) FROM misure WHERE serie='en.totale_wh'")
-    primo = r[0] if r and r[0] is not None else None
+    inizio = adesso.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prec = (inizio - timedelta(days=1)).replace(day=1)
+    fine = (inizio + timedelta(days=32)).replace(day=1)
+    primo = q_primo_ts(db, "en.totale_wh")
     if primo is None:
         return None
     t_in, t_prec = inizio.timestamp(), prec.timestamp()
@@ -6188,17 +6184,7 @@ def costo_mese(app, ora):
     scorso = energia_kwh(db, t_prec, t_in) if primo <= t_prec + 3600 else None
     # divisione tra riscaldamento, acqua calda e standby: stesse proporzioni della stima di Efficienza, applicate al
     # totale del contatore, cosi' la somma torna sempre con il costo del mese. Calcolo tenuto in memoria 5 minuti.
-    det = None
-    cache = app.__dict__.get("mese_cache")
-    if cache and cache["mese"] == t_in and ora - cache["ts"] < 300:
-        det = cache["tot"]
-    else:
-        try:
-            tol = tolleranza(app)
-            det = calcola_efficienza(db, max(t_in, primo), ora, tol, ora)["tot"]
-            app.__dict__["mese_cache"] = {"mese": t_in, "ts": ora, "tot": det}
-        except Exception:
-            det = None
+    det = _tot_efficienza(app, max(t_in, primo), ora, ora)
     return {"kwh": kwh, "euro": round(kwh * prezzo, 2), "dettaglio": _ripartisci(det, kwh * prezzo),
             "stima_euro": None if stima is None else round(stima * prezzo, 2),
             "scorso_euro": None if scorso is None else round(scorso * prezzo, 2),
@@ -6395,16 +6381,21 @@ def _num_fin(v):
     return x if math.isfinite(x) else None
 
 
+def _fin_salva(app, da, a, calo, ah, stato, manuale):
+    """Registra la risposta su una finestra (tolte quelle che si sovrappongono) e ricalibra le soglie."""
+    with app.db.lock, closing(app.db._c()) as c, c:
+        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
+        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?,?,?)", (int(da), int(a), calo, ah, stato, manuale))
+    fin_calibra(app.db)
+
+
 @api_post("/api/finestre/giudica")
 def api_fin_giudica(app, corpo, h):
     da, a, calo, ah = _num_fin(corpo.get("da")), _num_fin(corpo.get("a")), _num_fin(corpo.get("calo")), _num_fin(corpo.get("ah"))
     stato = corpo.get("stato")
     if da is None or a is None or a <= da or a - da > 86400 or stato not in ("si", "no"):
         return {"ok": False, "errore": "Dati non validi."}
-    with app.db.lock, closing(app.db._c()) as c, c:
-        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
-        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?,?,0)", (int(da), int(a), calo, ah, stato))
-    fin_calibra(app.db)
+    _fin_salva(app, da, a, calo, ah, stato, 0)
     return {"ok": True}
 
 
@@ -6422,10 +6413,7 @@ def api_fin_manuale(app, corpo, h):
         minimo = min(dentro, key=lambda x: x[1])
         calo = round(max(0.0, pic[1] - minimo[1]), 1)
         ah = _ah_vicina(U, [x[0] for x in U], minimo, pic)
-    with app.db.lock, closing(app.db._c()) as c, c:
-        c.execute("DELETE FROM finestre WHERE a > ? AND da < ?", (int(da), int(a)))
-        c.execute("INSERT INTO finestre(da, a, calo, ah, stato, manuale) VALUES(?,?,?,?, 'si', 1)", (int(da), int(a), calo, ah))
-    fin_calibra(app.db)
+    _fin_salva(app, da, a, calo, ah, "si", 1)
     return {"ok": True}
 
 
@@ -6622,6 +6610,19 @@ def _tratti_calmi(temp, tts, cicli, w0, w1):
     return out
 
 
+def _perdita_tratto(temp, tts, t_at, g0, g1, tol):
+    """Quanto perde l'acqua del bollitore tra g0 e g1: (gradi persi, ore), oppure None se manca la temperatura a uno dei due estremi
+    (t_at con tolleranza `tol`), se nel tratto e' salita di oltre mezzo grado, o se la perdita non e' tra 0 e 3 gradi all'ora."""
+    v0, v1 = t_at(g0, tol), t_at(g1, tol)
+    if v0 is None or v1 is None:
+        return None
+    dentro = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
+    h = (g1 - g0) / 3600.0
+    if (dentro and max(v for _, v in dentro) > v0 + 0.5) or not 0 <= (v0 - v1) / h <= 3:
+        return None
+    return v0 - v1, h
+
+
 def perdita_giorno(temp, tts, cicli, t_at, da, a, litri, ore_da=6, ore_a=23):
     """Perdita a riposo di giorno (6-23): i gradi persi per ora nei tratti tranquilli, tutti insieme (somma dei gradi / somma delle ore).
     None se in tutto ci sono meno di 2 ore tranquille."""
@@ -6634,16 +6635,11 @@ def perdita_giorno(temp, tts, cicli, t_at, da, a, litri, ore_da=6, ore_a=23):
         if w1 - w0 < 3600:
             continue
         for g0, g1 in _tratti_calmi(temp, tts, cicli, w0, w1):
-            v0, v1 = t_at(g0, 900), t_at(g1, 900)
-            if v0 is None or v1 is None:
-                continue
-            dentro = temp[bisect.bisect_left(tts, g0):bisect.bisect_right(tts, g1)]
-            h = (g1 - g0) / 3600.0
-            if (dentro and max(v for _, v in dentro) > v0 + 0.5) or not 0 <= (v0 - v1) / h <= 3:
-                continue
-            gradi += v0 - v1
-            ore += h
-            n += 1
+            p = _perdita_tratto(temp, tts, t_at, g0, g1, 900)
+            if p:
+                gradi += p[0]
+                ore += p[1]
+                n += 1
     if ore < 2:
         return None
     r = gradi / ore
@@ -6689,13 +6685,9 @@ def calcola_bollitore(db, da, a, ora, litri=300):
         g0 += 1200          # i primi 20 minuti dopo il riscaldo l'acqua si rimescola
         if g1 - g0 < 2.5 * 3600:
             continue
-        v0, v1 = t_at(g0), t_at(g1)
-        dentro = [v for ts_, v in temp if g0 <= ts_ <= g1]
-        if v0 is None or v1 is None or (dentro and max(dentro) > v0 + 0.5):
-            continue
-        r = (v0 - v1) / ((g1 - g0) / 3600.0)
-        if 0 <= r <= 3:
-            perd.append(r)
+        p = _perdita_tratto(temp, tts, t_at, g0, g1, 1800)
+        if p:
+            perd.append(p[0] / p[1])
     out = {"perdita": None, "salita": None, "giorno": perdita_giorno(temp, tts, cicli, t_at, da, a, litri), "litri": litri}
     if len(perd) >= 2:
         r = _mediana(perd)
@@ -6734,14 +6726,14 @@ def elenco_sbrinamenti(db, da, a, ora):
         kwh = round(max(0.0, e1 - e0) / 1000, 2) if e0 is not None and e1 is not None else None
         est = [v for _, v in q_serie(db, "ciclo.esterna", i - 900, fine + 900)]
         out.append({"ts": i, "fine": f, "min": round((fine - i) / 60), "kwh": kwh,
-                    "esterna": round(sum(est) / len(est), 1) if est else None, "incorso": f is None})
+                    "esterna": _media(est), "incorso": f is None})
     out.reverse()
     chiusi = [s for s in out if not s["incorso"]]
     kw = [s["kwh"] for s in out if s["kwh"] is not None]
     est = [s["esterna"] for s in out if s["esterna"] is not None]
     return {"n": len(out), "kwh": round(sum(kw), 2) if kw else None,
-            "media_min": round(sum(s["min"] for s in chiusi) / len(chiusi), 1) if chiusi else None,
-            "esterna": round(sum(est) / len(est), 1) if est else None,
+            "media_min": _media([s["min"] for s in chiusi]),
+            "esterna": _media(est),
             "elenco": out[:SBR_MAX_ELENCO]}
 
 
@@ -6751,6 +6743,16 @@ COP_DT_MIN = 5.0       # sotto questo salto termico medio (mandata - ritorno) il
 def _dt_medio(s):
     """[somma dei salti termici, celle] -> salto medio in °C, o None."""
     return round(s[0] / s[1], 1) if s[1] else None
+
+
+def _media(valori, decimali=1):
+    """Media arrotondata, oppure None se non c'e' nessun valore."""
+    return round(sum(valori) / len(valori), decimali) if valori else None
+
+
+def _cop(calore, el, minimo=0.05):
+    """COP = calore prodotto / energia elettrica; None se l'energia e' troppo poca perche' il rapporto abbia senso."""
+    return round(calore / el, 2) if el > minimo else None
 
 
 def cop_approssimato(dt_casa, dt_acs):
@@ -6822,12 +6824,12 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
             "el_casa": round(g["el"]["casa"], 2), "el_acs": round(g["el"]["acs"], 2),
             "el_riposo": round(g["el"]["riposo"], 2),
             "calore_casa": round(g["calore"]["casa"], 2), "calore_acs": round(g["calore"]["acs"], 2),
-            "cop_casa": round(g["calore"]["casa"] / g["el_cop"]["casa"], 2) if g["el_cop"]["casa"] > 0.05 else None,
-            "cop_acs": round(g["calore"]["acs"] / g["el_cop"]["acs"], 2) if g["el_cop"]["acs"] > 0.05 else None,
-            "cop": round(cal / el_cop, 2) if el_cop > 0.1 else None,
+            "cop_casa": _cop(g["calore"]["casa"], g["el_cop"]["casa"]),
+            "cop_acs": _cop(g["calore"]["acs"], g["el_cop"]["acs"]),
+            "cop": _cop(cal, el_cop, 0.1),
             "min_casa": g["min"]["casa"], "min_acs": g["min"]["acs"],
             "dt_casa": _dt_medio(g["dt"]["casa"]), "dt_acs": _dt_medio(g["dt"]["acs"]),
-            "esterna": round(sum(g["est"]) / len(g["est"]), 1) if g["est"] else None,
+            "esterna": _media(g["est"]),
             "nodati_min": g["nodati_min"]})
     tot = {"el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
            "el_cop": {"casa": 0.0, "acs": 0.0}}
@@ -6835,15 +6837,14 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         for k in ("el", "calore", "el_cop"):
             for m in tot[k]:
                 tot[k][m] += g[k].get(m, 0.0)
-    cop = lambda m: round(tot["calore"][m] / tot["el_cop"][m], 2) if tot["el_cop"][m] > 0.05 else None
-    el_c = tot["el_cop"]["casa"] + tot["el_cop"]["acs"]
+    el_c =tot["el_cop"]["casa"] + tot["el_cop"]["acs"]
     cal_c = tot["calore"]["casa"] + tot["calore"]["acs"]
     # cicli: un "ciclo" e' un tratto continuo in un modo
     cicli = {}
     runs = unisci_riprese(cicli_compressore(db, da, a, ora))     # le riprese del riscaldamento dopo l'acqua calda non sono nuovi avvii
     for m in ("casa", "acs"):
         durate = [x[3] / 60 for x in runs if x[2] == m]
-        cicli[m] = {"n": len(durate), "media_min": round(sum(durate) / len(durate), 1) if durate else None,
+        cicli[m] = {"n": len(durate), "media_min": _media(durate),
                     "brevi": sum(1 for d in durate if d < 10), "max_min": round(max(durate), 1) if durate else None}
     sbr = elenco_sbrinamenti(db, da, a, ora)
     sbrinamenti = sbr["n"]
@@ -6856,8 +6857,9 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         "tot": {"el_casa": round(tot["el"]["casa"], 1), "el_acs": round(tot["el"]["acs"], 1),
                 "el_riposo": round(tot["el"]["riposo"], 1),
                 "calore_casa": round(tot["calore"]["casa"], 1), "calore_acs": round(tot["calore"]["acs"], 1),
-                "cop_casa": cop("casa"), "cop_acs": cop("acs"),
-                "cop": round(cal_c / el_c, 2) if el_c > 0.1 else None,
+                "cop_casa": _cop(tot["calore"]["casa"], tot["el_cop"]["casa"]),
+                "cop_acs": _cop(tot["calore"]["acs"], tot["el_cop"]["acs"]),
+                "cop": _cop(cal_c, el_c, 0.1),
                 "dt_casa": _dt_medio([sum(g["dt"]["casa"][0] for g in giorni.values()), sum(g["dt"]["casa"][1] for g in giorni.values())]),
                 "dt_acs": _dt_medio([sum(g["dt"]["acs"][0] for g in giorni.values()), sum(g["dt"]["acs"][1] for g in giorni.values())]),
                 "ore_casa": round(modi["minuti"]["casa"] / 60, 1), "ore_acs": round(modi["minuti"]["acs"] / 60, 1)},
@@ -6943,7 +6945,7 @@ def csv_esporta(app, q):
     lt = time.localtime(ora)
     oggi0 = _ore_locali(lt)
     if tipo == "misure":
-        giorni = q_int(q, "giorni", 28, 1, 7)
+        giorni = q_int(q, "giorni", 7, 1, 7)
         da = oggi0 - (giorni - 1) * 86400
         w.writerow(["serie", "data_ora", "valore"])
         with closing(app.db._c()) as c:
