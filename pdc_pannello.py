@@ -6136,7 +6136,10 @@ def _tot_efficienza(app, da, a, ora):
     """I totali di calcola_efficienza(da, a), tenuti in memoria 5 minuti per periodo (si chiedono a ogni aggiornamento della Dashboard e
     per il costo del mese). None se il calcolo fallisce: il costo diviso per uso allora non si mostra, e l'errore resta nel registro."""
     cache = app.__dict__.setdefault("det_cache", {})
-    voce = cache.get(round(da))
+    # chiave grossolana: nella vista «ultime 24 ore» la pagina manda inizio e fine presi dal suo orologio, diversi a ogni aggiornamento;
+    # con la chiave esatta la cache non scattava mai. Le proporzioni tra riscaldamento, acqua e standby non cambiano in 5 minuti.
+    chiave = (round(da / 300), round((a - da) / 3600))
+    voce = cache.get(chiave)
     if voce and ora - voce["ts"] < 300:
         return voce["tot"]
     try:
@@ -6146,7 +6149,7 @@ def _tot_efficienza(app, da, a, ora):
         tot = None
     if len(cache) > 8:
         del cache[min(cache, key=lambda k: cache[k]["ts"])]      # via la voce piu' vecchia, non tutte (prima si svuotava l'intera cache)
-    cache[round(da)] = {"ts": ora, "tot": tot}
+    cache[chiave] = {"ts": ora, "tot": tot}
     return tot
 
 
