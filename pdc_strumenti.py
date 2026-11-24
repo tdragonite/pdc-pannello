@@ -14,6 +14,7 @@ Fa queste cose, tutte con la sola libreria standard di Python:
   st-prova-refresh  esperimento: il comando 'refresh' anticipa i dati del ciclo? (pannello fermo)
   rip-diag     diagnostica della «ripartenza prevista» dello Smarther: perche' c'e' o non c'e', quali pause usa
   nt-webhook-prova  prova i webhook Netatmo: registra un indirizzo temporaneo, ascolta gli eventi dello Smarther e li confronta con homestatus (pannello anche acceso)
+  nt-webhook-guidato  prova mirata dei webhook Netatmo: gesti a copione + fase senza toccare niente, confronto con il polling
   sbrinamenti  elenca gli sbrinamenti trovati nel database, uno per uno, con i cambi di stato grezzi (per controllare il conteggio)
   analisi      UN file con tutti i dati (impostazioni, cicli, sbrinamenti, serie nel tempo) per farli analizzare a Claude
   meteo-prova  prova a leggere umidita' e temperatura da una pagina WeatherLink "embeddable" (stazione meteo vicina), senza chiavi
@@ -848,10 +849,23 @@ def wh_firma_ok(corpo, segreto, intestazione):
     return hmac.compare_digest(atteso, intestazione.strip().lower())
 
 
-def wh_ricevitore(porta, segreto, eventi, lock):
-    """Piccolo server HTTP: registra ogni POST (con esito della firma) e risponde sempre 200 entro pochi ms."""
+def wh_ricevitore(porta, segreto, eventi, lock, errori=None):
+    """Piccolo server HTTP: registra ogni POST (con esito della firma) e risponde sempre 200 entro pochi ms.
+    Se 'errori' e' una lista, ci scrive gli errori del ricevitore (tipo, fase, ora) invece di stamparne solo la prima riga."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    def segna(tipo, msg, fase, da="", extra=None):
+        if errori is not None:
+            with lock:
+                errori.append({"ora": time.time(), "tipo": tipo, "messaggio": str(msg)[:200], "fase": fase, "da": da, **(extra or {})})
+        say(f"  {datetime.now().strftime('%H:%M:%S')}  (errore del ricevitore, fase «{fase}»: {tipo}: {str(msg)[:120]})")
+
+    class Srv(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):       # errori fuori da do_POST (lettura della richiesta, ecc.)
+            import sys
+            t, e, _ = sys.exc_info()
+            segna(t.__name__ if t else "?", e, "fuori dal gestore", client_address[0])
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -860,6 +874,8 @@ def wh_ricevitore(porta, segreto, eventi, lock):
             pass
 
         def do_POST(self):
+            fase = "intestazioni"
+            da = self.headers.get("CF-Connecting-IP") or self.client_address[0]
             try:
                 lungo = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -867,7 +883,18 @@ def wh_ricevitore(porta, segreto, eventi, lock):
             n = max(0, min(lungo, 262144))                  # mai negativo: read(-1) aspetterebbe la fine della connessione
             if lungo != n:
                 self.close_connection = True                # corpo non letto per intero: la connessione non si riusa
-            corpo = self.rfile.read(n) if n else b""
+            try:
+                fase = "lettura del corpo"
+                corpo = self.rfile.read(n) if n else b""
+                if len(corpo) < n:
+                    raise ConnectionError(f"corpo incompleto: attesi {n} byte, letti {len(corpo)}")
+            except (OSError, ValueError) as e:
+                segna(type(e).__name__, e, fase, da, {"metodo": self.command, "percorso": self.path, "content_length": lungo})
+                self.close_connection = True
+                return
+            self._ricevi(corpo, da)
+
+        def _ricevi(self, corpo, da):
             firma = wh_firma_ok(corpo, segreto, self.headers.get("X-Netatmo-secret"))
             try:
                 js = json.loads(corpo.decode("utf-8", "replace")) if corpo.strip() else {}
@@ -879,21 +906,25 @@ def wh_ricevitore(porta, segreto, eventi, lock):
                                    "da": (self.headers.get("CF-Connecting-IP") or self.client_address[0]),
                                    "agente": (self.headers.get("User-Agent") or "")[:60]})
             risp = b'{"status":"ok"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(risp)))
-            self.end_headers()
-            self.wfile.write(risp)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(risp)))
+                self.end_headers()
+                self.wfile.write(risp)
+            except OSError as e:       # l'evento e' gia' salvato: qui e' solo la risposta che non e' arrivata (Netatmo potrebbe riprovare)
+                segna(type(e).__name__, e, "risposta (evento gia' registrato)", da, {"metodo": self.command, "percorso": self.path})
+                self.close_connection = True
 
         do_GET = do_POST
 
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", porta), H)
+        srv = Srv(("127.0.0.1", porta), H)
     except OSError as e:     # su Windows alcune porte sono riservate o occupate (WinError 10013/10048): ne scelgo una libera
         if not porta:
             raise
         say(f"  (la porta {porta} non e' utilizzabile: {e.strerror or e}; ne scelgo una libera)")
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv = Srv(("127.0.0.1", 0), H)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -1156,6 +1187,320 @@ def cmd_nt_webhook_prova(cfg, args):
     say("\nFatto. Allega a Claude diagnostica/webhook_eventi.json (e controllalo prima con il Blocco note, NON config.json).")
 
 
+
+# --------------------------------------------------------------------------
+# nt-webhook-guidato: prova mirata dei webhook Netatmo (gesti a copione + fase senza toccare niente)
+# --------------------------------------------------------------------------
+
+WH_COPIONE = [
+    "imposta la temperatura a 22,0 (manuale)",
+    "imposta la temperatura a 21,5",
+    "torna al programma (Auto)",
+    "spegni (antigelo)",
+    "riaccendi (torna al programma)",
+    "imposta la temperatura a 22,5",
+    "torna al programma (Auto)",
+]
+WH_CAMPI_CHIAVE = ("therm_setpoint_temperature", "therm_setpoint_mode", "humidity", "therm_measured_temperature",
+                   "boiler_status", "anticipating", "cooler_status")
+WH_IGNORA_DESCR = ("id", "hardware_version", "firmware_revision", "hk_device_id", "installation_type", "type", "wifi_strength",
+                   "sequence_id", "correlation_id")
+
+
+def wh_home_evento(ev):
+    c = ev["corpo"] if isinstance(ev["corpo"], dict) else {}
+    h = (c.get("extra_params") or {}).get("home")
+    return h if isinstance(h, dict) else {}
+
+
+def wh_seq_evento(ev):
+    return {v for k, v in wh_piatto(wh_home_evento(ev)).items() if k.endswith("sequence_id") and isinstance(v, int)}
+
+
+def wh_descrivi(ev):
+    ep = (ev["corpo"].get("extra_params") if isinstance(ev["corpo"], dict) else None) or {}
+    pezzi = [f"{k}={v}" for k, v in wh_piatto(wh_home_evento(ev)).items() if k.split(".")[-1].split("[")[0] not in WH_IGNORA_DESCR]
+    seq = sorted(wh_seq_evento(ev))
+    return f"[{ep.get('type', 'stato')}] " + (", ".join(pezzi) or "(vuoto)") + (f"  (seq {','.join(map(str, seq))})" if seq else "")
+
+
+def wh_confronta_evento(ev, token, home_id):
+    """Confronta stanze e moduli dell'evento con homestatus letto subito dopo."""
+    h = wh_home_evento(ev)
+    st = (wh_leggi(token, "/api/homestatus", {"home_id": home_id}).get("body") or {}).get("home") or {}
+    out = []
+    for chiave, nome in (("rooms", "stanza"), ("modules", "modulo")):
+        by_id = {m.get("id"): m for m in st.get(chiave) or [] if isinstance(m, dict)}
+        for m in h.get(chiave) or []:
+            if isinstance(m, dict) and m.get("id") in by_id:
+                out.append({"oggetto": nome, "tipo": m.get("type"), "ora": datetime.now().isoformat(timespec="seconds"), **wh_confronta(m, by_id[m["id"]])})
+    return out
+
+
+def wh_analisi_sequenze(eventi, cambiamenti, finestre):
+    """Numeri di sequenza mancanti, con gli eventi vicini e cio' che il polling ha visto in quel momento."""
+    per_seq = {}
+    for e in eventi:
+        for q in wh_seq_evento(e):
+            per_seq.setdefault(q, []).append(e["arrivo"])
+    if not per_seq:
+        return {"visti": 0, "mancanti": []}
+    lo, hi = min(per_seq), max(per_seq)
+    mancanti = []
+    for n in range(lo, hi + 1):
+        if n in per_seq:
+            continue
+        pre = max((q for q in per_seq if q < n), default=None)
+        dopo = min((q for q in per_seq if q > n), default=None)
+        t0 = min(per_seq[pre]) if pre is not None else None
+        t1 = min(per_seq[dopo]) if dopo is not None else None
+        fase = "?"
+        if t0 is not None:
+            for nome, (a, b) in finestre.items():
+                if a - 2 <= t0 <= b + 2:
+                    fase = nome
+        vicini = [f"{c['campo'].split('.')[-1]} {c['prima']}->{c['dopo']}" for c in cambiamenti
+                  if t0 is not None and t1 is not None and t0 - 25 <= c["arrivo"] <= t1 + 25]
+        mancanti.append({"numero": n, "evento_prima": pre, "evento_dopo": dopo,
+                         "ora_prima": datetime.fromtimestamp(t0).isoformat(timespec="seconds") if t0 else None,
+                         "ora_dopo": datetime.fromtimestamp(t1).isoformat(timespec="seconds") if t1 else None,
+                         "fase": fase, "polling_in_quel_momento": vicini})
+    return {"visti": len(per_seq), "da": lo, "a": hi, "mancanti": mancanti}
+
+
+def wh_analisi_ritardi(eventi, cambiamenti):
+    """Per ogni cambiamento visto dal polling su un campo chiave: il webhook l'ha portato? con che anticipo? E gli eventi che il polling non ha visto."""
+    ev_p = [(e["arrivo"], wh_piatto(wh_home_evento(e))) for e in eventi]
+    chiave = [c for c in cambiamenti if c["campo"].split(".")[-1].split("[")[0] in WH_CAMPI_CHIAVE]
+    abbinati, senza, diff = [], [], []
+    for c in chiave:
+        nome = c["campo"].split(".")[-1]
+        trovato = None
+        for t, pz in ev_p:
+            if t >= c["arrivo"] - 30 and any(k.split(".")[-1] == nome and v == c["dopo"] for k, v in pz.items()):
+                trovato = t
+                break
+        if trovato is None:
+            senza.append({"campo": c["campo"], "prima": c["prima"], "dopo": c["dopo"], "ora": datetime.fromtimestamp(c["arrivo"]).isoformat(timespec="seconds")})
+        else:
+            abbinati.append(c)
+            diff.append(trovato - c["arrivo"])
+    visti_polling = {(c["campo"].split(".")[-1], c["dopo"]) for c in cambiamenti}
+    solo_wh = 0
+    for t, pz in ev_p:
+        for k, v in pz.items():
+            nome = k.split(".")[-1].split("[")[0]
+            if nome in ("therm_setpoint_temperature", "therm_setpoint_mode", "boiler_status") and (nome, v) not in visti_polling:
+                solo_wh += 1
+    diff.sort()
+    return {"cambi_polling_su_campi_chiave": len(chiave), "portati_dal_webhook": len(abbinati), "senza_evento": senza,
+            "arrivo_webhook_meno_polling_s": {"min": round(diff[0], 1), "mediana": round(diff[len(diff) // 2], 1), "max": round(diff[-1], 1)} if diff else None,
+            "valori_visti_solo_dal_webhook": solo_wh}
+
+
+def cmd_nt_webhook_guidato(cfg, args):
+    import threading
+    nt = cfg["netatmo"]
+    segreto = nt.get("client_secret") or ""
+    if not segreto:
+        die("Manca netatmo.client_secret in config.json (serve a controllare la firma dei messaggi).")
+    copione = WH_COPIONE[:max(0, args.gesti)]
+    durata = (len(copione) * (args.attesa + 40) + args.naturale * 60 + 120)
+    token = wh_token(cfg, durata, args.rinnova)
+    eventi, lock = [], threading.Lock()
+    rapporto = {"avviato": datetime.now().isoformat(timespec="seconds"), "registrazione": None, "passi": [], "eventi": [], "confronti": [],
+                "cambiamenti_netatmo": [], "controlli_registro": [], "elenco_prima": None, "elenco_dopo": None, "rimozione": None, "errori_ricevitore": []}
+    say("\nElenco dei webhook gia' presenti sul tuo account ...")
+    c0, js0 = wh_chiama(token, "GET", "/webhooks/v1/")
+    rapporto["elenco_prima"] = {"http": c0, "risposta": js0}
+    say(f"  HTTP {c0}: {json.dumps(js0, ensure_ascii=False)[:300]}")
+    if c0 >= 400 or not isinstance(js0, dict) or js0.get("body") != []:
+        die("Parto solo se l'elenco dei webhook e' certamente vuoto (la rimozione finale toglie TUTTI i webhook dell'account). Guarda l'elenco qui sopra.")
+
+    srv = pr = None
+    registrato = False
+    url = args.url
+    stop = threading.Event()
+    lavoratore = None
+    finestre = {}
+    try:
+        srv = wh_ricevitore(args.porta, segreto, eventi, lock, rapporto["errori_ricevitore"])
+        if not url:
+            exe = wh_trova_cloudflared(cfg)
+            if not exe or not Path(exe).exists():
+                die("Non trovo cloudflared. Mettilo nella cartella 'cloudflared' accanto a questo script, oppure passa un indirizzo tuo con --url.")
+            say(f"\nAvvio il tunnel temporaneo (cloudflared: {exe}) ...")
+            pr, url = wh_tunnel(exe, srv.server_address[1])
+        say(f"  indirizzo pubblico: {url}")
+        say("\nRegistro il webhook su Netatmo (POST /webhooks/v1/) ...")
+        c1, js1 = wh_chiama(token, "POST", "/webhooks/v1/", json_body={"url": url})
+        rapporto["registrazione"] = {"http": c1, "risposta": js1}
+        say(f"  HTTP {c1}: {json.dumps(js1, ensure_ascii=False)[:300]}")
+        if c1 >= 400:
+            die("Netatmo ha rifiutato la registrazione (vedi sopra). Manda l'output a Claude.")
+        registrato = True
+        homes = (wh_leggi(token, "/api/homesdata").get("body") or {}).get("homes") or []
+        home_id = homes[0]["id"] if homes else None
+
+        def lavora():
+            visti = n_conf = 0
+            ultimo_conf = 0.0
+            stato_nt = None
+            prox_sonda, prox_reg = time.time(), time.time() + 30
+            while not stop.is_set():
+                try:
+                    ora = time.time()
+                    if args.sonda and home_id and ora >= prox_sonda:
+                        stato_nt = wh_sonda(token, home_id, stato_nt, rapporto)
+                        prox_sonda = time.time() + args.sonda
+                    if ora >= prox_reg:
+                        wh_controlla_registro(token, url, rapporto)
+                        prox_reg = time.time() + 60
+                    with lock:
+                        nuovi = eventi[visti:]
+                        visti = len(eventi)
+                    for ev in nuovi:
+                        c = ev["corpo"] if isinstance(ev["corpo"], dict) else {}
+                        f = {True: "firma OK", False: "FIRMA NON VALIDA", None: "senza firma"}[ev["firma"]]
+                        say(f"  {datetime.fromtimestamp(ev['arrivo']).strftime('%H:%M:%S')}  {wh_descrivi(ev)}  [{f}]")
+                        rapporto["eventi"].append(ev)
+                        if c.get("push_type") == "device_event" and home_id and wh_home_evento(ev) and n_conf < 25 and time.time() - ultimo_conf > 4:
+                            ultimo_conf, n_conf = time.time(), n_conf + 1
+                            rapporto["confronti"].extend(wh_confronta_evento(ev, token, home_id))
+                except (Exception, SystemExit) as e:
+                    say(f"  (errore passeggero nella prova: {e})")
+                stop.wait(1)
+
+        lavoratore = threading.Thread(target=lavora, daemon=True)
+        lavoratore.start()
+
+        say("\n=== FASE 1: GESTI A COPIONE ===")
+        say(f"Ti dico cosa fare. Fai il gesto sull'app BTicino (o sullo Smarther), poi premi Invio qui. Poi aspetto {args.attesa} secondi e passo al prossimo.")
+        say("Aspetta sempre che io dica «prossimo» prima di fare il gesto dopo.\n")
+        input("Premi Invio per cominciare ... ")
+        t_fase1 = time.time()
+        for i, testo in enumerate(copione, 1):
+            say(f"\n--- Gesto {i} di {len(copione)}: {testo.upper()}")
+            input("    Fatto? Premi Invio subito dopo il gesto ... ")
+            t = time.time()
+            rapporto["passi"].append({"n": i, "gesto": testo, "ora": t})
+            time.sleep(args.attesa)
+        finestre["fase 1 (gesti)"] = (t_fase1, time.time())
+
+        say(f"\n=== FASE 2: NON TOCCARE PIU' NIENTE per {args.naturale} minuti ===" if args.naturale else "\n(fase 2 saltata)")
+        say("Lascia lo Smarther com'e' (al programma). Qui guardiamo cosa arriva da solo: temperatura, umidita', e soprattutto se il riscaldamento parte/si ferma.")
+        t_fase2 = time.time()
+        fine = t_fase2 + args.naturale * 60
+        try:
+            while time.time() < fine:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            say("\nFase 2 interrotta: passo al riepilogo.")
+        finestre["fase 2 (naturale)"] = (t_fase2, time.time())
+    except KeyboardInterrupt:
+        say("\nInterrotto: faccio pulizia ...")
+    finally:
+        stop.set()
+        if lavoratore:
+            lavoratore.join(timeout=15)
+        if registrato:
+            say("\nRimuovo il webhook da Netatmo (DELETE /webhooks/v1/) ...")
+            try:
+                c3, js3 = wh_chiama(token, "DELETE", "/webhooks/v1/")
+                rapporto["rimozione"] = {"http": c3, "risposta": js3}
+                say(f"  HTTP {c3}: {json.dumps(js3, ensure_ascii=False)[:300]}")
+                c4, js4 = wh_chiama(token, "GET", "/webhooks/v1/")
+                rapporto["elenco_dopo"] = {"http": c4, "risposta": js4}
+                if url and url in json.dumps(js4):
+                    say("  ATTENZIONE: il nostro indirizzo risulta ancora registrato. Rilancia 'nt-webhook-prova --metodo nuovo --elimina'.")
+            except SystemExit:
+                say("  Non sono riuscito a rimuoverlo: rilancia 'nt-webhook-prova --metodo nuovo --elimina'.")
+        if srv:
+            srv.shutdown()
+        if pr and pr.poll() is None:
+            pr.terminate()
+
+    wh_riepilogo_guidato(rapporto, finestre)
+
+
+def wh_riepilogo_guidato(r, finestre):
+    ev, camb, passi = r["eventi"], r["cambiamenti_netatmo"], r["passi"]
+    say("\n=== RIEPILOGO ===")
+    say(f"Eventi ricevuti: {len(ev)}. Firma: {sum(1 for e in ev if e['firma'] is True)} valide, "
+        f"{sum(1 for e in ev if e['firma'] is False)} non valide, {sum(1 for e in ev if e['firma'] is None)} assenti.")
+    # 1. gesto per gesto
+    say("\n1) GESTO PER GESTO (eventi arrivati dopo ogni gesto, prima del successivo)")
+    for k, p in enumerate(passi):
+        fine = passi[k + 1]["ora"] if k + 1 < len(passi) else (finestre.get("fase 1 (gesti)") or (0, p["ora"] + 30))[1]
+        mio = [e for e in ev if p["ora"] - 3 <= e["arrivo"] < fine]
+        p["eventi"] = len(mio)
+        say(f"  {p['n']}. {p['gesto']}: {len(mio)} eventi" + ("" if mio else "  <-- NESSUNO"))
+        for e in mio:
+            say(f"       {datetime.fromtimestamp(e['arrivo']).strftime('%H:%M:%S')} ({e['arrivo'] - p['ora']:+.0f} s dal tuo Invio)  {wh_descrivi(e)}")
+    # 2. polling contro webhook
+    rit = wh_analisi_ritardi(ev, camb)
+    r["analisi_ritardi"] = rit
+    say("\n2) WEBHOOK CONTRO POLLING (il polling legge homestatus ogni 20 s)")
+    say(f"  Cambiamenti di campi chiave visti dal polling: {rit['cambi_polling_su_campi_chiave']}; portati anche da un evento: {rit['portati_dal_webhook']}.")
+    if rit["senza_evento"]:
+        say("  Visti dal polling ma SENZA evento corrispondente:")
+        for x in rit["senza_evento"]:
+            say(f"     {x['ora'][11:]}  {x['campo']}: {x['prima']} -> {x['dopo']}")
+    else:
+        say("  Nessun cambiamento visto dal polling e mancato dal webhook.")
+    if rit["arrivo_webhook_meno_polling_s"]:
+        a = rit["arrivo_webhook_meno_polling_s"]
+        say(f"  Arrivo dell'evento meno momento in cui il polling se n'e' accorto: min {a['min']} s, mediana {a['mediana']} s, max {a['max']} s (negativo = il webhook e' arrivato prima).")
+    say(f"  Valori di setpoint/modo/caldaia visti SOLO dal webhook (il polling li ha persi): {rit['valori_visti_solo_dal_webhook']}")
+    # 3. buchi di sequenza
+    seq = wh_analisi_sequenze(ev, camb, finestre)
+    r["analisi_sequenze"] = seq
+    say("\n3) NUMERI DI SEQUENZA MANCANTI")
+    if not seq["mancanti"]:
+        say(f"  Nessun buco fra i {seq['visti']} numeri visti.")
+    for m in seq["mancanti"]:
+        say(f"  manca {m['numero']} (fra {m['evento_prima']} alle {(m['ora_prima'] or '?')[11:]} e {m['evento_dopo']} alle {(m['ora_dopo'] or '?')[11:]}), {m['fase']}; "
+            f"polling in quel momento: {'; '.join(m['polling_in_quel_momento']) or 'niente'}")
+    # 4. confronto con homestatus
+    say("\n4) CONFRONTO DEGLI EVENTI CON HOMESTATUS")
+    conf = r["confronti"]
+    say(f"  Confronti fatti: {len(conf)}")
+    for og in ("stanza", "modulo"):
+        c = [x for x in conf if x["oggetto"] == og]
+        if c:
+            mancano = set.intersection(*[set(x["solo_in_homestatus"]) for x in c])
+            diversi = sorted(set().union(*[set(x["diversi"]) for x in c]))
+            say(f"  {og}: campi di homestatus che l'evento non porta: {', '.join(sorted(mancano)) or 'nessuno'}")
+            say(f"  {og}: campi con valore diverso fra evento e homestatus: {', '.join(diversi) or 'nessuno'}")
+    # 5. registrazione
+    reg = r["controlli_registro"]
+    say(f"\n5) REGISTRAZIONE: controlli {len(reg)}, webhook presente in {sum(1 for x in reg if x['presente'])}.")
+    # 6. fase naturale
+    f2 = finestre.get("fase 2 (naturale)")
+    if f2:
+        nat = [e for e in ev if f2[0] <= e["arrivo"] <= f2[1]]
+        cald = [e for e in nat if any(k.endswith("boiler_status") for k in wh_piatto(wh_home_evento(e)))]
+        say(f"\n6) FASE SENZA GESTI ({(f2[1] - f2[0]) / 60:.0f} minuti): {len(nat)} eventi; con la caldaia (boiler_status): {len(cald)}")
+        for e in cald:
+            say(f"     {datetime.fromtimestamp(e['arrivo']).strftime('%H:%M:%S')}  {wh_descrivi(e)}")
+        if not cald:
+            say("     Nessun cambio di caldaia in questa fase (il riscaldamento non e' partito ne' si e' fermato).")
+    err = r.get("errori_ricevitore") or []
+    say(f"\n7) ERRORI DEL RICEVITORE: {len(err)}")
+    for e in err:
+        say(f"  {datetime.fromtimestamp(e['ora']).strftime('%H:%M:%S')}  {e['tipo']}: {e['messaggio']}  [fase: {e['fase']}; da {e.get('da') or '?'}]")
+    if not err:
+        say("  Nessuno (se l'errore delle 10:48:50 non si ripresenta, resta solo da tenerlo d'occhio).")
+    # file
+    for lista in (r["eventi"], r["cambiamenti_netatmo"], r["passi"], err):
+        for x in lista:
+            for k in ("arrivo", "ora"):
+                if isinstance(x.get(k), float):
+                    x[k] = datetime.fromtimestamp(x[k]).isoformat(timespec="seconds")
+    write_dump("webhook_guidato.json", wh_pulisci(r))
+    say("\nFatto. Incolla qui il testo di questo riepilogo e allega diagnostica/webhook_guidato.json (controllalo prima col Blocco note: deve avere dentro del testo).")
+
+
 def wh_riepilogo(r):
     ev = r["eventi"]
     say("\n=== RIEPILOGO ===")
@@ -1216,7 +1561,7 @@ def wh_riepilogo(r):
 # --------------------------------------------------------------------------
 
 METEO_UA = "Mozilla/5.0 (compatible; pdc-strumenti/1.0)"
-METEO_CHIAVI = re.compile(r"hum|temp|dew|rain|wind|bar|press|time|date|updat|ts$|stamp|name|title", re.I)
+METEO_CHIAVI = re.compile(r"hum|temp|dew|rain|wind|bar|press|time|date|updat|ts$|stamp|name|title|solar|radi|sun|uv", re.I)
 
 
 def meteo_scarica(url, max_byte=2_000_000):
@@ -1326,6 +1671,8 @@ def cmd_meteo_prova(cfg, args):
             say(f"     {k} = {v}")
         hum = [(k, v) for k, v in valori if re.search(r"hum", k, re.I) and isinstance(v, (int, float, str))]
         say("\n=> Umidita' trovata: " + (", ".join(f"{k}={v}" for k, v in hum[:6]) if hum else "NESSUN campo con 'hum': guarda l'elenco qui sopra."))
+        sol = [(k, v) for k, v in valori if re.search(r"solar|radi|sun", k, re.I)]
+        say("=> Radiazione solare trovata: " + (", ".join(f"{k}={v}" for k, v in sol[:6]) if sol else "NESSUN campo con 'solar', 'radi' o 'sun': guarda l'elenco qui sopra."))
         ult = js.get("lastReceived") if isinstance(js, dict) else None
         if isinstance(ult, (int, float)) and ult > 1e11:          # millisecondi dal 1970
             minuti = (time.time() - ult / 1000) / 60
@@ -1562,7 +1909,7 @@ def _profilo_per_esterna(S, modo_a):
 def _profilo_orario(S):
     """Media per ora del giorno (0-23): com'e' una giornata tipica."""
     out = {}
-    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("umidita_esterna", "esterna.umidita"), ("radiazione_w_m2", "meteo.radiazione"), ("potenza_w", "pot.watt"),
+    for nome, serie in (("esterna", "ciclo.esterna"), ("casa", "casa.temperatura"), ("umidita_casa", "casa.umidita"), ("umidita_esterna", "esterna.umidita"), ("radiazione_w_m2", "esterna.radsolare"), ("potenza_w", "pot.watt"),
                         ("richiesta_calore_pct", "casa.richiesta_calore"), ("compressore_hz", "ciclo.freq_compressore"), ("mandata", "ciclo.mandata"),
                         ("acqua_calda", "acs.temperatura")):
         acc = {h: [] for h in range(24)}
@@ -1596,9 +1943,9 @@ def _giornaliero(S, kwh_giorno):
             giorni.setdefault(_giorno(ts), {}).setdefault(nome, []).append(v)
     acqua = {nome: _acqua_aria(S, st, su) for nome, (st, su) in (("acqua_aria_casa_g_m3", ("casa.temperatura", "casa.umidita")),
                                                                     ("acqua_aria_esterna_g_m3", ("ciclo.esterna", "esterna.umidita")))}
-    radiazione = {}
-    for ts, v in S.get("meteo.radiazione", []):
-        radiazione.setdefault(_giorno(ts), []).append(v)
+    radiazione = {}      # {giorno: {ora: [valori]}}: fino a ieri c'e' un valore orario (Stima Open-Meteo), da quando c'e' la stazione uno ogni 10 minuti (misura)
+    for ts, v in S.get("esterna.radsolare", []):
+        radiazione.setdefault(_giorno(ts), {}).setdefault(time.localtime(ts).tm_hour, []).append(v)
     out = {}
     for g in sorted(giorni):
         d = {}
@@ -1612,9 +1959,9 @@ def _giornaliero(S, kwh_giorno):
         for nome, per_giorno in acqua.items():
             if per_giorno.get(g) is not None:
                 d[nome] = per_giorno[g]
-        rad = radiazione.get(g, [])
-        if len(rad) >= 20:      # giorno quasi completo (Open-Meteo, dato orario): somma W/m2 orari = Wh/m2
-            d["radiazione_kwh_m2"] = round(sum(rad) / 1000, 2)
+        rad = radiazione.get(g, {})
+        if len(rad) >= 20:      # giorno quasi completo: media di ogni ora, poi somma dei W/m2 orari = Wh/m2
+            d["radiazione_kwh_m2"] = round(sum(sum(v) / len(v) for v in rad.values()) / 1000, 2)
         d["energia_kwh_contatore"] = kwh_giorno.get(g)
         d["campioni"] = sum(len(v) for v in giorni[g].values())
         out[g] = d
@@ -1979,6 +2326,14 @@ def main():
     w.add_argument("--sostituisci", action="store_true", help="con il metodo 'vecchio': procede anche se c'e' gia' un webhook registrato (verra' sostituito e poi tolto)")
     w.add_argument("--rinnova", action="store_true", help="rinnova il token Netatmo: SOLO a pannello fermo")
     w.add_argument("--elimina", action="store_true", help="non ascolta: toglie da Netatmo un webhook rimasto registrato")
+    wg = sub.add_parser("nt-webhook-guidato", help="prova MIRATA dei webhook Netatmo: gesti a copione, confronto con il polling, fase senza toccare niente (pannello anche acceso)")
+    wg.add_argument("--gesti", type=int, default=len(WH_COPIONE), help="quanti gesti del copione fare (default tutti; 0 = nessuno)")
+    wg.add_argument("--attesa", type=int, default=20, help="secondi di attesa dopo ogni gesto (default 20)")
+    wg.add_argument("--naturale", type=int, default=12, help="minuti della fase finale senza toccare niente (default 12)")
+    wg.add_argument("--sonda", type=int, default=20, help="ogni quanti secondi leggere homestatus per il confronto (default 20)")
+    wg.add_argument("--porta", type=int, default=0, help="porta locale del ricevitore (default: sceglie da sola)")
+    wg.add_argument("--url", help="indirizzo pubblico tuo invece del tunnel temporaneo")
+    wg.add_argument("--rinnova", action="store_true", help="rinnova il token Netatmo: SOLO a pannello fermo")
     g = sub.add_parser("rip-diag", help="diagnostica della ripartenza prevista dello Smarther (legge il database, pannello anche acceso)")
     g.add_argument("--db", help="percorso del database (di solito lo trova da solo)")
     g.add_argument("--ultime", type=int, default=15, help="quante pause mostrare, le ultime (default 15)")
@@ -2019,7 +2374,7 @@ def main():
         return
     {"st-devices": cmd_st_devices, "st-oauth": cmd_st_oauth,
      "st-dump": cmd_st_dump, "st-capacita": cmd_st_capacita, "st-osserva": cmd_st_osserva, "nt-dump": cmd_nt_dump,
-     "st-prova-refresh": cmd_st_prova_refresh, "nt-webhook-prova": cmd_nt_webhook_prova}[args.cmd](cfg, args)
+     "st-prova-refresh": cmd_st_prova_refresh, "nt-webhook-prova": cmd_nt_webhook_prova, "nt-webhook-guidato": cmd_nt_webhook_guidato}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

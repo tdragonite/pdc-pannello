@@ -117,10 +117,13 @@ def schema_impostazioni():
             _c("netatmo.home_id", "testo", "ID della casa"),
             _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
             _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
+            _c("netatmo.webhook_attivo", "bool", "Usa i webhook di Netatmo (solo se il tunnel Cloudflare è collegato)",
+               "Netatmo avvisa il pannello appena lo Smarther cambia qualcosa, e lo Smarther si legge davvero solo ogni 15 minuti. "
+               "Se il tunnel è spento o qualcosa non torna, il pannello legge come prima."),
         ]},
-        {"id": "stazione", "titolo": "Stazione meteo vicina (umidità esterna)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
+        {"id": "stazione", "titolo": "Stazione meteo vicina (umidità e sole)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
          "stazione WeatherLink vicina (non quello della pagina: lo trovi con «python pdc_strumenti.py meteo-prova», che lo stampa pronto da incollare; "
-         "se la stazione cambia, rilancialo). Il pannello legge l'umidità ogni 10 minuti e la mostra nella card Esterna della Dashboard. "
+         "se la stazione cambia, rilancialo). Il pannello ogni 10 minuti legge l'umidità, che mostra nella card Esterna della Dashboard, e la radiazione solare, che salva per le analisi. "
          "Vuoto = funzione spenta.", "campi": [
             _c("stazione.url", "testo", "Indirizzo dei dati", "Deve iniziare con https:// e stare su weatherlink.com."),
         ]},

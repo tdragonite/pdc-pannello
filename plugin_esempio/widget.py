@@ -4,7 +4,8 @@
 #
 # SICUREZZA:
 #  1. l'indirizzo contiene un segreto casuale, generato al primo avvio: senza non si arriva a nulla (404);
-#  2. risponde solo a GET e non puo' comandare niente: niente storico, niente impostazioni, nessun comando;
+#  2. risponde solo a GET e non puo' comandare niente: niente impostazioni, nessun comando. Lo storico e' solo quello di casa
+#     (temperatura, umidita', target) delle ultime ore, e solo se lo chiede l'orologio con «?storico=N»;
 #  3. se l'indirizzo finisce in mano a qualcuno, scrivi un segreto nuovo (o svuota il campo), ricarica i plugin e aggiorna lo script:
 #     il vecchio indirizzo smette di funzionare;
 #  4. il pannello limita comunque la frequenza delle richieste;
@@ -12,18 +13,23 @@
 #     lo stesso 404 di un indirizzo sbagliato, quindi aprire l'indirizzo da un browser non mostra niente. Il token si scrive anche
 #     nello script di Scriptable. (Se il campo e' vuoto il controllo e' spento, come nella 1.0.)
 import hmac
+import sqlite3
 import re
 import secrets
 import time
 
 INFO = {
     "titolo": "Widget iPhone",
-    "versione": "1.1.1",
+    "versione": "1.3.0",
     "interfaccia": 1,
     "descrizione": "Indirizzo di sola lettura per il widget dell'iPhone (app Scriptable): casa, termostato, pompa di calore, acqua calda e fuori, "
                    "già pronti da mostrare. Non può comandare niente.",
 }
 CHANGELOG = [
+    {"v": "1.3.0", "data": "2026-11-14T11:00", "titolo": "Storico per l’orologio", "righe": [
+        ["n", "Storico di casa", "Con «?storico=6» (da 1 a 24 ore) la risposta contiene anche temperatura di casa, umidità e target a passi di 5 minuti, per il grafico dell’app dell’orologio. Senza il parametro la risposta è identica a prima, quindi il widget dell’iPhone non cambia."]]},
+    {"v": "1.2.0", "data": "2026-11-13T19:30", "titolo": "Finestre aperte e «Puoi chiudere»", "righe": [
+        ["n", "Riquadro in basso", "Mostra anche «Finestre aperte» e «Puoi chiudere», come la Dashboard (stessa priorità: sta prima della ripartenza). Nel widget dell’iPhone senza aggiornare lo script appaiono in grigio."]]},
     {"v": "1.1.1", "data": "2026-11-11T14:35", "titolo": "Ripartenza senza «domani»", "righe": [
         ["m", "Riquadro della ripartenza", "Dice sempre «Riparte alle 00:15», anche quando è dopo mezzanotte: con «domani» la scritta non entrava nel riquadro e l’ora veniva tagliata."]]},
     {"v": "1.1.0", "data": "2026-11-04T18:00", "titolo": "Token del widget", "righe": [
@@ -81,6 +87,50 @@ def ferma(ctx):
     _ctx.clear()
 
 
+STORICO_PASSO = 300       # secondi: un punto ogni 5 minuti
+STORICO_SERIE = (("t", "casa.temperatura", 1), ("u", "casa.umidita", 0), ("s", "casa.setpoint", 1))
+
+
+def storico(ctx, ore, ora=None):
+    """Casa, umidita' e target delle ultime `ore` ore: liste di n punti, uno ogni 5 minuti (null dove manca il dato).
+    I punti sono medie su 5 minuti; il target (che si salva solo quando cambia) e' portato avanti fino al cambio successivo."""
+    ora = int(ora or time.time())
+    n = ore * 3600 // STORICO_PASSO
+    fine = ora // STORICO_PASSO * STORICO_PASSO            # inizio dell'intervallo in corso (l'ultimo punto)
+    da = fine - (n - 1) * STORICO_PASSO
+    out = {"passo": STORICO_PASSO, "da": da, "n": n}
+    db = ctx._app.db
+    with sqlite3.connect(f"file:{db.path}?mode=ro", uri=True, timeout=10) as c:
+        for k, serie, dec in STORICO_SERIE:
+            if k == "s":    # a gradini: l'ultimo valore noto prima di ogni intervallo (si parte da quello di prima dell'inizio)
+                righe = c.execute("SELECT ts, valore FROM misure WHERE serie=? AND ts>=? AND ts<? ORDER BY ts",
+                                  (serie, da - 86400, fine + STORICO_PASSO)).fetchall()
+                v, i, lista = None, 0, []
+                for b in range(n):
+                    limite = da + (b + 1) * STORICO_PASSO
+                    while i < len(righe) and righe[i][0] < limite:
+                        v = righe[i][1]
+                        i += 1
+                    lista.append(None if v is None else round(v, dec))
+            else:
+                lista = [None] * n
+                for b, v in c.execute("SELECT (ts-?)/?, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<? GROUP BY 1",
+                                      (da, STORICO_PASSO, serie, da, fine + STORICO_PASSO)):
+                    if 0 <= b < n:
+                        lista[b] = round(v, dec) if dec else int(round(v))
+            out[k] = lista
+    return out
+
+
+def _ore(query):
+    """«?storico=N»: le ore richieste (0 = nessuno storico)."""
+    try:
+        v = int((query or {}).get("storico", [0])[0])
+    except (TypeError, ValueError, IndexError):
+        v = 0
+    return max(0, min(24, v))
+
+
 def riepilogo(d, ora=None):
     """Dalla Dashboard al riepilogo per il widget: testi gia' pronti, lo script di Scriptable deve solo disegnarli."""
     ora = ora or time.time()
@@ -92,6 +142,8 @@ def riepilogo(d, ora=None):
         chip = {"testo": "Smarther non collegato", "tipo": "bad"}
     elif c.get("ts") and ora - c["ts"] > CASA_VECCHIO:
         chip = {"testo": "Dato delle " + hhmm(c["ts"]), "tipo": "warn"}
+    elif c.get("vent"):
+        chip = {"testo": "Puoi chiudere" if c["vent"].get("s") == "chiudi" else "Finestre aperte", "tipo": "chiudi" if c["vent"].get("s") == "chiudi" else "finestre"}
     elif c.get("richiesta"):
         chip = {"testo": "Il termostato chiama", "tipo": "chiama"}
     elif c.get("riparte"):
@@ -148,5 +200,12 @@ def richiesta(rich):
     except Exception:
         ctx.log.exception("widget: errore nel riepilogo")
         return 500, {"errore": "errore interno"}
-    ctx.stato("ultima richiesta alle " + time.strftime("%H:%M"))
+    ore = _ore(rich.query)
+    if ore and not ctx.demo:
+        try:
+            r["storico"] = storico(ctx, ore)
+        except Exception:
+            ctx.log.exception("widget: errore nello storico")      # il riepilogo parte lo stesso, senza storico
+            r["storico"] = None
+    ctx.stato("ultima richiesta alle " + time.strftime("%H:%M") + (f" (con storico {ore} h)" if ore else ""))
     return r

@@ -24,13 +24,14 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.25.9"
+VERSIONE = "0.26.1"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
 import base64
 import copy
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -38,6 +39,7 @@ import logging.handlers
 import math
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import sys
@@ -277,7 +279,7 @@ TEMPLATE = {
     },
     "stazione": {
         "_nota": "Facoltativo. Indirizzo dei DATI di una stazione meteo WeatherLink vicina (non quello della pagina: lo stampa 'python pdc_strumenti.py meteo-prova'). "
-                 "Il pannello ne legge l'umidita' esterna ogni 10 minuti e la mostra nella card Esterna. Vuoto = funzione spenta.",
+                 "Il pannello ne legge ogni 10 minuti l'umidita' esterna (la mostra nella card Esterna) e la radiazione solare (la salva per le analisi). Vuoto = funzione spenta.",
         "url": "",
     },
     "tariffa": {
@@ -302,7 +304,8 @@ TEMPLATE = {
         },
     },
     "netatmo": {"client_id": "", "client_secret": "", "access_token": "", "refresh_token": "",
-                "expires_at": 0, "home_id": "", "room_id": ""},
+                "expires_at": 0, "home_id": "", "room_id": "",
+                "webhook_attivo": True, "webhook_segreto": ""},
     "dispositivi": {
         "_nota": "Facoltativo. Gli IP servono solo per mostrare l'IP e ricavare il MAC nella pagina Dispositivi. "
                  "I loghi si mettono nella cartella 'dati/loghi' (smarther.svg, samsung.svg, ...).",
@@ -478,6 +481,11 @@ class DB:
             with closing(self._c()) as c:
                 c.execute("PRAGMA journal_mode=WAL")
                 c.executescript(SCHEMA)
+                with c:      # dal 0.25.9 la radiazione solare si chiama esterna.radsolare (non viene dal meteo): si rinomina quella gia' salvata; idempotente
+                    c.execute("UPDATE OR IGNORE misure SET serie='esterna.radsolare' WHERE serie='meteo.radiazione'")
+                    c.execute("DELETE FROM misure WHERE serie='meteo.radiazione'")
+                    c.execute("UPDATE OR IGNORE ultimo SET serie='esterna.radsolare' WHERE serie='meteo.radiazione'")
+                    c.execute("DELETE FROM ultimo WHERE serie='meteo.radiazione'")
         except sqlite3.DatabaseError as e:
             raise ErroreDB(f"Il database ({self.path}) non si apre: {e}. Probabilmente e' danneggiato (blackout, disco pieno?). "
                            "Con il pannello fermo puoi rimettere l'ultima copia con:  python pdc_pannello.py ripristina") from e
@@ -862,13 +870,10 @@ def estrai_netatmo(js, room_id, ts):
         n("casa.temperatura", stanza.get("therm_measured_temperature"))
         n("casa.umidita", stanza.get("humidity"))
         n("casa.setpoint", stanza.get("therm_setpoint_temperature"), lento=True)
-        n("casa.richiesta_pct", stanza.get("heating_power_request"))
         if stanza.get("id"):
             rec.stati["info.nt.stanza_id"] = str(stanza["id"])
         if stanza.get("therm_setpoint_mode"):
             rec.stati["casa.modo"] = str(stanza["therm_setpoint_mode"])
-        if "open_window" in stanza:
-            rec.stati["casa.finestra_aperta"] = "si" if stanza["open_window"] else "no"
         if "reachable" in stanza:
             rec.stati["casa.raggiungibile"] = "si" if stanza["reachable"] else "no"
     if modulo:
@@ -1207,10 +1212,171 @@ class ServizioST(Raccoglitore):
             self.app.eventi.chiudi("st_pat")
 
 
+WH_LETTURA_REALE = 15 * 60     # con i webhook attivi lo Smarther si legge "davvero" solo ogni 15 minuti
+WH_LENTE = ("casa.setpoint", "casa.wifi")   # grandezze "lente" (si risalvano solo se cambiano, vedi DB.salva)
+WH_ATTESA_CONFERMA = 15        # secondi: dopo due eventi di setpoint non ordinabili si rilegge una volta sola
+
+
+class WebhookNT(threading.Thread):
+    """Webhook Netatmo: registra il nostro indirizzo (quello del tunnel Cloudflare) e controlla ogni minuto che ci resti.
+    Se qualcosa non va (tunnel spento, registrazione persa, dati che non tornano) il pannello fa come prima: legge lo Smarther
+    a intervalli. Il silenzio di Netatmo NON e' un problema (gli eventi arrivano solo quando qualcosa cambia): a controllare i dati
+    resta sempre la lettura vera ogni 15 minuti."""
+
+    def __init__(self, app, servizio):
+        super().__init__(daemon=True, name="webhook-nt")
+        self.app, self.srv = app, servizio
+        self.fermo = threading.Event()
+        self.registrato = False     # trovato nell'elenco di Netatmo all'ultimo controllo
+        self.ultimo_ok = 0          # ora dell'ultimo controllo riuscito
+        self.sospeso_fino = 0
+        self.motivo = "in avvio"
+        self.guasto_dal = None      # da quando non va pur dovendo andare (solo per l'avviso)
+        self.ricevuti = self.rifiutati = 0
+        self.ult_evento = 0
+
+    # ---- stato
+    def attivo(self):
+        t = time.time()
+        return self.registrato and t >= self.sospeso_fino and t - self.ultimo_ok < 300
+
+    def sospendi(self, secondi, motivo):
+        self.sospeso_fino = time.time() + secondi
+        self.motivo = motivo
+        self.guasto_dal = self.guasto_dal or time.time()
+        log.warning("Webhook Netatmo sospesi per %d minuti: %s", secondi // 60, motivo)
+
+    def stato(self):
+        return {"attivo": self.attivo(), "motivo": "" if self.attivo() else self.motivo, "ricevuti": self.ricevuti,
+                "rifiutati": self.rifiutati, "ultimo_evento": int(self.ult_evento) or None}
+
+    def _cfg(self):
+        return self.app.cfg.leggi()["netatmo"]
+
+    def segreto(self):
+        s = self._cfg().get("webhook_segreto") or ""
+        if len(s) < 20:
+            s = secrets.token_urlsafe(24)
+            self.app.cfg.aggiorna(lambda raw: raw.setdefault("netatmo", {}).update(webhook_segreto=s))
+        return s
+
+    # ---- ricezione (chiamata dal server web)
+    def ricevi(self, grezzo, firma):
+        """Un messaggio di Netatmo. -> codice HTTP. Non solleva mai eccezioni."""
+        try:
+            corpo = json.loads(grezzo.decode("utf-8"))
+            if not isinstance(corpo, dict):
+                return 400
+            if corpo.get("push_type") == "webhook_activation":    # messaggio di prova alla registrazione: senza dati
+                return 200
+            chiave = (self._cfg().get("client_secret") or "").encode()
+            atteso = hmac.new(chiave, grezzo, hashlib.sha256).hexdigest()
+            if not chiave or not firma or not hmac.compare_digest(atteso, firma.strip().lower()):
+                self.rifiutati += 1
+                return 401
+            self.ricevuti += 1
+            self.ult_evento = time.time()
+            self.srv.applica_evento(corpo)
+            return 200
+        except (ValueError, UnicodeDecodeError):
+            return 400
+        except Exception:
+            log.exception("webhook Netatmo: errore nel trattare un messaggio")
+            return 200      # il messaggio e' arrivato: non serve che Netatmo lo ripeta
+
+    # ---- registrazione
+    def _api(self, metodo, corpo=None):
+        h = {"Authorization": "Bearer " + self.app.token_nt.get(), "Accept": "application/json"}
+        dati = None
+        if corpo is not None:
+            h["Content-Type"] = "application/json"
+            dati = json.dumps(corpo).encode()
+        code, js = http_json(metodo, NT_BASE + "/webhooks/v1/", h, dati)
+        if code >= 400:
+            raise classifica("Netatmo", code, js)
+        return js
+
+    def _fuori(self, motivo, guasto=False):
+        self.registrato = False
+        self.motivo = motivo
+        if guasto:
+            self.guasto_dal = self.guasto_dal or time.time()
+        else:
+            self.guasto_dal = None
+        self._avviso()
+
+    def _avviso(self):
+        ev = self.app.eventi
+        if self.guasto_dal and time.time() - self.guasto_dal > 600:
+            ev.apri("nt_webhook", "I webhook Netatmo non funzionano (" + self.motivo + "): il pannello legge lo Smarther a intervalli, "
+                    "come prima. Niente di grave.", "avviso")
+        elif not self.guasto_dal:
+            ev.chiudi("nt_webhook")
+
+    def controlla(self):
+        n = self._cfg()
+        if not n.get("webhook_attivo", True):
+            return self._fuori("spenti nelle impostazioni")
+        tun = tunnel(self.app).stato()
+        if not tun["configurato"]:
+            return self._fuori("tunnel Cloudflare non configurato")
+        if not tun["collegato"]:
+            return self._fuori("tunnel Cloudflare non collegato")
+        base = tun["indirizzo"]
+        url = f"{base}/nt/{self.segreto()}"
+        testo = json.dumps(self._api("GET"))
+        if url not in testo:
+            altri = re.findall(r"https?://[^\s\"'\\]+", testo)
+            nostri = [u for u in altri if u.startswith(base + "/nt/")]
+            if [u for u in altri if u not in nostri]:
+                return self._fuori("su Netatmo c'e' gia' un altro webhook (non lo tocco)", guasto=True)
+            if nostri:       # il nostro, ma con un segreto vecchio: Netatmo ne ammette uno solo per account
+                self._api("DELETE")
+            self._api("POST", {"url": url})
+            if url not in json.dumps(self._api("GET")):
+                return self._fuori("Netatmo non conferma la registrazione", guasto=True)
+            log.info("Webhook Netatmo registrato")
+        self.registrato, self.ultimo_ok = True, time.time()
+        if time.time() >= self.sospeso_fino:
+            self.motivo, self.guasto_dal = "", None
+        else:
+            self.guasto_dal = self.guasto_dal or self.sospeso_fino - 3600
+        self._avviso()
+
+    def run(self):
+        self.fermo.wait(20)      # lascia partire prima la lettura normale
+        while not self.fermo.is_set():
+            try:
+                self.controlla()
+            except ErroreConfig as e:
+                self._fuori(str(e))
+            except ErroreAPI as e:
+                self._fuori("Netatmo non risponde (" + e.messaggio + ")", guasto=True)
+            except Exception:
+                log.exception("webhook Netatmo: errore nel controllo")
+                self._fuori("errore interno", guasto=True)
+            self.fermo.wait(60)
+
+
 class ServizioNT(Raccoglitore):
     def __init__(self, app):
         super().__init__(app, "nt")
         self.ult_info = 0          # ultima lettura della modalita' della casa (homesdata)
+        self.mem = None            # lo Smarther "in memoria": {"num": {serie: valore}, "stati": {serie: testo}}, dopo una lettura vera
+        self.mem_lock = threading.Lock()
+        self.ult_reale = 0         # ora dell'ultima lettura vera di homestatus
+        self.seq = {"room": None, "mod": None}   # ultimo numero di sequenza visto negli eventi
+        self.setp_chiave = (None, 0)             # (sequenza, orario d'inizio) dell'ultimo evento di setpoint applicato
+        self.forza_reale = False
+        self.divergenze = 0
+        self._timer = None
+        self.wh = WebhookNT(app, self)
+        self.wh.fermo = self.fermo
+
+    def start(self):
+        super().start()
+        if not self.app.demo:
+            self.wh.start()
 
     def intervallo(self):
         return max(60, int(self.app.cfg.leggi()["generale"]["intervallo_netatmo_secondi"]))
@@ -1229,6 +1395,11 @@ class ServizioNT(Raccoglitore):
 
     def passo(self):
         cfg = self.app.cfg.leggi()["netatmo"]
+        ts = int(time.time())
+        # webhook attivi e lettura vera recente: si salva lo stato tenuto in memoria (aggiornato dagli eventi), senza chiamare Netatmo
+        if (self.mem is not None and not self.forza_reale and self.wh.attivo() and ts - self.ult_reale < WH_LETTURA_REALE):
+            return self._salva_da_memoria(ts)
+        forzata, self.forza_reale = self.forza_reale, False
         home = cfg.get("home_id")
         if not home:
             homes = (self._get("/api/homesdata").get("body") or {}).get("homes") or []
@@ -1238,7 +1409,8 @@ class ServizioNT(Raccoglitore):
             self.app.cfg.aggiorna(lambda raw: raw.setdefault("netatmo", {}).update(home_id=home))
         js = self._get("/api/homestatus", {"home_id": home})
         ts = int(time.time())
-        if ts - self.ult_info > 120:  # la modalita' della casa (hg = spento) sta solo in homesdata
+        in_wh = self.wh.attivo()
+        if ts - self.ult_info > (WH_LETTURA_REALE - 60 if in_wh else 120):  # la modalita' della casa (hg = spento) sta solo in homesdata
             self.ult_info = ts
             try:
                 self.app.db.salva(estrai_netatmo_casa(self._get("/api/homesdata")), ts)
@@ -1247,7 +1419,143 @@ class ServizioNT(Raccoglitore):
         rec = estrai_netatmo(js, cfg.get("room_id"), ts)
         if not rec.num and not rec.stati:
             raise ErroreAPI("richiesta", 200, "Netatmo: risposta senza dati dello Smarther")
+        cambiati = self.app.db.salva(rec, ts)
+        self._sincronizza(rec, js, cfg.get("room_id"), ts, in_wh and not forzata)   # la lettura di conferma non conta come 'divergenza'
+        return cambiati
+
+    # ---- stato in memoria
+    def _sincronizza(self, rec, js, room_id, ts, in_wh):
+        """Dopo una lettura vera: confronta con la memoria (se i webhook erano attivi) e la rimette a zero."""
+        nuovo = {"num": {s: v for s, _t, v, _l in rec.num}, "stati": dict(rec.stati)}
+        with self.mem_lock:
+            if in_wh and self.mem is not None and time.time() - self.wh.ult_evento > 30:
+                diverso = []
+                for s, v in nuovo["num"].items():
+                    m = self.mem["num"].get(s)
+                    if s in ("casa.wifi",):
+                        continue
+                    if m is None or abs(m - v) > (0.5 if s == "casa.umidita" else 0.05):
+                        diverso.append(s)
+                if self.mem["stati"].get("casa.modo") != nuovo["stati"].get("casa.modo"):
+                    diverso.append("casa.modo")
+                self.divergenze = self.divergenze + 1 if diverso else 0
+                if diverso:
+                    log.warning("Webhook Netatmo: la lettura vera non coincide con gli eventi (%s)", ", ".join(diverso))
+                if self.divergenze >= 2:
+                    self.divergenze = 0
+                    self.wh.sospendi(3600, "i dati dei webhook non coincidevano con la lettura vera")
+            self.mem, self.ult_reale = nuovo, ts
+            home = (js.get("body") or {}).get("home") or {}
+            st = next((r.get("therm_setpoint_start_time") for r in home.get("rooms") or []
+                       if str(r.get("id")) == str(nuovo["stati"].get("info.nt.stanza_id"))), None)
+            if isinstance(st, int) and (self.setp_chiave[1] or 0) < st:
+                self.setp_chiave = (self.setp_chiave[0], st)
+
+    def _salva_da_memoria(self, ts):
+        rec = Rec()
+        with self.mem_lock:
+            for s, v in self.mem["num"].items():
+                rec.agg_num(s, ts, v, s in WH_LENTE)
+            for k in ("casa.modo", "casa.raggiungibile"):
+                if k in self.mem["stati"]:
+                    rec.stati[k] = self.mem["stati"][k]
         return self.app.db.salva(rec, ts)
+
+    @staticmethod
+    def _ordine(seq, inizio, cur):
+        """Confronta un evento di setpoint con l'ultimo applicato: 'nuovo', 'vecchio', 'uguale' o 'conflitto'
+        (sequenza e orario d'inizio che non si accordano). cur = (sequenza, orario d'inizio)."""
+        cs, ci = cur
+        if seq is not None and cs is not None and seq != cs:
+            if seq > cs:
+                return "nuovo"
+            return "conflitto" if (inizio is not None and ci is not None and inizio > ci) else "vecchio"
+        if inizio is None or ci is None:
+            return "uguale" if seq is not None and seq == cs else "nuovo"
+        return "nuovo" if inizio > ci else "vecchio" if inizio < ci else "uguale"
+
+    def applica_evento(self, corpo, ts=None):
+        """Un evento dei webhook: aggiorna la memoria, scrive subito sul database i valori cambiati e avvisa le pagine aperte.
+        Eventi piu' vecchi di quello gia' visto (arrivano a volte alla rovescia) si ignorano. Due eventi di setpoint che non
+        si riescono a ordinare (stessa sequenza e stesso secondo d'inizio, valori diversi: due tocchi rapidi sull'app)
+        si applicano nell'ordine d'arrivo e, una volta sola, poco dopo si rilegge Netatmo per sapere chi ha ragione."""
+        ts = ts or int(time.time())
+        home = (corpo.get("extra_params") or {}).get("home")
+        if not isinstance(home, dict):
+            return []
+        rec, ambiguo = Rec(), False
+        with self.mem_lock:
+            if self.mem is None:
+                return []           # nessuna lettura vera ancora: si parte da quella
+            num, stati = self.mem["num"], self.mem["stati"]
+            rid, mid = stati.get("info.nt.stanza_id"), stati.get("info.nt.id")
+
+            def cambia(serie, val):
+                val = _num(val)
+                if val is not None and num.get(serie) != val:
+                    num[serie] = val
+                    rec.agg_num(serie, ts, val, serie in WH_LENTE)
+
+            for r in home.get("rooms") or []:
+                if not isinstance(r, dict) or (rid and str(r.get("id")) != str(rid)):
+                    continue
+                seq = r.get("sequence_id") if isinstance(r.get("sequence_id"), int) else None
+                vecchio = seq is not None and self.seq["room"] is not None and seq < self.seq["room"]
+                if not vecchio:
+                    cambia("casa.temperatura", r.get("therm_measured_temperature"))
+                    cambia("casa.umidita", r.get("humidity"))
+                if "therm_setpoint_temperature" in r or "therm_setpoint_mode" in r:
+                    inizio = r.get("therm_setpoint_start_time")
+                    inizio = inizio if isinstance(inizio, int) else None
+                    ordine = self._ordine(seq, inizio, self.setp_chiave) if (seq is not None or inizio is not None) else "nuovo"
+                    if ordine != "vecchio":
+                        nuovo_sp = _num(r.get("therm_setpoint_temperature"))
+                        if ordine in ("uguale", "conflitto") and nuovo_sp is not None and num.get("casa.setpoint") not in (None, nuovo_sp):
+                            ambiguo = True
+                        elif ordine == "conflitto":
+                            ambiguo = True
+                        cambia("casa.setpoint", nuovo_sp)
+                        modo = r.get("therm_setpoint_mode")
+                        if modo and stati.get("casa.modo") != str(modo):
+                            stati["casa.modo"] = rec.stati["casa.modo"] = str(modo)
+                        if ordine != "uguale" or self.setp_chiave == (None, 0):
+                            self.setp_chiave = (seq if seq is not None else self.setp_chiave[0], inizio if inizio is not None else self.setp_chiave[1])
+                if seq is not None and (self.seq["room"] is None or seq > self.seq["room"]):
+                    self.seq["room"] = seq
+            for m in home.get("modules") or []:
+                if not isinstance(m, dict) or (m.get("id") != mid if mid else m.get("type") != "BNS"):
+                    continue
+                seq = m.get("sequence_id") if isinstance(m.get("sequence_id"), int) else None
+                if seq is not None and self.seq["mod"] is not None and seq < self.seq["mod"]:
+                    continue
+                if "boiler_status" in m:
+                    cambia("casa.richiesta_calore", 1.0 if m["boiler_status"] else 0.0)
+                cambia("casa.wifi", m.get("wifi_strength"))
+                if seq is not None:
+                    self.seq["mod"] = seq
+        cambiati = self.app.db.salva(rec, ts) if (rec.num or rec.stati) else []
+        if cambiati:
+            for cb in list(self.app.bus):
+                try:
+                    cb(cambiati)
+                except Exception:
+                    log.exception("errore in un ascoltatore dati")
+        if ambiguo:
+            self._pianifica_lettura(WH_ATTESA_CONFERMA)
+        return cambiati
+
+    def _pianifica_lettura(self, secondi):
+        with self.mem_lock:
+            if self._timer is not None:
+                return          # una lettura e' gia' in programma: basta quella
+            self._timer = threading.Timer(secondi, self._lettura_forzata)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _lettura_forzata(self):
+        self._timer = None
+        self.forza_reale = True
+        self.sveglia.set()
 
 
 def cartella_log(base):
@@ -1509,7 +1817,7 @@ main{min-width:0;padding:22px 26px 40px}
 .gr .cur-tx,#eff .cur-tx{fill:var(--txt);font-size:11.5px;font-variant-numeric:tabular-nums}
 .gr .cur-tx .nd{fill:var(--mut)}
 .bordo-vuoto{stroke:#8793a8;stroke-opacity:.4;stroke-width:1;stroke-dasharray:3 3}
-.bordo-vuoto.fin{stroke:#23a876;stroke-opacity:1}[data-fin]{cursor:pointer}
+.bordo-vuoto.fin{stroke:#23a876;stroke-opacity:1}[data-fin]{cursor:pointer}.fin-scegli #grafici svg[data-id=casa]{cursor:crosshair}
 .gl{stroke:rgba(255,255,255,.06)}.gv{stroke:rgba(255,255,255,.035)}
 .cur{stroke:rgba(255,255,255,.32);stroke-width:1}
 .legg{display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:flex-end;font-size:12.5px;color:var(--mut)}
@@ -1844,6 +2152,12 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 /* riquadri dell'ultimo ciclo: si dividono sempre tutta la larghezza, qualunque sia il loro numero */
 .fermo-g>.tile{flex:1 1 0;min-width:0}
 .fermo-g>.tile:first-child{flex-grow:1.5}
+/* corsa con riscaldamento E acqua calda (testo lungo «Riscaldamento + acqua calda»): scheda abbastanza larga = UNA riga sola con il primo riquadro piu' largo
+   (cosi' la scheda non diventa piu' alta di quella accanto); scheda stretta (telefono, < 470px) = «Per» da solo sulla prima riga, durata ed energia sotto.
+   Si guarda la larghezza della SCHEDA (container query), non quella della finestra. */
+.fermo-g.due>.tile:first-child{flex-grow:2.3}
+.fermo-w .fermo-g.due>.tile:first-child .t-txt{font-size:14px}
+@container (max-width:470px){.fermo-g.due{flex-wrap:wrap}.fermo-g.due>.tile:first-child{flex:1 1 100%}}
 
 .cg .tile,.tc .tile{background:rgba(var(--c),.09);border-color:rgba(var(--c),.3)}
 .come-b{font:inherit;font-size:12px;line-height:inherit;font-weight:400;color:var(--acs);background:none;border:0;padding:0;cursor:pointer;white-space:nowrap}
@@ -2146,7 +2460,10 @@ function tooltipTimeline(e) {
   const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), t = da + f * span;
   const i = m.segmenti.findIndex(x => t >= x[0] && t <= x[1]); if (i < 0) return;
   const s = m.segmenti[i], re = (m.reali || [])[i] || [s[0], s[1]], tip = $('#tip');   // orario e durata veri: il primo e l'ultimo tratto possono iniziare prima / finire dopo la finestra
-  tip.innerHTML = `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(re[0])}–${hhmm(re[1])} (${durata(Math.round((re[1] - re[0]) / 60))})`;
+  const g = (m.gruppi || [])[i];   // riscaldamento ripreso dopo l'acqua calda (compressore mai fermo): le info sono quelle totali, col primo tratto
+  tip.innerHTML = g
+    ? `<b style="color:${COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(g[0])}–${hhmm(g[1])} (${durata(g[2])})`
+    : `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(re[0])}–${hhmm(re[1])} (${durata(Math.round((re[1] - re[0]) / 60))})`;
   tip.hidden = false;
   const mezzo = tip.offsetWidth / 2 + 2;   // larghezza vera del tooltip: sta sempre dentro la barra
   tip.style.left = Math.max(mezzo, Math.min(r.width - mezzo, f * r.width)) + 'px';
@@ -2241,7 +2558,7 @@ function prestazioni(d) {
     const giorno = u && !stesso ? new Date(u.inizio * 1000).toLocaleDateString('it-IT', {day: '2-digit', month: '2-digit'}) + ' ' : '';
     const tile = (et, v) => `<div class="tile"><small>${et}</small><b class="t-txt">${v}</b></div>`;
     html('prest', `<div class="fermo-w"><div class="fermo-t"><span class="pill up">Fermo</span><span class="fermo-q">${u ? `Ultimo ciclo · ${giorno}${hhmm(u.inizio)}–${hhmm(u.fine)}` : 'Nessun ciclo negli ultimi 3 giorni'}</span></div>` +
-      (u ? `<div class="fermo-g">${tile('Per', u.modo === 'acs' ? 'Acqua calda' : 'Riscaldamento')}${tile('Durata', dur)}${u.kwh != null ? tile('Energia', num(u.kwh, 1) + ' <i>kWh</i>') : ''}</div>` : '') + '</div>');
+      (u ? `<div class="fermo-g${(u.modo || '').includes('+') ? ' due' : ''}">${tile('Per', (u.modo || 'casa').split('+').map((x, k) => { const n = x === 'acs' ? 'Acqua calda' : 'Riscaldamento'; return k ? n.toLowerCase() : n; }).join(' + '))}${tile('Durata', dur)}${u.kwh != null ? tile('Energia', num(u.kwh, 1) + ' <i>kWh</i>') : ''}</div>` : '') + '</div>');
     if (rt) rt.textContent = '';
     return;
   }
@@ -2395,6 +2712,23 @@ function fasceFinestre(fin, da, a, X, y0, h) {
       + (ok ? '' : [[f.da, x0], [f.a, x1]].filter(([t]) => t > da + 1 && t < a - 1).map(([, x]) => `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${y0}" y2="${y0 + h}" class="bordo-vuoto fin"/>`).join(''));
   }).join('');
 }
+// scelta a mano di una finestra: due clic sul grafico della temperatura ambiente (S.finScegli: 0 spento, 1 aspetta l'inizio, 2 aspetta la fine)
+function finSelSvg(sel, da, a, X, y0, h) {
+  if (!sel) return '';
+  const x0 = X(Math.max(sel[0], da)), x1 = X(Math.min(sel[1], a));
+  return `<rect x="${x0.toFixed(1)}" y="${y0}" width="${Math.max(2, x1 - x0).toFixed(1)}" height="${h}" fill="${COLS.fin}" opacity=".12"/>`
+    + [sel[0], sel[1]].filter(t => t > da && t < a).map(t => `<line x1="${X(t).toFixed(1)}" x2="${X(t).toFixed(1)}" y1="${y0}" y2="${y0 + h}" class="bordo-vuoto fin"/>`).join('');
+}
+function finSelAgg() {      // aggiorna la fascia senza ridisegnare il grafico
+  const svg = document.querySelector('#grafici svg[data-id="casa"]'), d = S.dati; if (!svg || !d) return;
+  const L = +svg.dataset.l, pw = +svg.dataset.pw, g = svg.querySelector('.fin-sel'); if (!g) return;
+  g.innerHTML = finSelSvg(S.finSel, d.da, d.a, t => L + (t - d.da) / (d.a - d.da) * pw, +svg.dataset.t0, +svg.dataset.ph);
+}
+function finHint() {
+  const h = $('#fin-hint'); if (!h) return;
+  h.textContent = !S.finScegli ? '' : S.finScegli === 1 ? (S.finSel ? 'Fatto: correggi con i campi se serve e premi «Segnala finestra». Un nuovo clic sul grafico ricomincia.' : 'Clicca sul grafico Temperatura ambiente l’inizio della finestra.') : 'Ora clicca la fine della finestra.';
+}
+function finScegliChiudi() { S.finScegli = 0; S.finSel = null; document.body.classList.remove('fin-scegli'); finSelAgg(); finHint(); }
 function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
   if (S.tel || a - da > 7 * 86400) return '';      // su telefono solo le fasce (si guarda e basta); su periodi lunghi le icone si accavallano: restano le fasce
   return fin.map((f, i) => {
@@ -2405,12 +2739,14 @@ function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
 }
 
 function scheletroAnalisi() {
+  S.finScegli = 0; S.finSel = null; document.body.classList.remove('fin-scegli');   // la barra nasce chiusa
   return `<div class="card"><div class="ch"><h2>Modo di funzionamento</h2><div class="riep" id="tl-riep"></div></div>
     <div class="tlw" id="tlw"><div id="tl"></div><div class="tip" id="tip" hidden></div></div><div class="assi" id="assi"></div></div>
     <div class="custom" id="fin-man" hidden>
       <label>Da<input type="datetime-local" id="fin-da"></label>
       <label>A<input type="datetime-local" id="fin-a"></label>
       <button id="fin-ok" type="button">Segnala finestra</button>
+      <span class="mut" id="fin-hint" style="flex-basis:100%;font-size:13px"></span>
     </div>
     <div id="grafici"></div>
     <ul class="nota-cv lun"><li><i class="in"></i><span>Le zone colorate dietro le linee indicano quando la PdC scalda la casa (rosso) o l'acqua (blu); le righe oblique grigie, i periodi senza dati.</span></li>
@@ -2532,7 +2868,7 @@ function graficoLineare(g, d, W, H) {
     return `<rect ${r} fill="rgba(135,147,168,.05)"/><rect ${r} fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('');
   }).join('');
   s += g.id === 'casa' ? fasceRichiesta(d.richiesta || [], d.da, d.a, X, T, ph) : fasce(d.modi.segmenti, d.da, d.a, X, T, ph);
-  if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph);
+  if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph) + `<g class="fin-sel">${finSelSvg(S.finSel, d.da, d.a, X, T, ph)}</g>`;
   if (g.id === 'casa') s += fasceRichiesta(d.richiesta || [], d.da, d.a, X, T + ph - 7, 7, .9);   // striscia piena in basso: quando lo Smarther chiede caldo
   s += sc.tick.map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, sc.passo < 1 ? 1 : 0)}</text>`).join('');
   if (doppio) s += sc1.tick.map(v => `<text x="${W - R + 4}" y="${(Y1(v) + 4).toFixed(1)}" text-anchor="start" fill="${colAsse1}">${num(v, sc1.passo < 1 ? 1 : 0)}</text>`).join('');
@@ -2703,7 +3039,7 @@ function muoviCursore(e) {
 // ---------- spostarsi indietro nel tempo col mouse (6h / 24h): si trascina un grafico, al rilascio si caricano le ore di quel periodo ----------
 let sposta = null;
 function spostaGiu(e) {
-  if (e.pointerType !== 'mouse' || e.button !== 0 || S.pagina !== 'analisi' || !S.dati || S.range === 'custom' || S.zoom) return;
+  if (e.pointerType !== 'mouse' || e.button !== 0 || S.pagina !== 'analisi' || !S.dati || S.range === 'custom' || S.zoom || S.finScegli) return;
   const el = e.target.closest && e.target.closest('#grafici, #tlw'); if (!el) return;
   const svg = document.querySelector('#grafici svg'), pw = el.id === 'tlw' || !svg ? el.getBoundingClientRect().width : +svg.dataset.pw;
   sposta = {x0: e.clientX, dx: 0, on: false, sec: (S.dati.a - S.dati.da) / Math.max(1, pw)};
@@ -2961,16 +3297,30 @@ document.addEventListener('click', ev => {
   const t = ev.target, vecchio = document.getElementById('fin-pan'), ic = t.closest && t.closest('[data-fin]');
   if (t.id === 'fin-add') {
     const b = $('#fin-man'), a = ora();
-    $('#fin-da').value = loc(a - 3600); $('#fin-a').value = loc(a); b.hidden = !b.hidden; if (!b.hidden) b.scrollIntoView({block: 'center', behavior: 'smooth'}); return;
+    $('#fin-da').value = loc(a - 3600); $('#fin-a').value = loc(a); b.hidden = !b.hidden;
+    if (b.hidden) finScegliChiudi(); else { S.finSel = null; S.finScegli = 1; document.body.classList.add('fin-scegli'); finHint(); b.scrollIntoView({block: 'center', behavior: 'smooth'}); }
+    return;
   }
   if (t.id === 'fin-ok') {
     const da = new Date($('#fin-da').value).getTime() / 1000, a = new Date($('#fin-a').value).getTime() / 1000;
     if (!isFinite(da) || !isFinite(a) || a <= da || a - da > 86400) { toast('Controlla le date: "A" deve venire dopo "Da" (al massimo 24 ore).', true); return; }
-    finInvia('/api/finestre/manuale', {da: Math.floor(da), a: Math.floor(a)}).then(v => { if (v) { $('#fin-man').hidden = true; finRidisegna(); toast('Finestra segnata.'); } });
+    finInvia('/api/finestre/manuale', {da: Math.floor(da), a: Math.floor(a)}).then(v => { if (v) { $('#fin-man').hidden = true; finScegliChiudi(); finRidisegna(); toast('Finestra segnata.'); } });
     return;
+  }
+  const sv = S.finScegli && !ic && t.closest && t.closest('#grafici svg[data-id="casa"]'), d = S.dati;
+  if (sv && d && S.dpag === 'analisi') {      // un clic sul grafico: prima l'inizio, poi la fine (se vengono al contrario si scambiano)
+    const r = sv.getBoundingClientRect(), L = +sv.dataset.l, pw = +sv.dataset.pw, f = Math.max(0, Math.min(1, (ev.clientX - r.left - L) / pw));
+    const tt = Math.round((d.da + f * (d.a - d.da)) / 60) * 60;
+    if (S.finScegli === 1) { S.finSel = [tt, tt]; S.finScegli = 2; } else { S.finSel = [Math.min(S.finSel[0], tt), Math.max(S.finSel[0], tt)]; S.finScegli = 1; }
+    $('#fin-da').value = loc(S.finSel[0]); $('#fin-a').value = loc(S.finSel[1]); finSelAgg(); finHint(); return;
   }
   if (vecchio && !(t.closest && t.closest('#fin-pan')) && !ic) vecchio.remove();
   if (ic) { if (vecchio) vecchio.remove(); finPannello(ic); }
+});
+document.addEventListener('change', ev => {
+  if (!S.finScegli || (ev.target.id !== 'fin-da' && ev.target.id !== 'fin-a')) return;
+  const da = new Date($('#fin-da').value).getTime() / 1000, a = new Date($('#fin-a').value).getTime() / 1000;
+  if (isFinite(da) && isFinite(a) && a > da) { S.finSel = [da, a]; S.finScegli = 1; finSelAgg(); finHint(); }
 });
 // Esc o lo scorrimento della pagina chiudono i pannellini sospesi (meteo e finestra)
 function chiudiPannelli() { if (S.meteoAperto) chiudiMeteo(); const v = document.getElementById('fin-pan'); if (v) v.remove(); }
@@ -2982,16 +3332,28 @@ window.addEventListener('scroll', chiudiPannelli, {passive: true});
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
+  ['webhook', 'Smarther in tempo reale', 'Con il tunnel attivo, Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
   ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
   ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo da casa, con lucchetto e conferma.'],
   ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
-  ['indietro', 'Grafici indietro nel tempo', 'Analisi, da computer: trascina un grafico verso destra per guardare le ore (o il giorno) prima; «Torna ad adesso» rimette la diretta.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
-  {v: '0.25.9', quando: '13 novembre 2026', titolo: 'Puoi chiudere su Telegram', righe: [   // VENT
+  {v: '0.26.1', quando: '19 novembre 2026', titolo: 'Riprese del riscaldamento', righe: [
+    ['s', 'Riscaldamento dopo l’acqua calda', 'Quando l’acqua calda parte a compressore acceso e, finita, il riscaldamento riprende senza che la pompa si sia fermata, quel secondo tratto non è più contato come un avvio nuovo: in Efficienza il numero di cicli, la durata media e i cicli brevi lo uniscono al riscaldamento di prima, e l’avviso «Cicli troppo brevi» non scatta più per queste riprese.'],
+    ['s', 'Tooltip del grafico Modo di funzionamento', 'Passando sul riscaldamento che riprende dopo l’acqua calda, il tooltip mostra l’inizio del primo tratto, la fine dell’ultimo e la durata totale del riscaldamento, invece del solo secondo tratto.'],
+    ['s', 'Scheda «Ultimo ciclo» a pompa ferma', 'Mostra l’intera corsa del compressore, dall’accensione allo spegnimento: se in mezzo c’è stata l’acqua calda, orario, durata ed energia sono quelli di tutta la corsa e il tipo diventa «Riscaldamento + acqua calda». Prima compariva solo l’ultimo tratto.'],
+  ]},
+  {v: '0.26.0', quando: '13 novembre 2026', titolo: 'Webhook Netatmo', righe: [
+    ['n', 'Webhook Netatmo', 'Con il tunnel Cloudflare collegato, il pannello si fa avvisare da Netatmo appena lo Smarther cambia (temperatura, setpoint, caldaia): i valori arrivano dopo circa un secondo e lo Smarther si legge davvero solo ogni 15 minuti. Se il tunnel è spento, la registrazione salta o i dati non tornano, legge a intervalli come prima. Si spegne in Impostazioni → Netatmo. Non salviamo più «finestra aperta» e «richiesta di calore in %», che i webhook non portano e che non servivano. Nella pagina Dispositivi, scheda Termostato, una riga dice se sono attivi e perché no.'],
+  ]},
+  {v: '0.25.9', quando: '13 novembre 2026', titolo: 'Telegram, COP e radiazione solare', righe: [
     ['n', 'Messaggio «Puoi chiudere»', 'Quando dopo una finestra aperta nella Dashboard compare «Puoi chiudere», ti arriva anche un messaggio Telegram, con suoneria, una sola volta per apertura. Lo spegni o ne cambi il testo dalle impostazioni, in «Quando avvisarti».'],   // VENT
-  ]},   // VENT
+    ['n', 'Tilde sul COP', 'Quando il salto tra mandata e ritorno è piccolo (sotto i 5 °C) il COP si legge a gradini di 1 °C e può sbagliare fino al 20%: in Efficienza, nel grafico giornaliero e nel riepilogo Telegram il numero ha una «~» davanti. Con acqua calda e curva alta non compare.'],
+    ['m', 'Sole dalla stazione', 'La radiazione solare ora è quella misurata dalla stazione meteo vicina, ogni 10 minuti, e non più la stima di Open-Meteo del giorno dopo. Si salva col nome «esterna.radsolare»: al primo avvio i giorni già salvati, anche quelli di Open-Meteo, passano al nome nuovo e lo storico resta in un unico campo. Non cambia niente di visibile: serve alle analisi.'],
+    ['m', 'Impostazioni → Collegamenti', 'La sezione della stazione meteo ora dice che legge umidità e sole, non solo l’umidità.'],
+    ['m', 'Due clic sul grafico', 'Premendo «Segnala finestra» ora basta cliccare sul grafico Temperatura ambiente l’inizio e poi la fine: una fascia verde mostra cosa stai segnando e i campi Da e A si riempiono da soli. A mano si può ancora correggere.'],
+  ]},
   {v: '0.25.8', quando: '12 novembre 2026', titolo: 'Target della mandata', righe: [
     ['s', 'Target del riscaldamento giusto', 'Il «Target» della scheda Riscaldamento era sempre 25°: è il setpoint della modalità a temperatura fissa, che la pompa non usa. Ora è la mandata che chiede la curva climatica alla temperatura esterna di adesso.'],
     ['s', 'Linea «Target mandata» in Analisi', 'Da adesso la linea tratteggiata segue la curva climatica, con i valori FSV di quel momento: se cambi la curva si vede un gradino. I giorni già registrati restano com’erano (25° fissi).'],
@@ -3314,10 +3676,12 @@ function meseCosto(m) {
       <div class="nota">Stima: media dei giorni passati, indicativa.${m.dettaglio ? ' <span class="come-b" data-come="eurm" role="button" tabindex="0" aria-expanded="false">Dettaglio</span>' : ''}</div>${m.dettaglio ? `<p class="come-t" id="come-eurm" hidden><span class="nw">Riscaldamento <b>${euro(m.dettaglio.casa)}</b></span><span class="nw">Acqua calda <b>${euro(m.dettaglio.acs)}</b></span><span class="nw">Standby <b>${euro(m.dettaglio.riposo)}</b></span></p>` : ''}</article>`;
 }
 const ICONA_SCARICA = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg>';
+const copApprossimato = (d, ...dt) => dt.some(x => x != null && x < d.cop_dt_min);   // stessa soglia del server
 function disegnaEfficienza(d) {
   EF.d = d;
   const t = d.tot, nodati = d.giorni.reduce((a, g) => a + g.nodati_min, 0);
   const cop = v => v == null ? '—' : num(v, 2);
+  const copT = (v, ...dt) => cop(v) === '—' || !copApprossimato(d, ...dt) ? cop(v) : '~' + cop(v);   // «~» se il salto termico e' piccolo: COP approssimato
   const pt = d.prec ? d.prec.tot : {};
   const cov = d.copertura, bassa = [cov.casa, cov.acs].some(v => v != null && v < 80);
   const avvDati = bassa || nodati > 120 ? `<div class="avviso warn"><span>⚠️</span><div>Dati incompleti${bassa ? `: per il calcolo del COP ho potenza e portata solo per il ${Math.min(cov.casa ?? 100, cov.acs ?? 100)}% del tempo di funzionamento` : ''}${nodati > 120 ? ` (mancano circa ${durata(nodati)} di dati nel periodo)` : ''}. I valori sono più bassi o meno precisi del reale.</div></div>` : '';
@@ -3325,8 +3689,8 @@ function disegnaEfficienza(d) {
   ${avvisoConf(d)}${avvDati}
   <div class="cards c5">
     <article class="card acc" style="--acc:var(--est)"><div class="ch"><span class="et">COP medio</span></div>
-      <div class="val"><div class="n"><span>${cop(t.cop)}</span></div></div>
-      <div class="sub"><span>Risc. <b>${cop(t.cop_casa)}</b></span><span>Acqua <b>${cop(t.cop_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
+      <div class="val"><div class="n"><span>${copT(t.cop, t.dt_casa, t.dt_acs)}</span></div></div>
+      <div class="sub"><span>Risc. <b>${copT(t.cop_casa, t.dt_casa)}</b></span><span>Acqua <b>${copT(t.cop_acs, t.dt_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
     <article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Energia elettrica</span></div>
       <div class="val"><div class="n"><span>${fm(t.el_casa + t.el_acs + t.el_riposo)}</span><i>kWh</i></div></div>
       <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span><span class="come-b" data-come="eur" role="button" tabindex="0" aria-expanded="false">Costo stimato</span> <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${d.prezzo_kwh > 0 ? `<p class="come-t" id="come-eur" hidden><span class="nw">Riscaldamento <b>${euro(t.el_casa * d.prezzo_kwh)}</b></span><span class="nw">Acqua calda <b>${euro(t.el_acs * d.prezzo_kwh)}</b></span><span class="nw">Standby <b>${euro(t.el_riposo * d.prezzo_kwh)}</b></span></p>` : ''}${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
@@ -3459,7 +3823,7 @@ function lineeGiorni(giorni, W, tip, tel) {
     }
     s += `<path d="${p}" fill="none" stroke="${c}" stroke-width="2.2" stroke-linejoin="round"/>`;
     giorni.forEach((g, i) => { if (g[k] != null) { const tv = tip && tip[g.giorno] && tip[g.giorno][k];
-      s += `<circle cx="${X(i).toFixed(1)}" cy="${Y(g[k]).toFixed(1)}" r="${n > 14 ? 2.5 : 3.5}" fill="${c}"><title>${giornoBreve(g)}: COP ${num(g[k], 2)}${tv != null ? ` · tipico per ${num(tip[g.giorno].esterna, 0)}°C esterni: ${num(tv, 2)}` : ''}</title></circle>`; } });
+      s += `<circle cx="${X(i).toFixed(1)}" cy="${Y(g[k]).toFixed(1)}" r="${n > 14 ? 2.5 : 3.5}" fill="${c}"><title>${giornoBreve(g)}: COP ${copApprossimato(EF.d, g[k === 'cop_casa' ? 'dt_casa' : 'dt_acs']) ? '~' : ''}${num(g[k], 2)}${tv != null ? ` · tipico per ${num(tip[g.giorno].esterna, 0)}°C esterni: ${num(tv, 2)}` : ''}</title></circle>`; } });
   });
   return s + curEf(T, ph, [COLS.casa, COLS.acs]) + '</svg>';
 }
@@ -4655,7 +5019,7 @@ def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300, estendi=True):
     a = min(int(a), ora)
     da = int(da)
     if a <= da:
-        return {"segmenti": [], "minuti": {m: 0 for m in MODI}, "reali": []}
+        return {"segmenti": [], "minuti": {m: 0 for m in MODI}, "reali": [], "gruppi": []}
     inizio = da - da % passo
     freq = campioni_freq(db, inizio, a)
     freq_ts = sorted(freq)
@@ -4706,7 +5070,7 @@ def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300, estendi=True):
             dopo = calcola_modi(db, s0, min(a + MODI_ESTENSIONE, ora), tolleranza, ora, passo, False)["segmenti"]
             if dopo and dopo[0][2] == m:
                 reali[-1][1] = dopo[0][1]
-    return {"segmenti": segmenti, "minuti": minuti, "reali": reali}
+    return {"segmenti": segmenti, "minuti": minuti, "reali": reali, "gruppi": gruppi_riscaldamento(segmenti, reali)}
 
 
 def tolleranza(app):
@@ -5088,61 +5452,6 @@ def meteo_info(app):
 
 
 # --------------------------------------------------------------------------
-# Radiazione solare oraria (Open-Meteo, archivio): si salva dopo mezzanotte per i giorni appena finiti, serie «meteo.radiazione» (W/m²)
-# --------------------------------------------------------------------------
-
-RADIAZIONE_URL = "https://archive-api.open-meteo.com/v1/archive"
-RADIAZIONE_GIORNI = 8          # ogni volta si rilegge anche qualche giorno prima (Open-Meteo corregge i dati a posteriori)
-RADIAZIONE_DOPO = 10800        # secondi dopo mezzanotte (ora locale) prima di chiedere: le 3:00
-RADIAZIONE_RIPROVA = 900       # se la richiesta fallisce si riprova dopo 15 minuti
-
-
-def radiazione_leggi(js):
-    """JSON di Open-Meteo -> [(epoch, W/m²)], saltando le ore senza valore. ValueError se la risposta non è quella attesa."""
-    try:
-        t, v = js["hourly"]["time"], js["hourly"]["shortwave_radiation"]
-    except (TypeError, KeyError):
-        raise ValueError("risposta inattesa") from None
-    if not isinstance(t, list) or not isinstance(v, list) or len(t) != len(v):
-        raise ValueError("risposta inattesa")
-    return [(int(a), round(float(b), 1)) for a, b in zip(t, v)
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(b, bool) and b >= 0]
-
-
-def radiazione_lavoro(app, lat, lon, ora=None):
-    """Se oggi non è ancora stata letta, scarica la radiazione dei giorni appena finiti e la salva. -> True se ha salvato."""
-    ora = int(ora if ora is not None else time.time())
-    lt = time.localtime(ora)
-    oggi = time.strftime("%Y-%m-%d", lt)
-    mezzanotte = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
-    st = app.__dict__.setdefault("rad_st", {"prossimo": 0})
-    if ora < st["prossimo"] or ora < mezzanotte + RADIAZIONE_DOPO or app.db.meta_get("rad_giorno") == oggi:
-        return False
-    da = time.strftime("%Y-%m-%d", time.localtime(mezzanotte - RADIAZIONE_GIORNI * 86400 + 3600))
-    a = time.strftime("%Y-%m-%d", time.localtime(mezzanotte - 3600))
-    url = "%s?latitude=%s&longitude=%s&start_date=%s&end_date=%s&hourly=shortwave_radiation&timezone=Europe%%2FRome&timeformat=unixtime" % (
-        RADIAZIONE_URL, lat, lon, da, a)
-    try:
-        code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
-        if code != 200:
-            raise ValueError("HTTP %s" % code)
-        punti = radiazione_leggi(js)
-        if not punti:
-            raise ValueError("nessun dato")
-        rec = Rec()
-        for ts, w in punti:
-            rec.agg_num("meteo.radiazione", ts, w)
-        app.db.salva(rec, ora)
-        app.db.meta_set("rad_giorno", oggi)
-        log.info("Radiazione solare: salvate %d ore (%s - %s)", len(punti), da, a)
-        return True
-    except Exception as e:  # noqa: BLE001  - senza rete o con Open-Meteo giù si riprova dopo
-        st["prossimo"] = ora + RADIAZIONE_RIPROVA
-        log.debug("Radiazione solare: lettura non riuscita (%s)", e)
-        return False
-
-
-# --------------------------------------------------------------------------
 # Umidità esterna da una stazione meteo vicina (WeatherLink, dati grezzi): un solo valore nella card «Esterna»
 # --------------------------------------------------------------------------
 
@@ -5186,11 +5495,63 @@ def stazione_leggi(js):
     return round(um, 1), ts
 
 
+RADIAZIONE_MAX = 1500          # W/m²: oltre e' un dato rotto, non si salva
+
+
+def stazione_url_radiazione(url):
+    """Indirizzo dei dati attuali della stessa stazione (quello che legge la pagina «Station Summary»): .../getData/<codice> -> .../summaryData/<codice>. '' se l'indirizzo non e' di quel tipo."""
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return ""
+    m = re.match(r"^/embeddablePage/getData/([0-9A-Za-z]+)/?$", p.path or "")
+    return f"{p.scheme}://{p.netloc}/embeddablePage/summaryData/{m.group(1)}" if m else ""
+
+
+def radiazione_leggi(js):
+    """JSON di summaryData -> (W/m², epoch dell'ultimo dato o None). ValueError se la stazione non manda la radiazione o il valore non ha senso."""
+    if not isinstance(js, dict) or not isinstance(js.get("currConditionValues"), list):
+        raise ValueError("risposta inattesa")
+    voce = next((x for x in js["currConditionValues"] if isinstance(x, dict) and x.get("sensorDataName") == "Solar Rad"), None)
+    if voce is None:
+        raise ValueError("la stazione non manda la radiazione solare")
+    grezza = voce.get("convertedValue", voce.get("value"))
+    try:
+        w = float(str(grezza).replace(",", "."))
+    except ValueError:
+        raise ValueError(f"radiazione non leggibile ({str(grezza)[:20]})") from None
+    if not 0 <= w <= RADIAZIONE_MAX:
+        raise ValueError("radiazione fuori scala")
+    ult = js.get("lastReceived")
+    ts = int(ult / 1000) if isinstance(ult, (int, float)) and not isinstance(ult, bool) and ult > 1e11 else None
+    return round(w, 1), ts
+
+
 def _stazione_stato(app, url):
     st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "vecchio": False})
     if st["url"] != url:
         st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0, vecchio=False)
     return st
+
+
+def _stazione_radiazione(app, url, ora):
+    """Radiazione solare della stazione (serie esterna.radsolare, W/m²): dai dati di prima fino a ieri c'e' la stima oraria di Open-Meteo, da qui in poi la misura.
+    Un errore qui non tocca la lettura dell'umidita'."""
+    u = stazione_url_radiazione(url)
+    if not u:
+        return
+    try:
+        code, js = http_json("GET", u, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=STAZIONE_ATTESA)
+        if code != 200:
+            raise ValueError(f"HTTP {code}")
+        w, ts = radiazione_leggi(js)
+        if ora - (ts or ora) > STAZIONE_VECCHIO:              # la stazione non aggiorna: non si salva un valore vecchio come fosse di adesso
+            return
+        rec = Rec()
+        rec.agg_num("esterna.radsolare", ts or ora, w)
+        app.db.salva(rec, ora)
+    except Exception as e:  # noqa: BLE001 - un extra: non deve mai fermare nient'altro
+        log.debug("Stazione meteo: radiazione non salvata (%s)", e)
 
 
 def _stazione_lavoro(app, url):
@@ -5216,6 +5577,7 @@ def _stazione_lavoro(app, url):
                     app.db.salva(rec, ora)
                 except Exception as e:                        # noqa: BLE001 - non deve mai fermare la lettura
                     log.debug("Stazione meteo: umidita' non salvata (%s)", e)
+                _stazione_radiazione(app, url, ora)
     except Exception as e:
         st["falliti"] += 1
         st["errore"] = str(e)[:120]
@@ -5264,10 +5626,6 @@ def esterni_giro(app):
         if time.time() >= st["prossimo"]:
             _meteo_lavoro(app, *cfg)
         prossimi.append(st["prossimo"])
-        try:
-            radiazione_lavoro(app, *cfg)
-        except Exception as e:  # noqa: BLE001
-            log.debug("Radiazione solare: %s", e)
     return max(15, min(60, min(prossimi) - int(time.time()))) if prossimi else 60
 
 
@@ -5681,7 +6039,7 @@ def api_dashboard(app, q):
                  "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
                                              num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
                  "vent": vent_stato(db, ora, (stz or {}).get("umidita"), num("ciclo.esterna"), num("casa.temperatura")),   # VENT
-                 "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
+                 "richiesta": num("casa.richiesta_calore") == 1.0,
                  "ts": ts_("casa.temperatura"), "spark": q_griglia(db, "casa.temperatura", da, a, 60)[0],
                  "spark_um": q_griglia(db, "casa.umidita", da, a, 60)[0]},
         "prestazioni": {k: num(f"ciclo.{k}") for k in ("freq_compressore", "freq_target", "vel_pompa", "portata",
@@ -5718,17 +6076,28 @@ def info_accesso_st(app):
 
 
 def ultimo_ciclo(db, ora):
-    """Ultimo ciclo del compressore concluso (ultimi 3 giorni): {inizio, fine, modo, kwh} oppure None.
-    I kWh vengono dal contatore (en.totale_wh) e si danno solo se la differenza e' leggibile."""
+    """Ultima CORSA del compressore conclusa (ultimi 3 giorni): {inizio, fine, modo, kwh} oppure None.
+    Una corsa va dall'accensione allo spegnimento del compressore: i tratti attaccati (l'inizio di uno e' la fine del precedente, quindi il
+    compressore non si e' mai fermato: es. riscaldamento -> acqua calda -> riscaldamento) sono UN solo ciclo. `modo` e' 'casa', 'acs' oppure
+    'casa+acs' / 'acs+casa' (nell'ordine in cui sono avvenuti); durata e kWh sono quelli dell'intera corsa, acqua calda compresa (kWh dal
+    contatore, en.totale_wh, e si danno solo se la differenza e' leggibile)."""
     try:
         cicli = cicli_compressore(db, ora - 3 * 86400, ora, ora)
     except Exception:
         return None
     if not cicli:
         return None
-    i, f, m = cicli[-1]
+    k = len(cicli) - 1
+    while k > 0 and cicli[k][0] == cicli[k - 1][1]:      # compressore mai fermo tra un tratto e l'altro
+        k -= 1
+    corsa = cicli[k:]
+    i, f = corsa[0][0], corsa[-1][1]
+    modi = []
+    for _, _, m in corsa:
+        if m not in modi:
+            modi.append(m)
     kwh = energia_kwh(db, i, f)
-    return {"inizio": i, "fine": f, "modo": m, "kwh": kwh if kwh and kwh > 0 else None}
+    return {"inizio": i, "fine": f, "modo": "+".join(modi), "kwh": kwh if kwh and kwh > 0 else None}
 
 
 def info_refresh(app):
@@ -6188,6 +6557,51 @@ def cicli_compressore(db, da, a, ora, gap=900):
     return cicli
 
 
+def unisci_riprese(cicli):
+    """[(inizio, fine, modo)] -> [[inizio, fine, modo, secondi_effettivi, riprese]].
+    Quando l'acqua calda parte a compressore acceso e, finita, il riscaldamento riprende senza che il compressore si sia mai fermato, quel
+    secondo tratto di riscaldamento e' una RIPRESA, non un nuovo avvio: lo si unisce al riscaldamento precedente della stessa corsa
+    (inizio del primo, fine dell'ultimo; i secondi effettivi sono la somma dei soli tratti di riscaldamento, l'acqua calda in mezzo non conta)."""
+    out, ult_fine, ult_casa = [], None, None
+    for i, f, m in cicli:
+        if ult_fine is None or i != ult_fine:          # il compressore e' ripartito da fermo (o c'e' un buco nei dati)
+            ult_casa = None
+        if m == "casa" and ult_casa is not None:
+            out[ult_casa][1] = f
+            out[ult_casa][3] += f - i
+            out[ult_casa][4] += 1
+        else:
+            out.append([i, f, m, f - i, 0])
+            if m == "casa":
+                ult_casa = len(out) - 1
+        ult_fine = f
+    return out
+
+
+def gruppi_riscaldamento(segmenti, reali):
+    """Per ogni tratto del grafico «Modo di funzionamento»: None oppure [inizio, fine, minuti_riscaldamento, minuti_acqua_calda]
+    quando il tratto e' un riscaldamento che fa parte di una corsa con piu' tratti di riscaldamento separati da acqua calda
+    (compressore mai fermo). Inizio e fine sono quelli del primo e dell'ultimo tratto: cosi' il tooltip del secondo tratto mostra le info totali."""
+    gr = [None] * len(segmenti)
+    k = 0
+    while k < len(segmenti):
+        if segmenti[k][2] not in ("casa", "acs"):
+            k += 1
+            continue
+        j = k
+        while j + 1 < len(segmenti) and segmenti[j + 1][2] in ("casa", "acs") and segmenti[j + 1][0] == segmenti[j][1]:
+            j += 1
+        casa = [x for x in range(k, j + 1) if segmenti[x][2] == "casa"]
+        if len(casa) >= 2:
+            g = [reali[casa[0]][0], reali[casa[-1]][1],
+                 round(sum(reali[x][1] - reali[x][0] for x in casa) / 60),
+                 round(sum(reali[x][1] - reali[x][0] for x in range(casa[0], casa[-1] + 1) if segmenti[x][2] == "acs") / 60)]
+            for x in casa:
+                gr[x] = g
+        k = j + 1
+    return gr
+
+
 def _mediana(v):
     v = sorted(v)
     n = len(v)
@@ -6346,6 +6760,19 @@ def elenco_sbrinamenti(db, da, a, ora):
             "elenco": out[:SBR_MAX_ELENCO]}
 
 
+COP_DT_MIN = 5.0       # sotto questo salto termico medio (mandata - ritorno) il COP e' solo approssimato: sensori a gradini di 1 °C, errore fino al ±20%
+
+
+def _dt_medio(s):
+    """[somma dei salti termici, celle] -> salto medio in °C, o None."""
+    return round(s[0] / s[1], 1) if s[1] else None
+
+
+def cop_approssimato(dt_casa, dt_acs):
+    """True se il COP (del solo riscaldamento, dell'acqua o totale) poggia su un salto termico medio sotto COP_DT_MIN."""
+    return any(x is not None and x < COP_DT_MIN for x in (dt_casa, dt_acs))
+
+
 def calcola_efficienza(db, da, a, tol, ora, passo=300):
     """Per ogni giorno locale: energia elettrica e calore prodotto stimato (portata x salto termico)
     separati tra riscaldamento casa e acqua calda, COP, cicli. Il calore e' una STIMA."""
@@ -6373,7 +6800,8 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         g = giorni.setdefault(chiave, {
             "giorno": chiave, "ts": _ore_locali(lt),
             "el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
-            "el_cop": {"casa": 0.0, "acs": 0.0}, "min": {"casa": 0, "acs": 0}, "est": [], "nodati_min": 0})
+            "el_cop": {"casa": 0.0, "acs": 0.0}, "min": {"casa": 0, "acs": 0}, "est": [], "nodati_min": 0,
+            "dt": {"casa": [0.0, 0], "acs": [0.0, 0]}})
         if m == "nodati":
             g["nodati_min"] += passo // 60
             continue
@@ -6390,6 +6818,8 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
                 kwh_el, kwh_th = w / 1000.0 * ore_h, kw * ore_h
                 g["calore"][m] += kwh_th
                 g["el_cop"][m] += kwh_el
+                g["dt"][m][0] += max(0.0, mand[i] - rit[i])      # salto termico medio: serve a dire quanto e' (im)preciso il COP
+                g["dt"][m][1] += 1
                 coperte[m] += 1
                 if i in est and kwh_el > 0:
                     b = int(math.floor(est[i] / 2.0)) * 2
@@ -6411,6 +6841,7 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
             "cop_acs": round(g["calore"]["acs"] / g["el_cop"]["acs"], 2) if g["el_cop"]["acs"] > 0.05 else None,
             "cop": round(cal / el_cop, 2) if el_cop > 0.1 else None,
             "min_casa": g["min"]["casa"], "min_acs": g["min"]["acs"],
+            "dt_casa": _dt_medio(g["dt"]["casa"]), "dt_acs": _dt_medio(g["dt"]["acs"]),
             "esterna": round(sum(g["est"]) / len(g["est"]), 1) if g["est"] else None,
             "nodati_min": g["nodati_min"]})
     tot = {"el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
@@ -6424,9 +6855,9 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
     cal_c = tot["calore"]["casa"] + tot["calore"]["acs"]
     # cicli: un "ciclo" e' un tratto continuo in un modo
     cicli = {}
-    runs = cicli_compressore(db, da, a, ora)
+    runs = unisci_riprese(cicli_compressore(db, da, a, ora))     # le riprese del riscaldamento dopo l'acqua calda non sono nuovi avvii
     for m in ("casa", "acs"):
-        durate = [(f - i) / 60 for i, f, mm in runs if mm == m]
+        durate = [x[3] / 60 for x in runs if x[2] == m]
         cicli[m] = {"n": len(durate), "media_min": round(sum(durate) / len(durate), 1) if durate else None,
                     "brevi": sum(1 for d in durate if d < 10), "max_min": round(max(durate), 1) if durate else None}
     sbr = elenco_sbrinamenti(db, da, a, ora)
@@ -6436,12 +6867,14 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         curva_cop[m] = [{"da": b, "a": b + 2, "cop": round(d[0] / d[1], 2), "ore": round(d[2] * ore_h, 1)}
                         for b, d in sorted(bins[m].items()) if d[2] >= 6 and d[1] > 0]
     return {
-        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti, "sbr": sbr,
+        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti, "sbr": sbr, "cop_dt_min": COP_DT_MIN,
         "tot": {"el_casa": round(tot["el"]["casa"], 1), "el_acs": round(tot["el"]["acs"], 1),
                 "el_riposo": round(tot["el"]["riposo"], 1),
                 "calore_casa": round(tot["calore"]["casa"], 1), "calore_acs": round(tot["calore"]["acs"], 1),
                 "cop_casa": cop("casa"), "cop_acs": cop("acs"),
                 "cop": round(cal_c / el_c, 2) if el_c > 0.1 else None,
+                "dt_casa": _dt_medio([sum(g["dt"]["casa"][0] for g in giorni.values()), sum(g["dt"]["casa"][1] for g in giorni.values())]),
+                "dt_acs": _dt_medio([sum(g["dt"]["acs"][0] for g in giorni.values()), sum(g["dt"]["acs"][1] for g in giorni.values())]),
                 "ore_casa": round(modi["minuti"]["casa"] / 60, 1), "ore_acs": round(modi["minuti"]["acs"] / 60, 1)},
         "copertura": {m: round(100.0 * coperte[m] / totali_celle[m]) if totali_celle[m] else None
                       for m in coperte},
@@ -6812,6 +7245,27 @@ class Gestore(BaseHTTPRequestHandler):
     def do_POST(self):
         self._smista()
 
+    def _webhook_nt(self, app, p):
+        """POST di Netatmo con un evento dello Smarther. Risponde subito; i tentativi con indirizzo sbagliato hanno un limite."""
+        self._chiudi = True
+        nt = next((s for s in app.servizi if getattr(s, "sigla", "") == "nt"), None)
+        ok = (nt is not None and self.command == "POST"
+              and hmac.compare_digest(p[4:].encode(), (nt.wh._cfg().get("webhook_segreto") or "-").encode()))
+        if not ok:
+            if _troppo_veloce("-", ip_client(self)):
+                return self._json({"errore": "troppe richieste"}, 429)
+            return self._invia(404, "Non trovato", "text/plain; charset=utf-8")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = -1
+        if n < 0 or n > 65536:
+            return self._invia(400 if n < 0 else 413, "richiesta non valida", "text/plain; charset=utf-8")
+        self._chiudi = False
+        corpo = self.rfile.read(n) if n else b""
+        codice = nt.wh.ricevi(corpo, self.headers.get("X-Netatmo-secret", ""))
+        return self._invia(codice, "ok" if codice == 200 else "errore", "text/plain; charset=utf-8")
+
     def _smista(self):
         app = self.server.app
         # Una richiesta con un corpo (POST) che poi nessuno legge lascerebbe quel corpo in coda sulla connessione, e verrebbe scambiato per la
@@ -6845,6 +7299,8 @@ class Gestore(BaseHTTPRequestHandler):
                 if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
                     return self._vai("/")   # gia' dentro (es. icona della Home salvata sulla pagina di login)
                 return self._invia(200, self._pagina("login.html", errore=""))
+            if p.startswith("/nt/"):          # webhook di Netatmo (pubblico: lo autentica il segreto nell'indirizzo + la firma del messaggio)
+                return self._webhook_nt(app, p)
             if p.startswith("/plugin/"):      # rotte pubbliche dei plugin (l'autenticazione e' del plugin)
                 return plugin_pubblico(app, self, p, q)
             autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
@@ -7078,7 +7534,6 @@ class Simulatore:
         n("casa.umidita", 52 + 6 * math.sin(ts / 7000) + 0.4 * (10 - s["out"]))
         n("casa.setpoint", 21, True)
         n("casa.richiesta_calore", 1.0 if self.dem else 0.0)
-        n("casa.richiesta_pct", 100 if self.dem else 0)
         n("casa.wifi", 51, True)
         if cicli:
             n("ciclo.esterna", s["out"])
@@ -7166,6 +7621,7 @@ TITOLI = {
     "nt_conn_limite": "Limite di richieste Netatmo",
     "nt_conn_server": "Server Netatmo",
     "nt_conn_richiesta": "Richiesta a Netatmo",
+    "nt_webhook": "Webhook Netatmo",
     "st_config": "Configurazione SmartThings",
     "nt_config": "Configurazione Netatmo",
     "st_script": "Script (lettura SmartThings)",
@@ -7665,8 +8121,8 @@ class Sentinella(threading.Thread):
         if on("cicli_brevi"):
             r = al["cicli_brevi"]
             da = ora - int(float(r["ore"]) * 3600)
-            brevi = [c for c in cicli_compressore(db, da, ora, ora)
-                     if c[2] == "casa" and (c[1] - c[0]) < float(r["durata_minima_min"]) * 60]
+            brevi = [c for c in unisci_riprese(cicli_compressore(db, da, ora, ora))     # una ripresa dopo l'acqua calda non e' un ciclo nuovo
+                     if c[2] == "casa" and c[3] < float(r["durata_minima_min"]) * 60]
             self.imposta("cicli_brevi", len(brevi) >= int(r["quanti"]),
                          f"{len(brevi)} cicli di riscaldamento sotto i {r['durata_minima_min']} minuti nelle ultime "
                          f"{num_it(r['ore'], 0)} ore: la pompa parte e si ferma troppo spesso.")
@@ -7855,7 +8311,7 @@ class Sentinella(threading.Thread):
         righe_notte = self._notte_righe(ora)
         if righe_notte:
             anom += "\n\n🌙 <b>Di notte</b>\n" + righe_notte
-        extra = {"energia": num_it(g["el_casa"] + g["el_acs"] + g["el_riposo"]), "cop": num_it(g["cop"], 2) if g["cop"] else "—",
+        extra = {"energia": num_it(g["el_casa"] + g["el_acs"] + g["el_riposo"]), "cop": ("~" if cop_approssimato(g["dt_casa"], g["dt_acs"]) else "") + num_it(g["cop"], 2) if g["cop"] else "—",
                  "ore_casa": num_it(g["min_casa"] / 60), "ore_acs": num_it(g["min_acs"] / 60), "cicli": e["cicli"]["casa"]["n"],
                  "casa_min": num_it(min(casa)) if casa else "—", "casa_max": num_it(max(casa)) if casa else "—",
                  "esterna": num_it(sum(est) / len(est)) if est else "—", "anomalie": anom,
@@ -7998,10 +8454,13 @@ def schema_impostazioni():
             _c("netatmo.home_id", "testo", "ID della casa"),
             _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
             _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
+            _c("netatmo.webhook_attivo", "bool", "Usa i webhook di Netatmo (solo se il tunnel Cloudflare è collegato)",
+               "Netatmo avvisa il pannello appena lo Smarther cambia qualcosa, e lo Smarther si legge davvero solo ogni 15 minuti. "
+               "Se il tunnel è spento o qualcosa non torna, il pannello legge come prima."),
         ]},
-        {"id": "stazione", "titolo": "Stazione meteo vicina (umidità esterna)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
+        {"id": "stazione", "titolo": "Stazione meteo vicina (umidità e sole)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
          "stazione WeatherLink vicina (non quello della pagina: lo trovi con «python pdc_strumenti.py meteo-prova», che lo stampa pronto da incollare; "
-         "se la stazione cambia, rilancialo). Il pannello legge l'umidità ogni 10 minuti e la mostra nella card Esterna della Dashboard. "
+         "se la stazione cambia, rilancialo). Il pannello ogni 10 minuti legge l'umidità, che mostra nella card Esterna della Dashboard, e la radiazione solare, che salva per le analisi. "
          "Vuoto = funzione spenta.", "campi": [
             _c("stazione.url", "testo", "Indirizzo dei dati", "Deve iniziare con https:// e stare su weatherlink.com."),
         ]},
@@ -9575,6 +10034,7 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
             _riga("Modalità", MODI_SMARTHER.get(modo, modo)),
             (lambda vn: _riga("Programma orario", vn[0], nota=vn[1]))(_testo_programma(t("info.nt.programma"))),
             wifi,
+            _riga_webhook(app),
         ]},
         {"titolo": "Identificativi", "righe": [
             _riga("ID modulo Netatmo" + (" (è il MAC)" if mac_nt else ""), id_mod, "c"),
@@ -9591,6 +10051,18 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
     return {"id": "smarther", "titolo": "Termostato", "sotto": "via Netatmo",
             "loghi": ["smarther"], "marca": "Smarther",
             "stato": {"testo": testo, "cls": cls}, "ultimo_dato": r[1] if r else None, "gruppi": gruppi}
+
+
+def _riga_webhook(app):
+    """Riga di stato dei webhook Netatmo (lo Smarther avvisa il pannello appena cambia qualcosa)."""
+    nt = next((s for s in app.servizi if getattr(s, "sigla", "") == "nt"), None)
+    if nt is None:
+        return _riga("Webhook Netatmo", None)
+    s = nt.wh.stato()
+    ev = ("Ultimo evento: " + datetime.fromtimestamp(s["ultimo_evento"]).strftime("%H:%M:%S") + ".") if s["ultimo_evento"] else "Nessun evento ricevuto da quando il pannello è partito."
+    if s["attivo"]:
+        return _riga("Webhook Netatmo", "Attivi", "b", "si", ev + " Lo Smarther si legge davvero ogni 15 minuti.")
+    return _riga("Webhook Netatmo", "Non attivi", "b", "no", (s["motivo"] or "in avvio").capitalize() + ". Intanto il pannello legge lo Smarther a intervalli, come prima.")
 
 
 GIORNI_BREVI = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]

@@ -24,13 +24,14 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.25.9"
+VERSIONE = "0.26.1"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
 import base64
 import copy
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -38,6 +39,7 @@ import logging.handlers
 import math
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import sys
@@ -277,7 +279,7 @@ TEMPLATE = {
     },
     "stazione": {
         "_nota": "Facoltativo. Indirizzo dei DATI di una stazione meteo WeatherLink vicina (non quello della pagina: lo stampa 'python pdc_strumenti.py meteo-prova'). "
-                 "Il pannello ne legge l'umidita' esterna ogni 10 minuti e la mostra nella card Esterna. Vuoto = funzione spenta.",
+                 "Il pannello ne legge ogni 10 minuti l'umidita' esterna (la mostra nella card Esterna) e la radiazione solare (la salva per le analisi). Vuoto = funzione spenta.",
         "url": "",
     },
     "tariffa": {
@@ -302,7 +304,8 @@ TEMPLATE = {
         },
     },
     "netatmo": {"client_id": "", "client_secret": "", "access_token": "", "refresh_token": "",
-                "expires_at": 0, "home_id": "", "room_id": ""},
+                "expires_at": 0, "home_id": "", "room_id": "",
+                "webhook_attivo": True, "webhook_segreto": ""},
     "dispositivi": {
         "_nota": "Facoltativo. Gli IP servono solo per mostrare l'IP e ricavare il MAC nella pagina Dispositivi. "
                  "I loghi si mettono nella cartella 'dati/loghi' (smarther.svg, samsung.svg, ...).",
@@ -478,6 +481,11 @@ class DB:
             with closing(self._c()) as c:
                 c.execute("PRAGMA journal_mode=WAL")
                 c.executescript(SCHEMA)
+                with c:      # dal 0.25.9 la radiazione solare si chiama esterna.radsolare (non viene dal meteo): si rinomina quella gia' salvata; idempotente
+                    c.execute("UPDATE OR IGNORE misure SET serie='esterna.radsolare' WHERE serie='meteo.radiazione'")
+                    c.execute("DELETE FROM misure WHERE serie='meteo.radiazione'")
+                    c.execute("UPDATE OR IGNORE ultimo SET serie='esterna.radsolare' WHERE serie='meteo.radiazione'")
+                    c.execute("DELETE FROM ultimo WHERE serie='meteo.radiazione'")
         except sqlite3.DatabaseError as e:
             raise ErroreDB(f"Il database ({self.path}) non si apre: {e}. Probabilmente e' danneggiato (blackout, disco pieno?). "
                            "Con il pannello fermo puoi rimettere l'ultima copia con:  python pdc_pannello.py ripristina") from e
@@ -862,13 +870,10 @@ def estrai_netatmo(js, room_id, ts):
         n("casa.temperatura", stanza.get("therm_measured_temperature"))
         n("casa.umidita", stanza.get("humidity"))
         n("casa.setpoint", stanza.get("therm_setpoint_temperature"), lento=True)
-        n("casa.richiesta_pct", stanza.get("heating_power_request"))
         if stanza.get("id"):
             rec.stati["info.nt.stanza_id"] = str(stanza["id"])
         if stanza.get("therm_setpoint_mode"):
             rec.stati["casa.modo"] = str(stanza["therm_setpoint_mode"])
-        if "open_window" in stanza:
-            rec.stati["casa.finestra_aperta"] = "si" if stanza["open_window"] else "no"
         if "reachable" in stanza:
             rec.stati["casa.raggiungibile"] = "si" if stanza["reachable"] else "no"
     if modulo:
@@ -1207,10 +1212,171 @@ class ServizioST(Raccoglitore):
             self.app.eventi.chiudi("st_pat")
 
 
+WH_LETTURA_REALE = 15 * 60     # con i webhook attivi lo Smarther si legge "davvero" solo ogni 15 minuti
+WH_LENTE = ("casa.setpoint", "casa.wifi")   # grandezze "lente" (si risalvano solo se cambiano, vedi DB.salva)
+WH_ATTESA_CONFERMA = 15        # secondi: dopo due eventi di setpoint non ordinabili si rilegge una volta sola
+
+
+class WebhookNT(threading.Thread):
+    """Webhook Netatmo: registra il nostro indirizzo (quello del tunnel Cloudflare) e controlla ogni minuto che ci resti.
+    Se qualcosa non va (tunnel spento, registrazione persa, dati che non tornano) il pannello fa come prima: legge lo Smarther
+    a intervalli. Il silenzio di Netatmo NON e' un problema (gli eventi arrivano solo quando qualcosa cambia): a controllare i dati
+    resta sempre la lettura vera ogni 15 minuti."""
+
+    def __init__(self, app, servizio):
+        super().__init__(daemon=True, name="webhook-nt")
+        self.app, self.srv = app, servizio
+        self.fermo = threading.Event()
+        self.registrato = False     # trovato nell'elenco di Netatmo all'ultimo controllo
+        self.ultimo_ok = 0          # ora dell'ultimo controllo riuscito
+        self.sospeso_fino = 0
+        self.motivo = "in avvio"
+        self.guasto_dal = None      # da quando non va pur dovendo andare (solo per l'avviso)
+        self.ricevuti = self.rifiutati = 0
+        self.ult_evento = 0
+
+    # ---- stato
+    def attivo(self):
+        t = time.time()
+        return self.registrato and t >= self.sospeso_fino and t - self.ultimo_ok < 300
+
+    def sospendi(self, secondi, motivo):
+        self.sospeso_fino = time.time() + secondi
+        self.motivo = motivo
+        self.guasto_dal = self.guasto_dal or time.time()
+        log.warning("Webhook Netatmo sospesi per %d minuti: %s", secondi // 60, motivo)
+
+    def stato(self):
+        return {"attivo": self.attivo(), "motivo": "" if self.attivo() else self.motivo, "ricevuti": self.ricevuti,
+                "rifiutati": self.rifiutati, "ultimo_evento": int(self.ult_evento) or None}
+
+    def _cfg(self):
+        return self.app.cfg.leggi()["netatmo"]
+
+    def segreto(self):
+        s = self._cfg().get("webhook_segreto") or ""
+        if len(s) < 20:
+            s = secrets.token_urlsafe(24)
+            self.app.cfg.aggiorna(lambda raw: raw.setdefault("netatmo", {}).update(webhook_segreto=s))
+        return s
+
+    # ---- ricezione (chiamata dal server web)
+    def ricevi(self, grezzo, firma):
+        """Un messaggio di Netatmo. -> codice HTTP. Non solleva mai eccezioni."""
+        try:
+            corpo = json.loads(grezzo.decode("utf-8"))
+            if not isinstance(corpo, dict):
+                return 400
+            if corpo.get("push_type") == "webhook_activation":    # messaggio di prova alla registrazione: senza dati
+                return 200
+            chiave = (self._cfg().get("client_secret") or "").encode()
+            atteso = hmac.new(chiave, grezzo, hashlib.sha256).hexdigest()
+            if not chiave or not firma or not hmac.compare_digest(atteso, firma.strip().lower()):
+                self.rifiutati += 1
+                return 401
+            self.ricevuti += 1
+            self.ult_evento = time.time()
+            self.srv.applica_evento(corpo)
+            return 200
+        except (ValueError, UnicodeDecodeError):
+            return 400
+        except Exception:
+            log.exception("webhook Netatmo: errore nel trattare un messaggio")
+            return 200      # il messaggio e' arrivato: non serve che Netatmo lo ripeta
+
+    # ---- registrazione
+    def _api(self, metodo, corpo=None):
+        h = {"Authorization": "Bearer " + self.app.token_nt.get(), "Accept": "application/json"}
+        dati = None
+        if corpo is not None:
+            h["Content-Type"] = "application/json"
+            dati = json.dumps(corpo).encode()
+        code, js = http_json(metodo, NT_BASE + "/webhooks/v1/", h, dati)
+        if code >= 400:
+            raise classifica("Netatmo", code, js)
+        return js
+
+    def _fuori(self, motivo, guasto=False):
+        self.registrato = False
+        self.motivo = motivo
+        if guasto:
+            self.guasto_dal = self.guasto_dal or time.time()
+        else:
+            self.guasto_dal = None
+        self._avviso()
+
+    def _avviso(self):
+        ev = self.app.eventi
+        if self.guasto_dal and time.time() - self.guasto_dal > 600:
+            ev.apri("nt_webhook", "I webhook Netatmo non funzionano (" + self.motivo + "): il pannello legge lo Smarther a intervalli, "
+                    "come prima. Niente di grave.", "avviso")
+        elif not self.guasto_dal:
+            ev.chiudi("nt_webhook")
+
+    def controlla(self):
+        n = self._cfg()
+        if not n.get("webhook_attivo", True):
+            return self._fuori("spenti nelle impostazioni")
+        tun = tunnel(self.app).stato()
+        if not tun["configurato"]:
+            return self._fuori("tunnel Cloudflare non configurato")
+        if not tun["collegato"]:
+            return self._fuori("tunnel Cloudflare non collegato")
+        base = tun["indirizzo"]
+        url = f"{base}/nt/{self.segreto()}"
+        testo = json.dumps(self._api("GET"))
+        if url not in testo:
+            altri = re.findall(r"https?://[^\s\"'\\]+", testo)
+            nostri = [u for u in altri if u.startswith(base + "/nt/")]
+            if [u for u in altri if u not in nostri]:
+                return self._fuori("su Netatmo c'e' gia' un altro webhook (non lo tocco)", guasto=True)
+            if nostri:       # il nostro, ma con un segreto vecchio: Netatmo ne ammette uno solo per account
+                self._api("DELETE")
+            self._api("POST", {"url": url})
+            if url not in json.dumps(self._api("GET")):
+                return self._fuori("Netatmo non conferma la registrazione", guasto=True)
+            log.info("Webhook Netatmo registrato")
+        self.registrato, self.ultimo_ok = True, time.time()
+        if time.time() >= self.sospeso_fino:
+            self.motivo, self.guasto_dal = "", None
+        else:
+            self.guasto_dal = self.guasto_dal or self.sospeso_fino - 3600
+        self._avviso()
+
+    def run(self):
+        self.fermo.wait(20)      # lascia partire prima la lettura normale
+        while not self.fermo.is_set():
+            try:
+                self.controlla()
+            except ErroreConfig as e:
+                self._fuori(str(e))
+            except ErroreAPI as e:
+                self._fuori("Netatmo non risponde (" + e.messaggio + ")", guasto=True)
+            except Exception:
+                log.exception("webhook Netatmo: errore nel controllo")
+                self._fuori("errore interno", guasto=True)
+            self.fermo.wait(60)
+
+
 class ServizioNT(Raccoglitore):
     def __init__(self, app):
         super().__init__(app, "nt")
         self.ult_info = 0          # ultima lettura della modalita' della casa (homesdata)
+        self.mem = None            # lo Smarther "in memoria": {"num": {serie: valore}, "stati": {serie: testo}}, dopo una lettura vera
+        self.mem_lock = threading.Lock()
+        self.ult_reale = 0         # ora dell'ultima lettura vera di homestatus
+        self.seq = {"room": None, "mod": None}   # ultimo numero di sequenza visto negli eventi
+        self.setp_chiave = (None, 0)             # (sequenza, orario d'inizio) dell'ultimo evento di setpoint applicato
+        self.forza_reale = False
+        self.divergenze = 0
+        self._timer = None
+        self.wh = WebhookNT(app, self)
+        self.wh.fermo = self.fermo
+
+    def start(self):
+        super().start()
+        if not self.app.demo:
+            self.wh.start()
 
     def intervallo(self):
         return max(60, int(self.app.cfg.leggi()["generale"]["intervallo_netatmo_secondi"]))
@@ -1229,6 +1395,11 @@ class ServizioNT(Raccoglitore):
 
     def passo(self):
         cfg = self.app.cfg.leggi()["netatmo"]
+        ts = int(time.time())
+        # webhook attivi e lettura vera recente: si salva lo stato tenuto in memoria (aggiornato dagli eventi), senza chiamare Netatmo
+        if (self.mem is not None and not self.forza_reale and self.wh.attivo() and ts - self.ult_reale < WH_LETTURA_REALE):
+            return self._salva_da_memoria(ts)
+        forzata, self.forza_reale = self.forza_reale, False
         home = cfg.get("home_id")
         if not home:
             homes = (self._get("/api/homesdata").get("body") or {}).get("homes") or []
@@ -1238,7 +1409,8 @@ class ServizioNT(Raccoglitore):
             self.app.cfg.aggiorna(lambda raw: raw.setdefault("netatmo", {}).update(home_id=home))
         js = self._get("/api/homestatus", {"home_id": home})
         ts = int(time.time())
-        if ts - self.ult_info > 120:  # la modalita' della casa (hg = spento) sta solo in homesdata
+        in_wh = self.wh.attivo()
+        if ts - self.ult_info > (WH_LETTURA_REALE - 60 if in_wh else 120):  # la modalita' della casa (hg = spento) sta solo in homesdata
             self.ult_info = ts
             try:
                 self.app.db.salva(estrai_netatmo_casa(self._get("/api/homesdata")), ts)
@@ -1247,7 +1419,143 @@ class ServizioNT(Raccoglitore):
         rec = estrai_netatmo(js, cfg.get("room_id"), ts)
         if not rec.num and not rec.stati:
             raise ErroreAPI("richiesta", 200, "Netatmo: risposta senza dati dello Smarther")
+        cambiati = self.app.db.salva(rec, ts)
+        self._sincronizza(rec, js, cfg.get("room_id"), ts, in_wh and not forzata)   # la lettura di conferma non conta come 'divergenza'
+        return cambiati
+
+    # ---- stato in memoria
+    def _sincronizza(self, rec, js, room_id, ts, in_wh):
+        """Dopo una lettura vera: confronta con la memoria (se i webhook erano attivi) e la rimette a zero."""
+        nuovo = {"num": {s: v for s, _t, v, _l in rec.num}, "stati": dict(rec.stati)}
+        with self.mem_lock:
+            if in_wh and self.mem is not None and time.time() - self.wh.ult_evento > 30:
+                diverso = []
+                for s, v in nuovo["num"].items():
+                    m = self.mem["num"].get(s)
+                    if s in ("casa.wifi",):
+                        continue
+                    if m is None or abs(m - v) > (0.5 if s == "casa.umidita" else 0.05):
+                        diverso.append(s)
+                if self.mem["stati"].get("casa.modo") != nuovo["stati"].get("casa.modo"):
+                    diverso.append("casa.modo")
+                self.divergenze = self.divergenze + 1 if diverso else 0
+                if diverso:
+                    log.warning("Webhook Netatmo: la lettura vera non coincide con gli eventi (%s)", ", ".join(diverso))
+                if self.divergenze >= 2:
+                    self.divergenze = 0
+                    self.wh.sospendi(3600, "i dati dei webhook non coincidevano con la lettura vera")
+            self.mem, self.ult_reale = nuovo, ts
+            home = (js.get("body") or {}).get("home") or {}
+            st = next((r.get("therm_setpoint_start_time") for r in home.get("rooms") or []
+                       if str(r.get("id")) == str(nuovo["stati"].get("info.nt.stanza_id"))), None)
+            if isinstance(st, int) and (self.setp_chiave[1] or 0) < st:
+                self.setp_chiave = (self.setp_chiave[0], st)
+
+    def _salva_da_memoria(self, ts):
+        rec = Rec()
+        with self.mem_lock:
+            for s, v in self.mem["num"].items():
+                rec.agg_num(s, ts, v, s in WH_LENTE)
+            for k in ("casa.modo", "casa.raggiungibile"):
+                if k in self.mem["stati"]:
+                    rec.stati[k] = self.mem["stati"][k]
         return self.app.db.salva(rec, ts)
+
+    @staticmethod
+    def _ordine(seq, inizio, cur):
+        """Confronta un evento di setpoint con l'ultimo applicato: 'nuovo', 'vecchio', 'uguale' o 'conflitto'
+        (sequenza e orario d'inizio che non si accordano). cur = (sequenza, orario d'inizio)."""
+        cs, ci = cur
+        if seq is not None and cs is not None and seq != cs:
+            if seq > cs:
+                return "nuovo"
+            return "conflitto" if (inizio is not None and ci is not None and inizio > ci) else "vecchio"
+        if inizio is None or ci is None:
+            return "uguale" if seq is not None and seq == cs else "nuovo"
+        return "nuovo" if inizio > ci else "vecchio" if inizio < ci else "uguale"
+
+    def applica_evento(self, corpo, ts=None):
+        """Un evento dei webhook: aggiorna la memoria, scrive subito sul database i valori cambiati e avvisa le pagine aperte.
+        Eventi piu' vecchi di quello gia' visto (arrivano a volte alla rovescia) si ignorano. Due eventi di setpoint che non
+        si riescono a ordinare (stessa sequenza e stesso secondo d'inizio, valori diversi: due tocchi rapidi sull'app)
+        si applicano nell'ordine d'arrivo e, una volta sola, poco dopo si rilegge Netatmo per sapere chi ha ragione."""
+        ts = ts or int(time.time())
+        home = (corpo.get("extra_params") or {}).get("home")
+        if not isinstance(home, dict):
+            return []
+        rec, ambiguo = Rec(), False
+        with self.mem_lock:
+            if self.mem is None:
+                return []           # nessuna lettura vera ancora: si parte da quella
+            num, stati = self.mem["num"], self.mem["stati"]
+            rid, mid = stati.get("info.nt.stanza_id"), stati.get("info.nt.id")
+
+            def cambia(serie, val):
+                val = _num(val)
+                if val is not None and num.get(serie) != val:
+                    num[serie] = val
+                    rec.agg_num(serie, ts, val, serie in WH_LENTE)
+
+            for r in home.get("rooms") or []:
+                if not isinstance(r, dict) or (rid and str(r.get("id")) != str(rid)):
+                    continue
+                seq = r.get("sequence_id") if isinstance(r.get("sequence_id"), int) else None
+                vecchio = seq is not None and self.seq["room"] is not None and seq < self.seq["room"]
+                if not vecchio:
+                    cambia("casa.temperatura", r.get("therm_measured_temperature"))
+                    cambia("casa.umidita", r.get("humidity"))
+                if "therm_setpoint_temperature" in r or "therm_setpoint_mode" in r:
+                    inizio = r.get("therm_setpoint_start_time")
+                    inizio = inizio if isinstance(inizio, int) else None
+                    ordine = self._ordine(seq, inizio, self.setp_chiave) if (seq is not None or inizio is not None) else "nuovo"
+                    if ordine != "vecchio":
+                        nuovo_sp = _num(r.get("therm_setpoint_temperature"))
+                        if ordine in ("uguale", "conflitto") and nuovo_sp is not None and num.get("casa.setpoint") not in (None, nuovo_sp):
+                            ambiguo = True
+                        elif ordine == "conflitto":
+                            ambiguo = True
+                        cambia("casa.setpoint", nuovo_sp)
+                        modo = r.get("therm_setpoint_mode")
+                        if modo and stati.get("casa.modo") != str(modo):
+                            stati["casa.modo"] = rec.stati["casa.modo"] = str(modo)
+                        if ordine != "uguale" or self.setp_chiave == (None, 0):
+                            self.setp_chiave = (seq if seq is not None else self.setp_chiave[0], inizio if inizio is not None else self.setp_chiave[1])
+                if seq is not None and (self.seq["room"] is None or seq > self.seq["room"]):
+                    self.seq["room"] = seq
+            for m in home.get("modules") or []:
+                if not isinstance(m, dict) or (m.get("id") != mid if mid else m.get("type") != "BNS"):
+                    continue
+                seq = m.get("sequence_id") if isinstance(m.get("sequence_id"), int) else None
+                if seq is not None and self.seq["mod"] is not None and seq < self.seq["mod"]:
+                    continue
+                if "boiler_status" in m:
+                    cambia("casa.richiesta_calore", 1.0 if m["boiler_status"] else 0.0)
+                cambia("casa.wifi", m.get("wifi_strength"))
+                if seq is not None:
+                    self.seq["mod"] = seq
+        cambiati = self.app.db.salva(rec, ts) if (rec.num or rec.stati) else []
+        if cambiati:
+            for cb in list(self.app.bus):
+                try:
+                    cb(cambiati)
+                except Exception:
+                    log.exception("errore in un ascoltatore dati")
+        if ambiguo:
+            self._pianifica_lettura(WH_ATTESA_CONFERMA)
+        return cambiati
+
+    def _pianifica_lettura(self, secondi):
+        with self.mem_lock:
+            if self._timer is not None:
+                return          # una lettura e' gia' in programma: basta quella
+            self._timer = threading.Timer(secondi, self._lettura_forzata)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _lettura_forzata(self):
+        self._timer = None
+        self.forza_reale = True
+        self.sveglia.set()
 
 
 def cartella_log(base):

@@ -25,6 +25,7 @@ const C = {
 };
 const alfa = (hex, a) => new Color(hex, a);
 const CHIP = {   // colore del testo e dello sfondo del riquadro in basso a sinistra
+  chiudi: [new Color("#62eba6"), alfa("#62eba6", 0.18)], finestre: [C.viola, alfa("#a78bfa", 0.22)],
   chiama: [new Color("#ff8d7c"), alfa("#ff6b57", 0.18)], riparte: [C.viola, alfa("#a78bfa", 0.22)],
   fermo: [C.grigio, alfa("#ffffff", 0.08)], warn: [new Color("#ffc873"), alfa("#ffb547", 0.18)], bad: [C.rosso, alfa("#ff5d6c", 0.18)],
 };

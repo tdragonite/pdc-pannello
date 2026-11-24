@@ -168,7 +168,7 @@ main{min-width:0;padding:22px 26px 40px}
 .gr .cur-tx,#eff .cur-tx{fill:var(--txt);font-size:11.5px;font-variant-numeric:tabular-nums}
 .gr .cur-tx .nd{fill:var(--mut)}
 .bordo-vuoto{stroke:#8793a8;stroke-opacity:.4;stroke-width:1;stroke-dasharray:3 3}
-.bordo-vuoto.fin{stroke:#23a876;stroke-opacity:1}[data-fin]{cursor:pointer}
+.bordo-vuoto.fin{stroke:#23a876;stroke-opacity:1}[data-fin]{cursor:pointer}.fin-scegli #grafici svg[data-id=casa]{cursor:crosshair}
 .gl{stroke:rgba(255,255,255,.06)}.gv{stroke:rgba(255,255,255,.035)}
 .cur{stroke:rgba(255,255,255,.32);stroke-width:1}
 .legg{display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:flex-end;font-size:12.5px;color:var(--mut)}
@@ -503,6 +503,12 @@ button.pericolo{background:#7a1f2b!important;border:1px solid #a8323f!important;
 /* riquadri dell'ultimo ciclo: si dividono sempre tutta la larghezza, qualunque sia il loro numero */
 .fermo-g>.tile{flex:1 1 0;min-width:0}
 .fermo-g>.tile:first-child{flex-grow:1.5}
+/* corsa con riscaldamento E acqua calda (testo lungo «Riscaldamento + acqua calda»): scheda abbastanza larga = UNA riga sola con il primo riquadro piu' largo
+   (cosi' la scheda non diventa piu' alta di quella accanto); scheda stretta (telefono, < 470px) = «Per» da solo sulla prima riga, durata ed energia sotto.
+   Si guarda la larghezza della SCHEDA (container query), non quella della finestra. */
+.fermo-g.due>.tile:first-child{flex-grow:2.3}
+.fermo-w .fermo-g.due>.tile:first-child .t-txt{font-size:14px}
+@container (max-width:470px){.fermo-g.due{flex-wrap:wrap}.fermo-g.due>.tile:first-child{flex:1 1 100%}}
 
 .cg .tile,.tc .tile{background:rgba(var(--c),.09);border-color:rgba(var(--c),.3)}
 .come-b{font:inherit;font-size:12px;line-height:inherit;font-weight:400;color:var(--acs);background:none;border:0;padding:0;cursor:pointer;white-space:nowrap}

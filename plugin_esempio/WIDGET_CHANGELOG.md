@@ -1,5 +1,11 @@
 # Plugin Widget iPhone — changelog
 
+## 1.3.0 — 14 novembre 2026
+- Con `?storico=6` (da 1 a 24 ore) la risposta contiene anche temperatura di casa, umidità e target a passi di 5 minuti, per il grafico dell'app dell'orologio. Senza il parametro la risposta è identica a prima: il widget dell'iPhone non cambia.
+
+## 1.2.0 — 13 novembre 2026
+- Il riquadro in basso mostra anche «Finestre aperte» (tinta viola) e «Puoi chiudere» (verde), con la stessa priorità della Dashboard: sta prima della ripartenza. Lo script di Scriptable ha i due colori nuovi; senza aggiornarlo i riquadri appaiono in grigio.
+
 ## 1.1.1 — 11 novembre 2026
 - Il riquadro della ripartenza dice sempre «Riparte alle 00:15», anche quando è dopo mezzanotte: con «domani» la scritta non entrava e l'ora veniva tagliata. Lo script di Scriptable non cambia.
 

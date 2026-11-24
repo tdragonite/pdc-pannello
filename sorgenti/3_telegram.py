@@ -17,6 +17,7 @@ TITOLI = {
     "nt_conn_limite": "Limite di richieste Netatmo",
     "nt_conn_server": "Server Netatmo",
     "nt_conn_richiesta": "Richiesta a Netatmo",
+    "nt_webhook": "Webhook Netatmo",
     "st_config": "Configurazione SmartThings",
     "nt_config": "Configurazione Netatmo",
     "st_script": "Script (lettura SmartThings)",
@@ -516,8 +517,8 @@ class Sentinella(threading.Thread):
         if on("cicli_brevi"):
             r = al["cicli_brevi"]
             da = ora - int(float(r["ore"]) * 3600)
-            brevi = [c for c in cicli_compressore(db, da, ora, ora)
-                     if c[2] == "casa" and (c[1] - c[0]) < float(r["durata_minima_min"]) * 60]
+            brevi = [c for c in unisci_riprese(cicli_compressore(db, da, ora, ora))     # una ripresa dopo l'acqua calda non e' un ciclo nuovo
+                     if c[2] == "casa" and c[3] < float(r["durata_minima_min"]) * 60]
             self.imposta("cicli_brevi", len(brevi) >= int(r["quanti"]),
                          f"{len(brevi)} cicli di riscaldamento sotto i {r['durata_minima_min']} minuti nelle ultime "
                          f"{num_it(r['ore'], 0)} ore: la pompa parte e si ferma troppo spesso.")
@@ -706,7 +707,7 @@ class Sentinella(threading.Thread):
         righe_notte = self._notte_righe(ora)
         if righe_notte:
             anom += "\n\n🌙 <b>Di notte</b>\n" + righe_notte
-        extra = {"energia": num_it(g["el_casa"] + g["el_acs"] + g["el_riposo"]), "cop": num_it(g["cop"], 2) if g["cop"] else "—",
+        extra = {"energia": num_it(g["el_casa"] + g["el_acs"] + g["el_riposo"]), "cop": ("~" if cop_approssimato(g["dt_casa"], g["dt_acs"]) else "") + num_it(g["cop"], 2) if g["cop"] else "—",
                  "ore_casa": num_it(g["min_casa"] / 60), "ore_acs": num_it(g["min_acs"] / 60), "cicli": e["cicli"]["casa"]["n"],
                  "casa_min": num_it(min(casa)) if casa else "—", "casa_max": num_it(max(casa)) if casa else "—",
                  "esterna": num_it(sum(est) / len(est)) if est else "—", "anomalie": anom,

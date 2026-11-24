@@ -256,7 +256,10 @@ function tooltipTimeline(e) {
   const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), t = da + f * span;
   const i = m.segmenti.findIndex(x => t >= x[0] && t <= x[1]); if (i < 0) return;
   const s = m.segmenti[i], re = (m.reali || [])[i] || [s[0], s[1]], tip = $('#tip');   // orario e durata veri: il primo e l'ultimo tratto possono iniziare prima / finire dopo la finestra
-  tip.innerHTML = `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(re[0])}–${hhmm(re[1])} (${durata(Math.round((re[1] - re[0]) / 60))})`;
+  const g = (m.gruppi || [])[i];   // riscaldamento ripreso dopo l'acqua calda (compressore mai fermo): le info sono quelle totali, col primo tratto
+  tip.innerHTML = g
+    ? `<b style="color:${COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(g[0])}–${hhmm(g[1])} (${durata(g[2])})`
+    : `<b style="color:${s[2] === 'nodati' || s[2] === 'riposo' ? 'var(--mut)' : COL[s[2]]}">${NOMI[s[2]]}</b> · ${hhmm(re[0])}–${hhmm(re[1])} (${durata(Math.round((re[1] - re[0]) / 60))})`;
   tip.hidden = false;
   const mezzo = tip.offsetWidth / 2 + 2;   // larghezza vera del tooltip: sta sempre dentro la barra
   tip.style.left = Math.max(mezzo, Math.min(r.width - mezzo, f * r.width)) + 'px';
@@ -351,7 +354,7 @@ function prestazioni(d) {
     const giorno = u && !stesso ? new Date(u.inizio * 1000).toLocaleDateString('it-IT', {day: '2-digit', month: '2-digit'}) + ' ' : '';
     const tile = (et, v) => `<div class="tile"><small>${et}</small><b class="t-txt">${v}</b></div>`;
     html('prest', `<div class="fermo-w"><div class="fermo-t"><span class="pill up">Fermo</span><span class="fermo-q">${u ? `Ultimo ciclo · ${giorno}${hhmm(u.inizio)}–${hhmm(u.fine)}` : 'Nessun ciclo negli ultimi 3 giorni'}</span></div>` +
-      (u ? `<div class="fermo-g">${tile('Per', u.modo === 'acs' ? 'Acqua calda' : 'Riscaldamento')}${tile('Durata', dur)}${u.kwh != null ? tile('Energia', num(u.kwh, 1) + ' <i>kWh</i>') : ''}</div>` : '') + '</div>');
+      (u ? `<div class="fermo-g${(u.modo || '').includes('+') ? ' due' : ''}">${tile('Per', (u.modo || 'casa').split('+').map((x, k) => { const n = x === 'acs' ? 'Acqua calda' : 'Riscaldamento'; return k ? n.toLowerCase() : n; }).join(' + '))}${tile('Durata', dur)}${u.kwh != null ? tile('Energia', num(u.kwh, 1) + ' <i>kWh</i>') : ''}</div>` : '') + '</div>');
     if (rt) rt.textContent = '';
     return;
   }
@@ -505,6 +508,23 @@ function fasceFinestre(fin, da, a, X, y0, h) {
       + (ok ? '' : [[f.da, x0], [f.a, x1]].filter(([t]) => t > da + 1 && t < a - 1).map(([, x]) => `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${y0}" y2="${y0 + h}" class="bordo-vuoto fin"/>`).join(''));
   }).join('');
 }
+// scelta a mano di una finestra: due clic sul grafico della temperatura ambiente (S.finScegli: 0 spento, 1 aspetta l'inizio, 2 aspetta la fine)
+function finSelSvg(sel, da, a, X, y0, h) {
+  if (!sel) return '';
+  const x0 = X(Math.max(sel[0], da)), x1 = X(Math.min(sel[1], a));
+  return `<rect x="${x0.toFixed(1)}" y="${y0}" width="${Math.max(2, x1 - x0).toFixed(1)}" height="${h}" fill="${COLS.fin}" opacity=".12"/>`
+    + [sel[0], sel[1]].filter(t => t > da && t < a).map(t => `<line x1="${X(t).toFixed(1)}" x2="${X(t).toFixed(1)}" y1="${y0}" y2="${y0 + h}" class="bordo-vuoto fin"/>`).join('');
+}
+function finSelAgg() {      // aggiorna la fascia senza ridisegnare il grafico
+  const svg = document.querySelector('#grafici svg[data-id="casa"]'), d = S.dati; if (!svg || !d) return;
+  const L = +svg.dataset.l, pw = +svg.dataset.pw, g = svg.querySelector('.fin-sel'); if (!g) return;
+  g.innerHTML = finSelSvg(S.finSel, d.da, d.a, t => L + (t - d.da) / (d.a - d.da) * pw, +svg.dataset.t0, +svg.dataset.ph);
+}
+function finHint() {
+  const h = $('#fin-hint'); if (!h) return;
+  h.textContent = !S.finScegli ? '' : S.finScegli === 1 ? (S.finSel ? 'Fatto: correggi con i campi se serve e premi «Segnala finestra». Un nuovo clic sul grafico ricomincia.' : 'Clicca sul grafico Temperatura ambiente l’inizio della finestra.') : 'Ora clicca la fine della finestra.';
+}
+function finScegliChiudi() { S.finScegli = 0; S.finSel = null; document.body.classList.remove('fin-scegli'); finSelAgg(); finHint(); }
 function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
   if (S.tel || a - da > 7 * 86400) return '';      // su telefono solo le fasce (si guarda e basta); su periodi lunghi le icone si accavallano: restano le fasce
   return fin.map((f, i) => {
@@ -515,12 +535,14 @@ function iconeFinestre(fin, da, a, X, xmin, xmax, y) {
 }
 
 function scheletroAnalisi() {
+  S.finScegli = 0; S.finSel = null; document.body.classList.remove('fin-scegli');   // la barra nasce chiusa
   return `<div class="card"><div class="ch"><h2>Modo di funzionamento</h2><div class="riep" id="tl-riep"></div></div>
     <div class="tlw" id="tlw"><div id="tl"></div><div class="tip" id="tip" hidden></div></div><div class="assi" id="assi"></div></div>
     <div class="custom" id="fin-man" hidden>
       <label>Da<input type="datetime-local" id="fin-da"></label>
       <label>A<input type="datetime-local" id="fin-a"></label>
       <button id="fin-ok" type="button">Segnala finestra</button>
+      <span class="mut" id="fin-hint" style="flex-basis:100%;font-size:13px"></span>
     </div>
     <div id="grafici"></div>
     <ul class="nota-cv lun"><li><i class="in"></i><span>Le zone colorate dietro le linee indicano quando la PdC scalda la casa (rosso) o l'acqua (blu); le righe oblique grigie, i periodi senza dati.</span></li>
@@ -642,7 +664,7 @@ function graficoLineare(g, d, W, H) {
     return `<rect ${r} fill="rgba(135,147,168,.05)"/><rect ${r} fill="url(#tr-${g.id})"/>` + [s0, s1].filter(u => u > d.da + 1 && u < d.a - 1).map(u => `<line x1="${X(u).toFixed(1)}" x2="${X(u).toFixed(1)}" y1="${T}" y2="${T + ph}" class="bordo-vuoto"/>`).join('');
   }).join('');
   s += g.id === 'casa' ? fasceRichiesta(d.richiesta || [], d.da, d.a, X, T, ph) : fasce(d.modi.segmenti, d.da, d.a, X, T, ph);
-  if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph);
+  if (g.id === 'casa') s += fasceFinestre(d.finestre || [], d.da, d.a, X, T, ph) + `<g class="fin-sel">${finSelSvg(S.finSel, d.da, d.a, X, T, ph)}</g>`;
   if (g.id === 'casa') s += fasceRichiesta(d.richiesta || [], d.da, d.a, X, T + ph - 7, 7, .9);   // striscia piena in basso: quando lo Smarther chiede caldo
   s += sc.tick.map(v => `<line x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" class="gl"/><text x="${L - 4}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${num(v, sc.passo < 1 ? 1 : 0)}</text>`).join('');
   if (doppio) s += sc1.tick.map(v => `<text x="${W - R + 4}" y="${(Y1(v) + 4).toFixed(1)}" text-anchor="start" fill="${colAsse1}">${num(v, sc1.passo < 1 ? 1 : 0)}</text>`).join('');
@@ -813,7 +835,7 @@ function muoviCursore(e) {
 // ---------- spostarsi indietro nel tempo col mouse (6h / 24h): si trascina un grafico, al rilascio si caricano le ore di quel periodo ----------
 let sposta = null;
 function spostaGiu(e) {
-  if (e.pointerType !== 'mouse' || e.button !== 0 || S.pagina !== 'analisi' || !S.dati || S.range === 'custom' || S.zoom) return;
+  if (e.pointerType !== 'mouse' || e.button !== 0 || S.pagina !== 'analisi' || !S.dati || S.range === 'custom' || S.zoom || S.finScegli) return;
   const el = e.target.closest && e.target.closest('#grafici, #tlw'); if (!el) return;
   const svg = document.querySelector('#grafici svg'), pw = el.id === 'tlw' || !svg ? el.getBoundingClientRect().width : +svg.dataset.pw;
   sposta = {x0: e.clientX, dx: 0, on: false, sec: (S.dati.a - S.dati.da) / Math.max(1, pw)};
@@ -1071,16 +1093,30 @@ document.addEventListener('click', ev => {
   const t = ev.target, vecchio = document.getElementById('fin-pan'), ic = t.closest && t.closest('[data-fin]');
   if (t.id === 'fin-add') {
     const b = $('#fin-man'), a = ora();
-    $('#fin-da').value = loc(a - 3600); $('#fin-a').value = loc(a); b.hidden = !b.hidden; if (!b.hidden) b.scrollIntoView({block: 'center', behavior: 'smooth'}); return;
+    $('#fin-da').value = loc(a - 3600); $('#fin-a').value = loc(a); b.hidden = !b.hidden;
+    if (b.hidden) finScegliChiudi(); else { S.finSel = null; S.finScegli = 1; document.body.classList.add('fin-scegli'); finHint(); b.scrollIntoView({block: 'center', behavior: 'smooth'}); }
+    return;
   }
   if (t.id === 'fin-ok') {
     const da = new Date($('#fin-da').value).getTime() / 1000, a = new Date($('#fin-a').value).getTime() / 1000;
     if (!isFinite(da) || !isFinite(a) || a <= da || a - da > 86400) { toast('Controlla le date: "A" deve venire dopo "Da" (al massimo 24 ore).', true); return; }
-    finInvia('/api/finestre/manuale', {da: Math.floor(da), a: Math.floor(a)}).then(v => { if (v) { $('#fin-man').hidden = true; finRidisegna(); toast('Finestra segnata.'); } });
+    finInvia('/api/finestre/manuale', {da: Math.floor(da), a: Math.floor(a)}).then(v => { if (v) { $('#fin-man').hidden = true; finScegliChiudi(); finRidisegna(); toast('Finestra segnata.'); } });
     return;
+  }
+  const sv = S.finScegli && !ic && t.closest && t.closest('#grafici svg[data-id="casa"]'), d = S.dati;
+  if (sv && d && S.dpag === 'analisi') {      // un clic sul grafico: prima l'inizio, poi la fine (se vengono al contrario si scambiano)
+    const r = sv.getBoundingClientRect(), L = +sv.dataset.l, pw = +sv.dataset.pw, f = Math.max(0, Math.min(1, (ev.clientX - r.left - L) / pw));
+    const tt = Math.round((d.da + f * (d.a - d.da)) / 60) * 60;
+    if (S.finScegli === 1) { S.finSel = [tt, tt]; S.finScegli = 2; } else { S.finSel = [Math.min(S.finSel[0], tt), Math.max(S.finSel[0], tt)]; S.finScegli = 1; }
+    $('#fin-da').value = loc(S.finSel[0]); $('#fin-a').value = loc(S.finSel[1]); finSelAgg(); finHint(); return;
   }
   if (vecchio && !(t.closest && t.closest('#fin-pan')) && !ic) vecchio.remove();
   if (ic) { if (vecchio) vecchio.remove(); finPannello(ic); }
+});
+document.addEventListener('change', ev => {
+  if (!S.finScegli || (ev.target.id !== 'fin-da' && ev.target.id !== 'fin-a')) return;
+  const da = new Date($('#fin-da').value).getTime() / 1000, a = new Date($('#fin-a').value).getTime() / 1000;
+  if (isFinite(da) && isFinite(a) && a > da) { S.finSel = [da, a]; S.finScegli = 1; finSelAgg(); finHint(); }
 });
 // Esc o lo scorrimento della pagina chiudono i pannellini sospesi (meteo e finestra)
 function chiudiPannelli() { if (S.meteoAperto) chiudiMeteo(); const v = document.getElementById('fin-pan'); if (v) v.remove(); }
@@ -1092,16 +1128,28 @@ window.addEventListener('scroll', chiudiPannelli, {passive: true});
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
+  ['webhook', 'Smarther in tempo reale', 'Con il tunnel attivo, Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
   ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
   ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo da casa, con lucchetto e conferma.'],
   ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
-  ['indietro', 'Grafici indietro nel tempo', 'Analisi, da computer: trascina un grafico verso destra per guardare le ore (o il giorno) prima; «Torna ad adesso» rimette la diretta.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣'};
+const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
-  {v: '0.25.9', quando: '13 novembre 2026', titolo: 'Puoi chiudere su Telegram', righe: [   // VENT
+  {v: '0.26.1', quando: '19 novembre 2026', titolo: 'Riprese del riscaldamento', righe: [
+    ['s', 'Riscaldamento dopo l’acqua calda', 'Quando l’acqua calda parte a compressore acceso e, finita, il riscaldamento riprende senza che la pompa si sia fermata, quel secondo tratto non è più contato come un avvio nuovo: in Efficienza il numero di cicli, la durata media e i cicli brevi lo uniscono al riscaldamento di prima, e l’avviso «Cicli troppo brevi» non scatta più per queste riprese.'],
+    ['s', 'Tooltip del grafico Modo di funzionamento', 'Passando sul riscaldamento che riprende dopo l’acqua calda, il tooltip mostra l’inizio del primo tratto, la fine dell’ultimo e la durata totale del riscaldamento, invece del solo secondo tratto.'],
+    ['s', 'Scheda «Ultimo ciclo» a pompa ferma', 'Mostra l’intera corsa del compressore, dall’accensione allo spegnimento: se in mezzo c’è stata l’acqua calda, orario, durata ed energia sono quelli di tutta la corsa e il tipo diventa «Riscaldamento + acqua calda». Prima compariva solo l’ultimo tratto.'],
+  ]},
+  {v: '0.26.0', quando: '13 novembre 2026', titolo: 'Webhook Netatmo', righe: [
+    ['n', 'Webhook Netatmo', 'Con il tunnel Cloudflare collegato, il pannello si fa avvisare da Netatmo appena lo Smarther cambia (temperatura, setpoint, caldaia): i valori arrivano dopo circa un secondo e lo Smarther si legge davvero solo ogni 15 minuti. Se il tunnel è spento, la registrazione salta o i dati non tornano, legge a intervalli come prima. Si spegne in Impostazioni → Netatmo. Non salviamo più «finestra aperta» e «richiesta di calore in %», che i webhook non portano e che non servivano. Nella pagina Dispositivi, scheda Termostato, una riga dice se sono attivi e perché no.'],
+  ]},
+  {v: '0.25.9', quando: '13 novembre 2026', titolo: 'Telegram, COP e radiazione solare', righe: [
     ['n', 'Messaggio «Puoi chiudere»', 'Quando dopo una finestra aperta nella Dashboard compare «Puoi chiudere», ti arriva anche un messaggio Telegram, con suoneria, una sola volta per apertura. Lo spegni o ne cambi il testo dalle impostazioni, in «Quando avvisarti».'],   // VENT
-  ]},   // VENT
+    ['n', 'Tilde sul COP', 'Quando il salto tra mandata e ritorno è piccolo (sotto i 5 °C) il COP si legge a gradini di 1 °C e può sbagliare fino al 20%: in Efficienza, nel grafico giornaliero e nel riepilogo Telegram il numero ha una «~» davanti. Con acqua calda e curva alta non compare.'],
+    ['m', 'Sole dalla stazione', 'La radiazione solare ora è quella misurata dalla stazione meteo vicina, ogni 10 minuti, e non più la stima di Open-Meteo del giorno dopo. Si salva col nome «esterna.radsolare»: al primo avvio i giorni già salvati, anche quelli di Open-Meteo, passano al nome nuovo e lo storico resta in un unico campo. Non cambia niente di visibile: serve alle analisi.'],
+    ['m', 'Impostazioni → Collegamenti', 'La sezione della stazione meteo ora dice che legge umidità e sole, non solo l’umidità.'],
+    ['m', 'Due clic sul grafico', 'Premendo «Segnala finestra» ora basta cliccare sul grafico Temperatura ambiente l’inizio e poi la fine: una fascia verde mostra cosa stai segnando e i campi Da e A si riempiono da soli. A mano si può ancora correggere.'],
+  ]},
   {v: '0.25.8', quando: '12 novembre 2026', titolo: 'Target della mandata', righe: [
     ['s', 'Target del riscaldamento giusto', 'Il «Target» della scheda Riscaldamento era sempre 25°: è il setpoint della modalità a temperatura fissa, che la pompa non usa. Ora è la mandata che chiede la curva climatica alla temperatura esterna di adesso.'],
     ['s', 'Linea «Target mandata» in Analisi', 'Da adesso la linea tratteggiata segue la curva climatica, con i valori FSV di quel momento: se cambi la curva si vede un gradino. I giorni già registrati restano com’erano (25° fissi).'],
@@ -1424,10 +1472,12 @@ function meseCosto(m) {
       <div class="nota">Stima: media dei giorni passati, indicativa.${m.dettaglio ? ' <span class="come-b" data-come="eurm" role="button" tabindex="0" aria-expanded="false">Dettaglio</span>' : ''}</div>${m.dettaglio ? `<p class="come-t" id="come-eurm" hidden><span class="nw">Riscaldamento <b>${euro(m.dettaglio.casa)}</b></span><span class="nw">Acqua calda <b>${euro(m.dettaglio.acs)}</b></span><span class="nw">Standby <b>${euro(m.dettaglio.riposo)}</b></span></p>` : ''}</article>`;
 }
 const ICONA_SCARICA = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg>';
+const copApprossimato = (d, ...dt) => dt.some(x => x != null && x < d.cop_dt_min);   // stessa soglia del server
 function disegnaEfficienza(d) {
   EF.d = d;
   const t = d.tot, nodati = d.giorni.reduce((a, g) => a + g.nodati_min, 0);
   const cop = v => v == null ? '—' : num(v, 2);
+  const copT = (v, ...dt) => cop(v) === '—' || !copApprossimato(d, ...dt) ? cop(v) : '~' + cop(v);   // «~» se il salto termico e' piccolo: COP approssimato
   const pt = d.prec ? d.prec.tot : {};
   const cov = d.copertura, bassa = [cov.casa, cov.acs].some(v => v != null && v < 80);
   const avvDati = bassa || nodati > 120 ? `<div class="avviso warn"><span>⚠️</span><div>Dati incompleti${bassa ? `: per il calcolo del COP ho potenza e portata solo per il ${Math.min(cov.casa ?? 100, cov.acs ?? 100)}% del tempo di funzionamento` : ''}${nodati > 120 ? ` (mancano circa ${durata(nodati)} di dati nel periodo)` : ''}. I valori sono più bassi o meno precisi del reale.</div></div>` : '';
@@ -1435,8 +1485,8 @@ function disegnaEfficienza(d) {
   ${avvisoConf(d)}${avvDati}
   <div class="cards c5">
     <article class="card acc" style="--acc:var(--est)"><div class="ch"><span class="et">COP medio</span></div>
-      <div class="val"><div class="n"><span>${cop(t.cop)}</span></div></div>
-      <div class="sub"><span>Risc. <b>${cop(t.cop_casa)}</b></span><span>Acqua <b>${cop(t.cop_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
+      <div class="val"><div class="n"><span>${copT(t.cop, t.dt_casa, t.dt_acs)}</span></div></div>
+      <div class="sub"><span>Risc. <b>${copT(t.cop_casa, t.dt_casa)}</b></span><span>Acqua <b>${copT(t.cop_acs, t.dt_acs)}</b></span></div>${rigaConf(d, t.cop, pt.cop, cop, 'su', 0.1)}</article>
     <article class="card acc" style="--acc:var(--en)"><div class="ch"><span class="et">Energia elettrica</span></div>
       <div class="val"><div class="n"><span>${fm(t.el_casa + t.el_acs + t.el_riposo)}</span><i>kWh</i></div></div>
       <div class="sub"><span>Risc. <b>${fm(t.el_casa)}</b></span><span>Acqua <b>${fm(t.el_acs)}</b></span><span>Standby <b>${fm(t.el_riposo)}</b></span>${d.prezzo_kwh > 0 ? `<span><span class="come-b" data-come="eur" role="button" tabindex="0" aria-expanded="false">Costo stimato</span> <b>${euro((t.el_casa + t.el_acs + t.el_riposo) * d.prezzo_kwh)}</b></span>` : ''}</div>${d.prezzo_kwh > 0 ? `<p class="come-t" id="come-eur" hidden><span class="nw">Riscaldamento <b>${euro(t.el_casa * d.prezzo_kwh)}</b></span><span class="nw">Acqua calda <b>${euro(t.el_acs * d.prezzo_kwh)}</b></span><span class="nw">Standby <b>${euro(t.el_riposo * d.prezzo_kwh)}</b></span></p>` : ''}${rigaConf(d, t.el_casa + t.el_acs + t.el_riposo, pt.el_casa + pt.el_acs + pt.el_riposo, v => fm(v) + ' kWh', 'giu', 1)}</article>
@@ -1569,7 +1619,7 @@ function lineeGiorni(giorni, W, tip, tel) {
     }
     s += `<path d="${p}" fill="none" stroke="${c}" stroke-width="2.2" stroke-linejoin="round"/>`;
     giorni.forEach((g, i) => { if (g[k] != null) { const tv = tip && tip[g.giorno] && tip[g.giorno][k];
-      s += `<circle cx="${X(i).toFixed(1)}" cy="${Y(g[k]).toFixed(1)}" r="${n > 14 ? 2.5 : 3.5}" fill="${c}"><title>${giornoBreve(g)}: COP ${num(g[k], 2)}${tv != null ? ` · tipico per ${num(tip[g.giorno].esterna, 0)}°C esterni: ${num(tv, 2)}` : ''}</title></circle>`; } });
+      s += `<circle cx="${X(i).toFixed(1)}" cy="${Y(g[k]).toFixed(1)}" r="${n > 14 ? 2.5 : 3.5}" fill="${c}"><title>${giornoBreve(g)}: COP ${copApprossimato(EF.d, g[k === 'cop_casa' ? 'dt_casa' : 'dt_acs']) ? '~' : ''}${num(g[k], 2)}${tv != null ? ` · tipico per ${num(tip[g.giorno].esterna, 0)}°C esterni: ${num(tv, 2)}` : ''}</title></circle>`; } });
   });
   return s + curEf(T, ph, [COLS.casa, COLS.acs]) + '</svg>';
 }

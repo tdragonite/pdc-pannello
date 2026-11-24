@@ -260,6 +260,7 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
             _riga("Modalità", MODI_SMARTHER.get(modo, modo)),
             (lambda vn: _riga("Programma orario", vn[0], nota=vn[1]))(_testo_programma(t("info.nt.programma"))),
             wifi,
+            _riga_webhook(app),
         ]},
         {"titolo": "Identificativi", "righe": [
             _riga("ID modulo Netatmo" + (" (è il MAC)" if mac_nt else ""), id_mod, "c"),
@@ -276,6 +277,18 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
     return {"id": "smarther", "titolo": "Termostato", "sotto": "via Netatmo",
             "loghi": ["smarther"], "marca": "Smarther",
             "stato": {"testo": testo, "cls": cls}, "ultimo_dato": r[1] if r else None, "gruppi": gruppi}
+
+
+def _riga_webhook(app):
+    """Riga di stato dei webhook Netatmo (lo Smarther avvisa il pannello appena cambia qualcosa)."""
+    nt = next((s for s in app.servizi if getattr(s, "sigla", "") == "nt"), None)
+    if nt is None:
+        return _riga("Webhook Netatmo", None)
+    s = nt.wh.stato()
+    ev = ("Ultimo evento: " + datetime.fromtimestamp(s["ultimo_evento"]).strftime("%H:%M:%S") + ".") if s["ultimo_evento"] else "Nessun evento ricevuto da quando il pannello è partito."
+    if s["attivo"]:
+        return _riga("Webhook Netatmo", "Attivi", "b", "si", ev + " Lo Smarther si legge davvero ogni 15 minuti.")
+    return _riga("Webhook Netatmo", "Non attivi", "b", "no", (s["motivo"] or "in avvio").capitalize() + ". Intanto il pannello legge lo Smarther a intervalli, come prima.")
 
 
 GIORNI_BREVI = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]

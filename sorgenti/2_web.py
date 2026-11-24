@@ -260,7 +260,7 @@ def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300, estendi=True):
     a = min(int(a), ora)
     da = int(da)
     if a <= da:
-        return {"segmenti": [], "minuti": {m: 0 for m in MODI}, "reali": []}
+        return {"segmenti": [], "minuti": {m: 0 for m in MODI}, "reali": [], "gruppi": []}
     inizio = da - da % passo
     freq = campioni_freq(db, inizio, a)
     freq_ts = sorted(freq)
@@ -311,7 +311,7 @@ def calcola_modi(db, da, a, tolleranza=150, ora=None, passo=300, estendi=True):
             dopo = calcola_modi(db, s0, min(a + MODI_ESTENSIONE, ora), tolleranza, ora, passo, False)["segmenti"]
             if dopo and dopo[0][2] == m:
                 reali[-1][1] = dopo[0][1]
-    return {"segmenti": segmenti, "minuti": minuti, "reali": reali}
+    return {"segmenti": segmenti, "minuti": minuti, "reali": reali, "gruppi": gruppi_riscaldamento(segmenti, reali)}
 
 
 def tolleranza(app):
@@ -693,61 +693,6 @@ def meteo_info(app):
 
 
 # --------------------------------------------------------------------------
-# Radiazione solare oraria (Open-Meteo, archivio): si salva dopo mezzanotte per i giorni appena finiti, serie «meteo.radiazione» (W/m²)
-# --------------------------------------------------------------------------
-
-RADIAZIONE_URL = "https://archive-api.open-meteo.com/v1/archive"
-RADIAZIONE_GIORNI = 8          # ogni volta si rilegge anche qualche giorno prima (Open-Meteo corregge i dati a posteriori)
-RADIAZIONE_DOPO = 10800        # secondi dopo mezzanotte (ora locale) prima di chiedere: le 3:00
-RADIAZIONE_RIPROVA = 900       # se la richiesta fallisce si riprova dopo 15 minuti
-
-
-def radiazione_leggi(js):
-    """JSON di Open-Meteo -> [(epoch, W/m²)], saltando le ore senza valore. ValueError se la risposta non è quella attesa."""
-    try:
-        t, v = js["hourly"]["time"], js["hourly"]["shortwave_radiation"]
-    except (TypeError, KeyError):
-        raise ValueError("risposta inattesa") from None
-    if not isinstance(t, list) or not isinstance(v, list) or len(t) != len(v):
-        raise ValueError("risposta inattesa")
-    return [(int(a), round(float(b), 1)) for a, b in zip(t, v)
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(b, bool) and b >= 0]
-
-
-def radiazione_lavoro(app, lat, lon, ora=None):
-    """Se oggi non è ancora stata letta, scarica la radiazione dei giorni appena finiti e la salva. -> True se ha salvato."""
-    ora = int(ora if ora is not None else time.time())
-    lt = time.localtime(ora)
-    oggi = time.strftime("%Y-%m-%d", lt)
-    mezzanotte = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
-    st = app.__dict__.setdefault("rad_st", {"prossimo": 0})
-    if ora < st["prossimo"] or ora < mezzanotte + RADIAZIONE_DOPO or app.db.meta_get("rad_giorno") == oggi:
-        return False
-    da = time.strftime("%Y-%m-%d", time.localtime(mezzanotte - RADIAZIONE_GIORNI * 86400 + 3600))
-    a = time.strftime("%Y-%m-%d", time.localtime(mezzanotte - 3600))
-    url = "%s?latitude=%s&longitude=%s&start_date=%s&end_date=%s&hourly=shortwave_radiation&timezone=Europe%%2FRome&timeformat=unixtime" % (
-        RADIAZIONE_URL, lat, lon, da, a)
-    try:
-        code, js = http_json("GET", url, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
-        if code != 200:
-            raise ValueError("HTTP %s" % code)
-        punti = radiazione_leggi(js)
-        if not punti:
-            raise ValueError("nessun dato")
-        rec = Rec()
-        for ts, w in punti:
-            rec.agg_num("meteo.radiazione", ts, w)
-        app.db.salva(rec, ora)
-        app.db.meta_set("rad_giorno", oggi)
-        log.info("Radiazione solare: salvate %d ore (%s - %s)", len(punti), da, a)
-        return True
-    except Exception as e:  # noqa: BLE001  - senza rete o con Open-Meteo giù si riprova dopo
-        st["prossimo"] = ora + RADIAZIONE_RIPROVA
-        log.debug("Radiazione solare: lettura non riuscita (%s)", e)
-        return False
-
-
-# --------------------------------------------------------------------------
 # Umidità esterna da una stazione meteo vicina (WeatherLink, dati grezzi): un solo valore nella card «Esterna»
 # --------------------------------------------------------------------------
 
@@ -791,11 +736,63 @@ def stazione_leggi(js):
     return round(um, 1), ts
 
 
+RADIAZIONE_MAX = 1500          # W/m²: oltre e' un dato rotto, non si salva
+
+
+def stazione_url_radiazione(url):
+    """Indirizzo dei dati attuali della stessa stazione (quello che legge la pagina «Station Summary»): .../getData/<codice> -> .../summaryData/<codice>. '' se l'indirizzo non e' di quel tipo."""
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return ""
+    m = re.match(r"^/embeddablePage/getData/([0-9A-Za-z]+)/?$", p.path or "")
+    return f"{p.scheme}://{p.netloc}/embeddablePage/summaryData/{m.group(1)}" if m else ""
+
+
+def radiazione_leggi(js):
+    """JSON di summaryData -> (W/m², epoch dell'ultimo dato o None). ValueError se la stazione non manda la radiazione o il valore non ha senso."""
+    if not isinstance(js, dict) or not isinstance(js.get("currConditionValues"), list):
+        raise ValueError("risposta inattesa")
+    voce = next((x for x in js["currConditionValues"] if isinstance(x, dict) and x.get("sensorDataName") == "Solar Rad"), None)
+    if voce is None:
+        raise ValueError("la stazione non manda la radiazione solare")
+    grezza = voce.get("convertedValue", voce.get("value"))
+    try:
+        w = float(str(grezza).replace(",", "."))
+    except ValueError:
+        raise ValueError(f"radiazione non leggibile ({str(grezza)[:20]})") from None
+    if not 0 <= w <= RADIAZIONE_MAX:
+        raise ValueError("radiazione fuori scala")
+    ult = js.get("lastReceived")
+    ts = int(ult / 1000) if isinstance(ult, (int, float)) and not isinstance(ult, bool) and ult > 1e11 else None
+    return round(w, 1), ts
+
+
 def _stazione_stato(app, url):
     st = app.__dict__.setdefault("stazione_st", {"url": "", "um": None, "ts": 0, "errore": None, "falliti": 0, "prossimo": 0, "vecchio": False})
     if st["url"] != url:
         st.update(url=url, um=None, ts=0, errore=None, falliti=0, prossimo=0, vecchio=False)
     return st
+
+
+def _stazione_radiazione(app, url, ora):
+    """Radiazione solare della stazione (serie esterna.radsolare, W/m²): dai dati di prima fino a ieri c'e' la stima oraria di Open-Meteo, da qui in poi la misura.
+    Un errore qui non tocca la lettura dell'umidita'."""
+    u = stazione_url_radiazione(url)
+    if not u:
+        return
+    try:
+        code, js = http_json("GET", u, {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=STAZIONE_ATTESA)
+        if code != 200:
+            raise ValueError(f"HTTP {code}")
+        w, ts = radiazione_leggi(js)
+        if ora - (ts or ora) > STAZIONE_VECCHIO:              # la stazione non aggiorna: non si salva un valore vecchio come fosse di adesso
+            return
+        rec = Rec()
+        rec.agg_num("esterna.radsolare", ts or ora, w)
+        app.db.salva(rec, ora)
+    except Exception as e:  # noqa: BLE001 - un extra: non deve mai fermare nient'altro
+        log.debug("Stazione meteo: radiazione non salvata (%s)", e)
 
 
 def _stazione_lavoro(app, url):
@@ -821,6 +818,7 @@ def _stazione_lavoro(app, url):
                     app.db.salva(rec, ora)
                 except Exception as e:                        # noqa: BLE001 - non deve mai fermare la lettura
                     log.debug("Stazione meteo: umidita' non salvata (%s)", e)
+                _stazione_radiazione(app, url, ora)
     except Exception as e:
         st["falliti"] += 1
         st["errore"] = str(e)[:120]
@@ -869,10 +867,6 @@ def esterni_giro(app):
         if time.time() >= st["prossimo"]:
             _meteo_lavoro(app, *cfg)
         prossimi.append(st["prossimo"])
-        try:
-            radiazione_lavoro(app, *cfg)
-        except Exception as e:  # noqa: BLE001
-            log.debug("Radiazione solare: %s", e)
     return max(15, min(60, min(prossimi) - int(time.time()))) if prossimi else 60
 
 
@@ -1286,7 +1280,7 @@ def api_dashboard(app, q):
                  "riparte": stima_ripartenza(app, ora, num("casa.temperatura"), ts_("casa.temperatura"),
                                              num("casa.richiesta_calore") == 1.0, num("ciclo.esterna"), num("casa.setpoint")),
                  "vent": vent_stato(db, ora, (stz or {}).get("umidita"), num("ciclo.esterna"), num("casa.temperatura")),   # VENT
-                 "richiesta": num("casa.richiesta_calore") == 1.0, "richiesta_pct": num("casa.richiesta_pct"),
+                 "richiesta": num("casa.richiesta_calore") == 1.0,
                  "ts": ts_("casa.temperatura"), "spark": q_griglia(db, "casa.temperatura", da, a, 60)[0],
                  "spark_um": q_griglia(db, "casa.umidita", da, a, 60)[0]},
         "prestazioni": {k: num(f"ciclo.{k}") for k in ("freq_compressore", "freq_target", "vel_pompa", "portata",
@@ -1323,17 +1317,28 @@ def info_accesso_st(app):
 
 
 def ultimo_ciclo(db, ora):
-    """Ultimo ciclo del compressore concluso (ultimi 3 giorni): {inizio, fine, modo, kwh} oppure None.
-    I kWh vengono dal contatore (en.totale_wh) e si danno solo se la differenza e' leggibile."""
+    """Ultima CORSA del compressore conclusa (ultimi 3 giorni): {inizio, fine, modo, kwh} oppure None.
+    Una corsa va dall'accensione allo spegnimento del compressore: i tratti attaccati (l'inizio di uno e' la fine del precedente, quindi il
+    compressore non si e' mai fermato: es. riscaldamento -> acqua calda -> riscaldamento) sono UN solo ciclo. `modo` e' 'casa', 'acs' oppure
+    'casa+acs' / 'acs+casa' (nell'ordine in cui sono avvenuti); durata e kWh sono quelli dell'intera corsa, acqua calda compresa (kWh dal
+    contatore, en.totale_wh, e si danno solo se la differenza e' leggibile)."""
     try:
         cicli = cicli_compressore(db, ora - 3 * 86400, ora, ora)
     except Exception:
         return None
     if not cicli:
         return None
-    i, f, m = cicli[-1]
+    k = len(cicli) - 1
+    while k > 0 and cicli[k][0] == cicli[k - 1][1]:      # compressore mai fermo tra un tratto e l'altro
+        k -= 1
+    corsa = cicli[k:]
+    i, f = corsa[0][0], corsa[-1][1]
+    modi = []
+    for _, _, m in corsa:
+        if m not in modi:
+            modi.append(m)
     kwh = energia_kwh(db, i, f)
-    return {"inizio": i, "fine": f, "modo": m, "kwh": kwh if kwh and kwh > 0 else None}
+    return {"inizio": i, "fine": f, "modo": "+".join(modi), "kwh": kwh if kwh and kwh > 0 else None}
 
 
 def info_refresh(app):
@@ -1793,6 +1798,51 @@ def cicli_compressore(db, da, a, ora, gap=900):
     return cicli
 
 
+def unisci_riprese(cicli):
+    """[(inizio, fine, modo)] -> [[inizio, fine, modo, secondi_effettivi, riprese]].
+    Quando l'acqua calda parte a compressore acceso e, finita, il riscaldamento riprende senza che il compressore si sia mai fermato, quel
+    secondo tratto di riscaldamento e' una RIPRESA, non un nuovo avvio: lo si unisce al riscaldamento precedente della stessa corsa
+    (inizio del primo, fine dell'ultimo; i secondi effettivi sono la somma dei soli tratti di riscaldamento, l'acqua calda in mezzo non conta)."""
+    out, ult_fine, ult_casa = [], None, None
+    for i, f, m in cicli:
+        if ult_fine is None or i != ult_fine:          # il compressore e' ripartito da fermo (o c'e' un buco nei dati)
+            ult_casa = None
+        if m == "casa" and ult_casa is not None:
+            out[ult_casa][1] = f
+            out[ult_casa][3] += f - i
+            out[ult_casa][4] += 1
+        else:
+            out.append([i, f, m, f - i, 0])
+            if m == "casa":
+                ult_casa = len(out) - 1
+        ult_fine = f
+    return out
+
+
+def gruppi_riscaldamento(segmenti, reali):
+    """Per ogni tratto del grafico «Modo di funzionamento»: None oppure [inizio, fine, minuti_riscaldamento, minuti_acqua_calda]
+    quando il tratto e' un riscaldamento che fa parte di una corsa con piu' tratti di riscaldamento separati da acqua calda
+    (compressore mai fermo). Inizio e fine sono quelli del primo e dell'ultimo tratto: cosi' il tooltip del secondo tratto mostra le info totali."""
+    gr = [None] * len(segmenti)
+    k = 0
+    while k < len(segmenti):
+        if segmenti[k][2] not in ("casa", "acs"):
+            k += 1
+            continue
+        j = k
+        while j + 1 < len(segmenti) and segmenti[j + 1][2] in ("casa", "acs") and segmenti[j + 1][0] == segmenti[j][1]:
+            j += 1
+        casa = [x for x in range(k, j + 1) if segmenti[x][2] == "casa"]
+        if len(casa) >= 2:
+            g = [reali[casa[0]][0], reali[casa[-1]][1],
+                 round(sum(reali[x][1] - reali[x][0] for x in casa) / 60),
+                 round(sum(reali[x][1] - reali[x][0] for x in range(casa[0], casa[-1] + 1) if segmenti[x][2] == "acs") / 60)]
+            for x in casa:
+                gr[x] = g
+        k = j + 1
+    return gr
+
+
 def _mediana(v):
     v = sorted(v)
     n = len(v)
@@ -1951,6 +2001,19 @@ def elenco_sbrinamenti(db, da, a, ora):
             "elenco": out[:SBR_MAX_ELENCO]}
 
 
+COP_DT_MIN = 5.0       # sotto questo salto termico medio (mandata - ritorno) il COP e' solo approssimato: sensori a gradini di 1 °C, errore fino al ±20%
+
+
+def _dt_medio(s):
+    """[somma dei salti termici, celle] -> salto medio in °C, o None."""
+    return round(s[0] / s[1], 1) if s[1] else None
+
+
+def cop_approssimato(dt_casa, dt_acs):
+    """True se il COP (del solo riscaldamento, dell'acqua o totale) poggia su un salto termico medio sotto COP_DT_MIN."""
+    return any(x is not None and x < COP_DT_MIN for x in (dt_casa, dt_acs))
+
+
 def calcola_efficienza(db, da, a, tol, ora, passo=300):
     """Per ogni giorno locale: energia elettrica e calore prodotto stimato (portata x salto termico)
     separati tra riscaldamento casa e acqua calda, COP, cicli. Il calore e' una STIMA."""
@@ -1978,7 +2041,8 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         g = giorni.setdefault(chiave, {
             "giorno": chiave, "ts": _ore_locali(lt),
             "el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
-            "el_cop": {"casa": 0.0, "acs": 0.0}, "min": {"casa": 0, "acs": 0}, "est": [], "nodati_min": 0})
+            "el_cop": {"casa": 0.0, "acs": 0.0}, "min": {"casa": 0, "acs": 0}, "est": [], "nodati_min": 0,
+            "dt": {"casa": [0.0, 0], "acs": [0.0, 0]}})
         if m == "nodati":
             g["nodati_min"] += passo // 60
             continue
@@ -1995,6 +2059,8 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
                 kwh_el, kwh_th = w / 1000.0 * ore_h, kw * ore_h
                 g["calore"][m] += kwh_th
                 g["el_cop"][m] += kwh_el
+                g["dt"][m][0] += max(0.0, mand[i] - rit[i])      # salto termico medio: serve a dire quanto e' (im)preciso il COP
+                g["dt"][m][1] += 1
                 coperte[m] += 1
                 if i in est and kwh_el > 0:
                     b = int(math.floor(est[i] / 2.0)) * 2
@@ -2016,6 +2082,7 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
             "cop_acs": round(g["calore"]["acs"] / g["el_cop"]["acs"], 2) if g["el_cop"]["acs"] > 0.05 else None,
             "cop": round(cal / el_cop, 2) if el_cop > 0.1 else None,
             "min_casa": g["min"]["casa"], "min_acs": g["min"]["acs"],
+            "dt_casa": _dt_medio(g["dt"]["casa"]), "dt_acs": _dt_medio(g["dt"]["acs"]),
             "esterna": round(sum(g["est"]) / len(g["est"]), 1) if g["est"] else None,
             "nodati_min": g["nodati_min"]})
     tot = {"el": {"casa": 0.0, "acs": 0.0, "riposo": 0.0}, "calore": {"casa": 0.0, "acs": 0.0},
@@ -2029,9 +2096,9 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
     cal_c = tot["calore"]["casa"] + tot["calore"]["acs"]
     # cicli: un "ciclo" e' un tratto continuo in un modo
     cicli = {}
-    runs = cicli_compressore(db, da, a, ora)
+    runs = unisci_riprese(cicli_compressore(db, da, a, ora))     # le riprese del riscaldamento dopo l'acqua calda non sono nuovi avvii
     for m in ("casa", "acs"):
-        durate = [(f - i) / 60 for i, f, mm in runs if mm == m]
+        durate = [x[3] / 60 for x in runs if x[2] == m]
         cicli[m] = {"n": len(durate), "media_min": round(sum(durate) / len(durate), 1) if durate else None,
                     "brevi": sum(1 for d in durate if d < 10), "max_min": round(max(durate), 1) if durate else None}
     sbr = elenco_sbrinamenti(db, da, a, ora)
@@ -2041,12 +2108,14 @@ def calcola_efficienza(db, da, a, tol, ora, passo=300):
         curva_cop[m] = [{"da": b, "a": b + 2, "cop": round(d[0] / d[1], 2), "ore": round(d[2] * ore_h, 1)}
                         for b, d in sorted(bins[m].items()) if d[2] >= 6 and d[1] > 0]
     return {
-        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti, "sbr": sbr,
+        "giorni": righe, "bins": curva_cop, "cicli": cicli, "sbrinamenti": sbrinamenti, "sbr": sbr, "cop_dt_min": COP_DT_MIN,
         "tot": {"el_casa": round(tot["el"]["casa"], 1), "el_acs": round(tot["el"]["acs"], 1),
                 "el_riposo": round(tot["el"]["riposo"], 1),
                 "calore_casa": round(tot["calore"]["casa"], 1), "calore_acs": round(tot["calore"]["acs"], 1),
                 "cop_casa": cop("casa"), "cop_acs": cop("acs"),
                 "cop": round(cal_c / el_c, 2) if el_c > 0.1 else None,
+                "dt_casa": _dt_medio([sum(g["dt"]["casa"][0] for g in giorni.values()), sum(g["dt"]["casa"][1] for g in giorni.values())]),
+                "dt_acs": _dt_medio([sum(g["dt"]["acs"][0] for g in giorni.values()), sum(g["dt"]["acs"][1] for g in giorni.values())]),
                 "ore_casa": round(modi["minuti"]["casa"] / 60, 1), "ore_acs": round(modi["minuti"]["acs"] / 60, 1)},
         "copertura": {m: round(100.0 * coperte[m] / totali_celle[m]) if totali_celle[m] else None
                       for m in coperte},
@@ -2417,6 +2486,27 @@ class Gestore(BaseHTTPRequestHandler):
     def do_POST(self):
         self._smista()
 
+    def _webhook_nt(self, app, p):
+        """POST di Netatmo con un evento dello Smarther. Risponde subito; i tentativi con indirizzo sbagliato hanno un limite."""
+        self._chiudi = True
+        nt = next((s for s in app.servizi if getattr(s, "sigla", "") == "nt"), None)
+        ok = (nt is not None and self.command == "POST"
+              and hmac.compare_digest(p[4:].encode(), (nt.wh._cfg().get("webhook_segreto") or "-").encode()))
+        if not ok:
+            if _troppo_veloce("-", ip_client(self)):
+                return self._json({"errore": "troppe richieste"}, 429)
+            return self._invia(404, "Non trovato", "text/plain; charset=utf-8")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = -1
+        if n < 0 or n > 65536:
+            return self._invia(400 if n < 0 else 413, "richiesta non valida", "text/plain; charset=utf-8")
+        self._chiudi = False
+        corpo = self.rfile.read(n) if n else b""
+        codice = nt.wh.ricevi(corpo, self.headers.get("X-Netatmo-secret", ""))
+        return self._invia(codice, "ok" if codice == 200 else "errore", "text/plain; charset=utf-8")
+
     def _smista(self):
         app = self.server.app
         # Una richiesta con un corpo (POST) che poi nessuno legge lascerebbe quel corpo in coda sulla connessione, e verrebbe scambiato per la
@@ -2450,6 +2540,8 @@ class Gestore(BaseHTTPRequestHandler):
                 if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
                     return self._vai("/")   # gia' dentro (es. icona della Home salvata sulla pagina di login)
                 return self._invia(200, self._pagina("login.html", errore=""))
+            if p.startswith("/nt/"):          # webhook di Netatmo (pubblico: lo autentica il segreto nell'indirizzo + la firma del messaggio)
+                return self._webhook_nt(app, p)
             if p.startswith("/plugin/"):      # rotte pubbliche dei plugin (l'autenticazione e' del plugin)
                 return plugin_pubblico(app, self, p, q)
             autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
@@ -2683,7 +2775,6 @@ class Simulatore:
         n("casa.umidita", 52 + 6 * math.sin(ts / 7000) + 0.4 * (10 - s["out"]))
         n("casa.setpoint", 21, True)
         n("casa.richiesta_calore", 1.0 if self.dem else 0.0)
-        n("casa.richiesta_pct", 100 if self.dem else 0)
         n("casa.wifi", 51, True)
         if cicli:
             n("ciclo.esterna", s["out"])
