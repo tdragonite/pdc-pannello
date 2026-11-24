@@ -401,7 +401,7 @@ def cambia_password(app, corpo, h):
     if app.demo:
         return {"ok": False, "messaggio": "In modalità demo non si cambia la password."}
     ip = ip_client(h)
-    if app.limite.bloccato(ip):
+    if app.limite.bloccato(ip, da_casa(h)):
         return {"ok": False, "messaggio": "Troppi tentativi. Riprova più tardi."}
     acc = app.cfg.leggi()["accesso"]
     if not verifica_password(str(corpo.get("attuale", "")), acc.get("password_hash") or ""):
@@ -488,7 +488,7 @@ def reset_database(app, corpo, h):
     if app.demo:
         return {"ok": False, "messaggio": "In modalità demo non si azzera niente."}
     ip = ip_client(h)
-    if app.limite.bloccato(ip):
+    if app.limite.bloccato(ip, da_casa(h)):
         return {"ok": False, "messaggio": "Troppi tentativi. Riprova più tardi."}
     if str(corpo.get("conferma", "")).strip() != "RESETTA":
         return {"ok": False, "messaggio": "Per confermare scrivi esattamente RESETTA (tutto maiuscolo)."}

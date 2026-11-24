@@ -69,7 +69,8 @@ def _valida(ctx, chiave):
 
 
 def _da_casa(rich):
-    """Stessa regola delle regolazioni della pompa: niente intestazioni di tunnel o proxy, e indirizzo privato o locale."""
+    """Stessa regola delle regolazioni della pompa: niente intestazioni di tunnel o proxy, e indirizzo privato o locale.
+    Copia di da_casa() in sorgenti/2_web.py (un plugin non vede le funzioni del pannello): se cambi una, cambia anche l'altra."""
     if any(rich.intestazioni.get(x) for x in _DA_PROXY):
         return False
     try:

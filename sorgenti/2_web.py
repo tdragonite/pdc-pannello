@@ -125,11 +125,13 @@ class LimiteLogin:
             if not self.falliti[k]:
                 del self.falliti[k]
 
-    def bloccato(self, ip):
+    def bloccato(self, ip, locale=False):
+        """locale=True (richiesta da casa): vale solo il limite del singolo indirizzo, non il tetto totale, cosi' chi sbaglia
+        password da fuori non puo' chiudere fuori anche chi e' in casa."""
         with self.lock:
             self._pulisci()
             return (len(self.falliti.get(ip, [])) >= self.MAX_IP
-                    or sum(len(v) for v in self.falliti.values()) >= self.MAX_TOT)
+                    or (not locale and sum(len(v) for v in self.falliti.values()) >= self.MAX_TOT))
 
     def fallito(self, ip):
         with self.lock:
@@ -2370,7 +2372,8 @@ def ip_client(h):
 
 def da_casa(h):
     """True solo se la richiesta arriva dalla rete di casa: niente intestazioni del tunnel Cloudflare (le mette sempre
-    lui) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno."""
+    lui) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno.
+    Ne esiste una copia in plugin_esempio/analisi.py (_da_casa): un plugin non vede le funzioni del pannello. Se cambi una, cambia anche l'altra."""
     if any(h.headers.get(x) for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "Cf-Visitor")):
         return False
     try:
@@ -2571,7 +2574,7 @@ class Gestore(BaseHTTPRequestHandler):
         except (ConnectionError, TimeoutError):     # il browser se n'e' andato a meta' (pipe rotta, reset, abort 10053 di Windows)
             pass
         except Exception:
-            log.exception("errore nella richiesta web %s", self.path)
+            log.exception("errore nella richiesta web %s", "/nt/..." if self.path.startswith("/nt/") else self.path)   # il segreto del webhook non va nel log
             try:
                 self._json({"errore": "errore interno"}, 500)
             except Exception:
@@ -2618,7 +2621,7 @@ class Gestore(BaseHTTPRequestHandler):
         self._chiudi = True      # in tutti i casi di rifiuto (e se il corpo supera il limite) il corpo non viene letto per intero
         if origine and origine != "null" and urlparse(origine).netloc != self.headers.get("Host", ""):
             return self._invia(403, "Richiesta non consentita", "text/plain; charset=utf-8")
-        if app.limite.bloccato(ip):
+        if app.limite.bloccato(ip, da_casa(self)):
             return self._invia(429, self._pagina("login.html", errore="Troppi tentativi. Riprova tra 15 minuti."))
         try:
             n = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
