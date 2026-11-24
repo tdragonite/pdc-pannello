@@ -35,7 +35,7 @@ def compatta_storico(db, giorni, minuti, ora=None, elimina_blob=True, blocco_gio
     for serie in series:
         t0 = primo - primo % passo
         while t0 < limite:
-            t1 = min(limite, t0 + blocco_giorni * 86400)
+            t1 = min(limite, t0 + blocco_giorni * 86400 // passo * passo)   # fine blocco sempre su un confine di media: altrimenti una media verrebbe tagliata a meta'
             with db.lock, closing(db._c()) as c, c:
                 gruppi = c.execute(
                     "SELECT ts/?1 AS b, COUNT(*), AVG(valore), MAX(ts) FROM misure WHERE serie=?2 AND ts>=?3 AND ts<?4 "

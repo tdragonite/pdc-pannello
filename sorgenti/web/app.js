@@ -2408,7 +2408,7 @@ async function carica() {
   }
 }
 let attesa = null;
-const presto = () => { clearTimeout(attesa); attesa = setTimeout(() => { if (finestra().live) carica(); }, S.pagina === 'dashboard' ? 400 : 3000); };
+const presto = () => { clearTimeout(attesa); attesa = setTimeout(() => { if (!document.hidden && finestra().live) carica(); }, S.pagina === 'dashboard' ? 400 : 3000); };
 
 let flusso = null, ultimoMsg = 0;
 // Safari chiude il canale in tempo reale (EventSource) quando la scheda dorme o la rete cambia, e spesso non lo riapre da solo:
@@ -2477,7 +2477,7 @@ function avvia() {
   ricordaFinestra();
   datiIniziali() || carica();
   collega();
-  setInterval(() => { if (finestra().live) carica(); }, 60000);
+  setInterval(() => { if (!document.hidden && finestra().live) carica(); }, 60000);   // scheda nascosta: niente carico, al ritorno si ricarica da sola (visibilitychange)
   setInterval(stato, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { controllaFlusso(); if (finestra().live) carica(); } });
   window.addEventListener('pageshow', controllaFlusso); window.addEventListener('online', controllaFlusso);

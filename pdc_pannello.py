@@ -1355,7 +1355,7 @@ class WebhookNT(threading.Thread):
             except Exception:
                 log.exception("webhook Netatmo: errore nel controllo")
                 self._fuori("errore interno", guasto=True)
-            self.fermo.wait(60)
+            self.fermo.wait(120)     # attivo() vale 300 s dall'ultimo controllo: ogni 2 minuti basta e avanza (prima ogni minuto)
 
 
 class ServizioNT(Raccoglitore):
@@ -4612,7 +4612,7 @@ async function carica() {
   }
 }
 let attesa = null;
-const presto = () => { clearTimeout(attesa); attesa = setTimeout(() => { if (finestra().live) carica(); }, S.pagina === 'dashboard' ? 400 : 3000); };
+const presto = () => { clearTimeout(attesa); attesa = setTimeout(() => { if (!document.hidden && finestra().live) carica(); }, S.pagina === 'dashboard' ? 400 : 3000); };
 
 let flusso = null, ultimoMsg = 0;
 // Safari chiude il canale in tempo reale (EventSource) quando la scheda dorme o la rete cambia, e spesso non lo riapre da solo:
@@ -4681,7 +4681,7 @@ function avvia() {
   ricordaFinestra();
   datiIniziali() || carica();
   collega();
-  setInterval(() => { if (finestra().live) carica(); }, 60000);
+  setInterval(() => { if (!document.hidden && finestra().live) carica(); }, 60000);   // scheda nascosta: niente carico, al ritorno si ricarica da sola (visibilitychange)
   setInterval(stato, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { controllaFlusso(); if (finestra().live) carica(); } });
   window.addEventListener('pageshow', controllaFlusso); window.addEventListener('online', controllaFlusso);
@@ -8769,6 +8769,7 @@ _SEGRETI = [
     (re.compile(r"(?i)((?:access_token|refresh_token|client_secret|secret|password|passwd|pat|token|api_key|apikey)[\"']?\s*[:=]\s*[\"']?)[^\s,\"'}&]+"), r"\1***"),
     (re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{30,}\b"), "***"),
     (re.compile(r"(/plugin/)[^\s\"'?]+"), r"\1***"),             # le rotte pubbliche dei plugin contengono un segreto
+    (re.compile(r"(/nt/)[^\s\"'?]+"), r"\1***"),                 # idem il webhook Netatmo (segreto da 32 caratteri: sotto la soglia della regola generica)
     (re.compile(r"[A-Za-z0-9_\-]{40,}"), "***"),
 ]
 
@@ -9523,7 +9524,7 @@ def compatta_storico(db, giorni, minuti, ora=None, elimina_blob=True, blocco_gio
     for serie in series:
         t0 = primo - primo % passo
         while t0 < limite:
-            t1 = min(limite, t0 + blocco_giorni * 86400)
+            t1 = min(limite, t0 + blocco_giorni * 86400 // passo * passo)   # fine blocco sempre su un confine di media: altrimenti una media verrebbe tagliata a meta'
             with db.lock, closing(db._c()) as c, c:
                 gruppi = c.execute(
                     "SELECT ts/?1 AS b, COUNT(*), AVG(valore), MAX(ts) FROM misure WHERE serie=?2 AND ts>=?3 AND ts<?4 "

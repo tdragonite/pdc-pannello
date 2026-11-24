@@ -429,6 +429,7 @@ _SEGRETI = [
     (re.compile(r"(?i)((?:access_token|refresh_token|client_secret|secret|password|passwd|pat|token|api_key|apikey)[\"']?\s*[:=]\s*[\"']?)[^\s,\"'}&]+"), r"\1***"),
     (re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{30,}\b"), "***"),
     (re.compile(r"(/plugin/)[^\s\"'?]+"), r"\1***"),             # le rotte pubbliche dei plugin contengono un segreto
+    (re.compile(r"(/nt/)[^\s\"'?]+"), r"\1***"),                 # idem il webhook Netatmo (segreto da 32 caratteri: sotto la soglia della regola generica)
     (re.compile(r"[A-Za-z0-9_\-]{40,}"), "***"),
 ]
 

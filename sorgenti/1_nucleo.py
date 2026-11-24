@@ -1355,7 +1355,7 @@ class WebhookNT(threading.Thread):
             except Exception:
                 log.exception("webhook Netatmo: errore nel controllo")
                 self._fuori("errore interno", guasto=True)
-            self.fermo.wait(60)
+            self.fermo.wait(120)     # attivo() vale 300 s dall'ultimo controllo: ogni 2 minuti basta e avanza (prima ogni minuto)
 
 
 class ServizioNT(Raccoglitore):
