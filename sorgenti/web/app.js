@@ -266,6 +266,7 @@ function tooltipTimeline(e) {
 }
 
 function riga(k, v) { return `<div class="riga"><span>${k}</span><b>${v}</b></div>`; }
+function tileHtml(et, val, sub, cf) { return `<div class="tile"><small>${et}</small><b>${val}</b>${sub ? `<small>${sub}</small>` : ''}${cf || ''}</div>`; }
 const online = b => `<span class="pill ${b == null ? 'no' : b ? 'si' : 'off'}">${b == null ? '—' : b ? 'ONLINE' : 'OFFLINE'}</span>`;
 const sino = b => `<span class="pill ${b ? 'si' : 'off'}">${b ? 'ACCESO' : 'SPENTO'}</span>`;
 // ---- comandi: accendi/spegni (sbloccabili per 30 secondi) ----
@@ -1450,7 +1451,7 @@ function notaConf(d) {
 function cardBollitore(d) {
   const b = d.bollitore, pb = S.confronto && d.prec && d.prec.completo ? d.prec.bollitore : null;
   const conf = (v, fmtv) => pb === undefined || !S.confronto || !d.prec || !d.prec.completo ? '' : `<small class="conf-t">${v == null ? 'Prima: dati insufficienti' : 'Prima ' + fmtv(v)}</small>`;
-  const t = (et, val, sub, cf) => `<div class="tile"><small>${et}</small><b>${val}</b>${sub ? `<small>${sub}</small>` : ''}${cf || ''}</div>`;
+  const t = tileHtml;
   const p = b && b.perdita, sa = b && b.salita, g = b && b.giorno, pp_ = pb && pb.perdita, ps = pb && pb.salita, pg = pb && pb.giorno;
   const tiles = (p ? t('Perdita di notte', num(p.gradi_ora, 2) + ' °C/h', `circa ${num(p.watt, 0)} W · ${p.notti} notti`,
       conf(pp_ ? pp_.gradi_ora : null, v => num(v, 2) + ' °C/h')) : t('Perdita di notte', '—', 'servono almeno 2 notti senza acqua calda'))
@@ -1541,7 +1542,7 @@ document.addEventListener('click', ev => {
 });
 
 function cicliHtml(d) {
-  const c = d.cicli, t = (k, v) => `<div class="tile"><small>${k}</small><b>${v}</b></div>`;
+  const c = d.cicli, t = tileHtml;
   const dm = x => x == null ? '—' : durata(Math.round(x));
   const gr = (cl, tit, righe) => `<div class="cg ${cl}"><h3 class="eti"><i></i>${tit}</h3><div class="tiles">${righe}</div></div>`;
   return gr('c-casa', 'Riscaldamento', t('Cicli', c.casa.n) + t('Durata media', dm(c.casa.media_min))) +

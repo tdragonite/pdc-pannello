@@ -179,8 +179,7 @@ def main(argv=None, base=AQUI):
     if a.comando == "ripristina":
         return cmd_ripristina(app)
     if a.comando == "telegram-prova":
-        tg = Telegram(app)
-        _, _, err = tg.credenziali()
+        tg, err = telegram_pronto(app)
         if err:
             print("PROBLEMA:", err)
             return 1

@@ -527,15 +527,21 @@ def cf_scarica(app, corpo, h):
     return {"ok": True, "versione": v or "installato"}
 
 
-@api_post("/api/cloudflare/avvia")
-def cf_avvia(app, corpo, h):
+def _avvia_tunnel(app, riavvia=False):
     try:
         t = tunnel(app)
+        if riavvia:
+            t.ferma(spegni=False)
         t.ultimo_errore = None
         t.avvia()
     except ErroreCF as e:
         return _risposta_errore(e)
     return {"ok": True}
+
+
+@api_post("/api/cloudflare/avvia")
+def cf_avvia(app, corpo, h):
+    return _avvia_tunnel(app)
 
 
 @api_post("/api/cloudflare/ferma")
@@ -552,8 +558,7 @@ def cf_telegram(app, corpo, h):
     c = app.cfg.leggi().get("cloudflare") or {}
     if not c.get("hostname"):
         return {"ok": False, "messaggio": "L'accesso da internet non è ancora configurato."}
-    tg = getattr(app, "telegram", None) or Telegram(app)
-    _, _, err = tg.credenziali()
+    tg, err = telegram_pronto(app)
     if err:
         return {"ok": False, "messaggio": err}
     nome = esc_html(tg.cfg().get("nome_impianto") or "Pompa di calore")
@@ -563,14 +568,7 @@ def cf_telegram(app, corpo, h):
 
 @api_post("/api/cloudflare/riavvia")
 def cf_riavvia(app, corpo, h):
-    try:
-        t = tunnel(app)
-        t.ferma(spegni=False)
-        t.ultimo_errore = None
-        t.avvia()
-    except ErroreCF as e:
-        return _risposta_errore(e)
-    return {"ok": True}
+    return _avvia_tunnel(app, riavvia=True)
 
 
 @api_post("/api/cloudflare/opzioni")

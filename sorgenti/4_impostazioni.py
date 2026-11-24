@@ -223,8 +223,7 @@ _cache_db = {"t": 0, "v": None}
 def info_database(app):
     if time.time() - _cache_db["t"] < 300 and _cache_db["v"]:
         return _cache_db["v"]
-    with closing(app.db._c()) as c:
-        n, primo = c.execute("SELECT COUNT(*), MIN(ts) FROM misure").fetchone()
+    n, primo = app.db.uno("SELECT COUNT(*), MIN(ts) FROM misure")
     try:
         peso = os.path.getsize(app.db.path) / 1e6
     except OSError:
@@ -254,8 +253,7 @@ def stato_collegamenti(app, ora):
     def sv(sigla):
         s = srv.get(sigla)
         return {"ultimo_ok": s.stato["ultimo_ok"], "messaggio": s.stato["messaggio"]} if s else {"ultimo_ok": None, "messaggio": None}
-    tg = getattr(app, "telegram", None) or Telegram(app)
-    _, _, err = tg.credenziali()
+    tg, err = telegram_pronto(app)
     nt = cfg["netatmo"]
     return {
         "versione": VERSIONE, "python": sys.version.split()[0], "demo": app.demo,
@@ -388,8 +386,7 @@ def salva_impostazioni(app, corpo, h):
 def prova_telegram(app, corpo, h):
     if app.demo:
         return {"ok": False, "messaggio": "In modalità demo non si invia nulla."}
-    tg = getattr(app, "telegram", None) or Telegram(app)
-    _, _, err = tg.credenziali()
+    tg, err = telegram_pronto(app)
     if err:
         return {"ok": False, "messaggio": err}
     ok, msg = tg.invia_ora(tg.formatta("prova", "prova", "info", ""))

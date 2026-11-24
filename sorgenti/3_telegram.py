@@ -99,13 +99,14 @@ TELEGRAM_DEFAULT = {
 
 
 def _cerca_chiave(dati, percorso):
-    cur = dati
-    for p in str(percorso).split("."):
-        if isinstance(cur, dict) and p in cur:
-            cur = cur[p]
-        else:
-            return None
-    return cur if isinstance(cur, (str, int)) and str(cur).strip() else None
+    v = _leggi_percorso(dati, str(percorso))
+    return v if isinstance(v, (str, int)) and str(v).strip() else None
+
+
+def telegram_pronto(app):
+    """-> (telegram, errore): quello del pannello (o uno nuovo, per provare) e il motivo per cui non si puo' usare, se c'e'."""
+    tg = getattr(app, "telegram", None) or Telegram(app)
+    return tg, tg.credenziali()[2]
 
 
 def _chiavi_file(dati, prefisso=""):

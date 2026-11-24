@@ -207,9 +207,7 @@ def api_controlli(app, corpo, gestore):
 
 def elenco_comandi(app, massimo=100):
     """Gli ultimi comandi dati dal pannello: [{ts, cosa, acceso, ip, esito}], dal piu' recente."""
-    with closing(app.db._c()) as c:
-        righe = c.execute("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'cmd.%' ORDER BY ts DESC LIMIT ?",
-                          (massimo,)).fetchall()
+    righe = app.db.tutti("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'cmd.%' ORDER BY ts DESC LIMIT ?", massimo)
     out = []
     for serie, ts, v in righe:
         parti = (v.split("|") + ["", "", ""])[:3]
@@ -490,8 +488,7 @@ _boost_lock = threading.Lock()
 
 
 def _boost_leggi(app):
-    with closing(app.db._c()) as c:
-        r = c.execute("SELECT valore FROM stati WHERE serie='boost.attivo' ORDER BY ts DESC LIMIT 1").fetchone()
+    r = app.db.uno("SELECT valore FROM stati WHERE serie='boost.attivo' ORDER BY ts DESC LIMIT 1")
     try:
         d = json.loads(r[0]) if r and r[0] else None
     except ValueError:

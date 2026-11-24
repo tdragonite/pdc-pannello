@@ -353,9 +353,8 @@ def _leggibile(serie, v):
 def storico_versioni(app, massimo=40):
     """{cambi: [{ts, dispositivo, cosa, prima, dopo}] dal piu' recente, iniziale: [{ts, dispositivo, cosa, valore}]}.
     Il primo valore visto di ogni serie non e' un cambio: finisce in 'iniziale' (cosa c'era quando il pannello ha iniziato)."""
-    with closing(app.db._c()) as c:
-        righe = c.execute(f"SELECT ts, serie, valore FROM stati WHERE serie IN ({','.join('?' * len(STORICO_SERIE))}) "
-                          "ORDER BY ts", tuple(STORICO_SERIE)).fetchall()
+    righe = app.db.tutti(f"SELECT ts, serie, valore FROM stati WHERE serie IN ({','.join('?' * len(STORICO_SERIE))}) "
+                         "ORDER BY ts", *STORICO_SERIE)
     prec, cambi, iniziale = {}, [], []
     for ts, serie, v in righe:
         dev, cosa = STORICO_SERIE[serie]
@@ -743,8 +742,7 @@ def _reg_uguali(cosa, a, b):
 
 def regolazioni_dati(app, ult, adesso):
     """Valori attuali, scelte possibili e modifiche in attesa. -> ({cosa: {...}}, cronologia)"""
-    with closing(app.db._c()) as c:
-        mod = c.execute("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'regmod.%' ORDER BY ts").fetchall()
+    mod = app.db.tutti("SELECT serie, ts, valore FROM stati WHERE serie LIKE 'regmod.%' ORDER BY ts")
     richieste = {}
     for serie, ts, v in mod:
         parti = (v.split("|") + ["", "", "", ""])[:4]

@@ -95,8 +95,7 @@ class Sessioni:
     def valida(self, token):
         if not token:
             return False
-        with closing(self.db._c()) as c:
-            r = c.execute("SELECT scade FROM sessioni WHERE h=?", (self._h(token),)).fetchone()
+        r = self.db.uno("SELECT scade FROM sessioni WHERE h=?", self._h(token))
         return bool(r and r[0] > time.time())
 
     def elimina_altre(self, token):
@@ -188,22 +187,17 @@ def soglie_umidita(app):
 
 
 def q_serie(db, serie, da, a):
-    with closing(db._c()) as c:
-        return c.execute("SELECT ts, valore FROM misure WHERE serie=? AND ts BETWEEN ? AND ? ORDER BY ts",
-                         (serie, int(da), int(a))).fetchall()
+    return db.tutti("SELECT ts, valore FROM misure WHERE serie=? AND ts BETWEEN ? AND ? ORDER BY ts", serie, int(da), int(a))
 
 
 def q_primo_ts(db):
     """Quando e' il primo dato di pompa che il pannello ha (per sapere se il periodo di confronto e' coperto)."""
-    with closing(db._c()) as c:
-        r = c.execute("SELECT MIN(ts) FROM misure WHERE serie='ciclo.freq_compressore'").fetchone()
+    r = db.uno("SELECT MIN(ts) FROM misure WHERE serie='ciclo.freq_compressore'")
     return r[0] if r and r[0] is not None else None
 
 
 def q_valore_a(db, serie, t):
-    with closing(db._c()) as c:
-        r = c.execute("SELECT valore FROM misure WHERE serie=? AND ts<=? ORDER BY ts DESC LIMIT 1",
-                      (serie, int(t))).fetchone()
+    r = db.uno("SELECT valore FROM misure WHERE serie=? AND ts<=? ORDER BY ts DESC LIMIT 1", serie, int(t))
     return r[0] if r else None
 
 
@@ -332,8 +326,7 @@ def energia_kwh(db, da, a):
         return None
     e0 = q_valore_a(db, "en.totale_wh", da)
     if e0 is None:
-        with closing(db._c()) as c:
-            r = c.execute("SELECT valore FROM misure WHERE serie='en.totale_wh' ORDER BY ts LIMIT 1").fetchone()
+        r = db.uno("SELECT valore FROM misure WHERE serie='en.totale_wh' ORDER BY ts LIMIT 1")
         e0 = r[0] if r else e1
     return round(max(0.0, e1 - e0) / 1000, 3)
 
@@ -1087,9 +1080,8 @@ def ripartenza_eta(fit, ora, t_casa, esterna, target, spenta_da, t_alla_fine, di
 
 def _celle_sql(db, serie, da, a, funz):
     """{cella: valore} con una sola query: media (o massimo) per cella di 5 minuti."""
-    with closing(db._c()) as c:
-        righe = c.execute(f"SELECT ts/{RIP_PASSO} AS b, {funz}(valore) FROM misure WHERE serie=? AND ts BETWEEN ? AND ? "
-                          "GROUP BY b", (serie, int(da), int(a))).fetchall()
+    righe = db.tutti(f"SELECT ts/{RIP_PASSO} AS b, {funz}(valore) FROM misure WHERE serie=? AND ts BETWEEN ? AND ? "
+                     "GROUP BY b", serie, int(da), int(a))
     return {b: v for b, v in righe if v is not None}
 
 
@@ -1187,9 +1179,7 @@ def stima_ripartenza(app, ora, t_casa, ts_casa, richiesta, esterna, target, diag
     if blocco:
         return None
     # da quando lo Smarther ha smesso di chiedere, e a che temperatura eravamo
-    with closing(db._c()) as c:
-        r = c.execute("SELECT MAX(ts) FROM misure WHERE serie='casa.richiesta_calore' AND valore>=0.5 AND ts>?",
-                      (int(ora - 6 * 3600),)).fetchone()
+    r = db.uno("SELECT MAX(ts) FROM misure WHERE serie='casa.richiesta_calore' AND valore>=0.5 AND ts>?", int(ora - 6 * 3600))
     spenta_da = t_fine = None
     if r and r[0] is not None:
         spenta_da = max(0, ora - r[0])
@@ -1412,8 +1402,7 @@ def costo_mese(app, ora):
     inizio = datetime(adesso.year, adesso.month, 1)
     prec = datetime(adesso.year - (adesso.month == 1), 12 if adesso.month == 1 else adesso.month - 1, 1)
     fine = datetime(adesso.year + (adesso.month == 12), 1 if adesso.month == 12 else adesso.month + 1, 1)
-    with closing(db._c()) as c:
-        r = c.execute("SELECT MIN(ts) FROM misure WHERE serie='en.totale_wh'").fetchone()
+    r = db.uno("SELECT MIN(ts) FROM misure WHERE serie='en.totale_wh'")
     primo = r[0] if r and r[0] is not None else None
     if primo is None:
         return None
@@ -1484,18 +1473,16 @@ def q_griglia(db, serie, da, a, n):
     """Media per intervalli uguali: [[ts_centro, valore]]. Massimo ~n punti."""
     da, a = int(da), int(a)
     dim = max(1, (a - da) // n)
-    with closing(db._c()) as c:
-        righe = c.execute("SELECT (ts-?)/? AS b, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<=? "
-                          "GROUP BY b ORDER BY b", (da, dim, serie, da, a)).fetchall()
+    righe = db.tutti("SELECT (ts-?)/? AS b, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<=? "
+                     "GROUP BY b ORDER BY b", da, dim, serie, da, a)
     return [[da + b * dim + dim // 2, round(v, 2)] for b, v in righe], dim
 
 
 def q_potenza_a_gradini(db, da, a):
     """Potenza elettrica come 'gradini': ogni rapporto di SmartThings vale per la sua finestra (inizio-fine) ed e' una media,
     non un istante. Cosi' la linea e' continua e dice la verita' (prima: un punto ogni ~15 min, spezzato in tanti pezzetti)."""
-    with closing(db._c()) as c:
-        righe = c.execute("SELECT p.ts, p.valore, f.valore FROM misure p LEFT JOIN misure f ON f.serie='en.finestra_s' AND f.ts=p.ts "
-                          "WHERE p.serie='pot.watt' AND p.ts BETWEEN ? AND ? ORDER BY p.ts", (int(da), int(a) + 3 * 3600)).fetchall()
+    righe = db.tutti("SELECT p.ts, p.valore, f.valore FROM misure p LEFT JOIN misure f ON f.serie='en.finestra_s' AND f.ts=p.ts "
+                     "WHERE p.serie='pot.watt' AND p.ts BETWEEN ? AND ? ORDER BY p.ts", int(da), int(a) + 3 * 3600)
     pts, ult = [], int(da)
     for ts, w, fin in righe:
         t0 = ts - int(fin) if fin and 60 <= fin <= 3 * 3600 else ts
@@ -1524,15 +1511,6 @@ def dirada_richiesta(punti, passo_max=600):
 
 # ---------- Finestre aperte (riconosciute dai dati) ----------
 FIN_BASE = {"calo": 0.5, "ah": None}     # calo minimo in gradi; variazione minima (negativa) dell'umidita' assoluta, None = non richiesta
-
-
-def fin_tabella(db):
-    """La tabella nasce all'avvio; se il pannello e' stato aggiornato a caldo si crea qui, una volta sola."""
-    if not getattr(db, "_fin_ok", False):
-        with db.lock, closing(db._c()) as c, c:
-            c.execute("CREATE TABLE IF NOT EXISTS finestre(da INTEGER PRIMARY KEY, a INTEGER NOT NULL, calo REAL, ah REAL,"
-                      " stato TEXT NOT NULL, manuale INTEGER NOT NULL DEFAULT 0)")
-        db._fin_ok = True
 
 
 def fin_soglie(db):
@@ -1608,7 +1586,6 @@ def fin_rileva(db, da, a, soglie=None):
 def fin_eventi(db, da, a):
     """Quello che il grafico mostra: le finestre confermate (anche a mano) e quelle ancora da confermare.
     Le risposte «no» spariscono, e con loro i rilevamenti che si sovrappongono."""
-    fin_tabella(db)
     with closing(db._c()) as c:
         reg = c.execute("SELECT da, a, calo, ah, stato, manuale FROM finestre WHERE a > ? AND da < ? ORDER BY da", (int(da), int(a))).fetchall()
         tot = c.execute("SELECT COUNT(*) FROM finestre WHERE manuale=0").fetchone()[0]
@@ -1623,8 +1600,7 @@ def fin_eventi(db, da, a):
 
 def fin_calibra(db):
     """Dopo almeno 10 risposte (con almeno 2 si' e 2 no) sceglie le soglie che sbagliano meno sulle risposte date."""
-    with closing(db._c()) as c:
-        righe = c.execute("SELECT calo, ah, stato FROM finestre WHERE calo IS NOT NULL").fetchall()
+    righe = db.tutti("SELECT calo, ah, stato FROM finestre WHERE calo IS NOT NULL")
     si = [r for r in righe if r[2] == "si"]
     no = [r for r in righe if r[2] == "no"]
     if len(righe) < 10 or len(si) < 2 or len(no) < 2:
@@ -1651,7 +1627,6 @@ def _num_fin(v):
 
 @api_post("/api/finestre/giudica")
 def api_fin_giudica(app, corpo, h):
-    fin_tabella(app.db)
     da, a, calo, ah = _num_fin(corpo.get("da")), _num_fin(corpo.get("a")), _num_fin(corpo.get("calo")), _num_fin(corpo.get("ah"))
     stato = corpo.get("stato")
     if da is None or a is None or a <= da or a - da > 86400 or stato not in ("si", "no"):
@@ -1665,7 +1640,6 @@ def api_fin_giudica(app, corpo, h):
 
 @api_post("/api/finestre/manuale")
 def api_fin_manuale(app, corpo, h):
-    fin_tabella(app.db)
     da, a = _num_fin(corpo.get("da")), _num_fin(corpo.get("a"))
     if da is None or a is None or a <= da or a - da > 86400:
         return {"ok": False, "errore": "L'intervallo non è valido (max 24 ore)."}
@@ -1687,7 +1661,6 @@ def api_fin_manuale(app, corpo, h):
 
 @api_post("/api/finestre/annulla")
 def api_fin_annulla(app, corpo, h):
-    fin_tabella(app.db)
     da = _num_fin(corpo.get("da"))
     if da is None:
         return {"ok": False, "errore": "Dati non validi."}
@@ -1761,9 +1734,8 @@ def api_analisi(app, q):
 
 
 def _celle(db, serie, da, a, passo):
-    with closing(db._c()) as c:
-        righe = c.execute("SELECT (ts-?)/? AS b, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<?"
-                          " GROUP BY b", (da, passo, serie, da, a)).fetchall()
+    righe = db.tutti("SELECT (ts-?)/? AS b, AVG(valore) FROM misure WHERE serie=? AND ts>=? AND ts<?"
+                     " GROUP BY b", da, passo, serie, da, a)
     return dict(righe)
 
 
@@ -2248,24 +2220,38 @@ def _png(n, tipo_colore, righe, alto=None):
             + chunk(b"IDAT", zlib.compress(b"".join(righe), 9)) + chunk(b"IEND", b""))
 
 
+_PUNTO = (52, 211, 176)      # turchese del punto al centro
+
+
+def _simbolo(x, y, n, r_anello, spessore, r_punto, bordo):
+    """Il simbolo (anello sfumato con un punto turchese al centro) nel pixel (x, y) di un quadrato di lato n.
+    -> (colore RGB dell'anello, opacita' dell'anello, opacita' del punto)."""
+    dx, dy = x + .5 - n / 2, y + .5 - n / 2
+    d = math.hypot(dx, dy)
+    k = dx / n + .5
+    return ([255 - 60 * k, 107 + 90 * k, 87 - 20 * k],
+            _liscio(abs(d - n * r_anello) - n * spessore, bordo), _liscio(d - n * r_punto, bordo))
+
+
+def _simbolo_trasparente(x, y, n):
+    """Il simbolo senza sfondo (favicon e schermate di avvio). -> (colore RGB, opacita')."""
+    col, a, p = _simbolo(x, y, n, .37, .075, .13, 1.1)
+    if p:
+        col = [col[i] * (1 - p) + _PUNTO[i] * p for i in range(3)]
+        a = max(a, p)
+    return col, a
+
+
 def png_icona(n=180):
     righe = []
     for y in range(n):
         r = bytearray([0])
+        t = y / n
         for x in range(n):
-            dx, dy = x + .5 - n / 2, y + .5 - n / 2
-            d = math.hypot(dx, dy)
-            t = y / n
             col = [11 + 12 * t, 15 + 14 * t, 23 + 30 * t]
-            anello = _liscio(abs(d - n * .27) - n * .055, 1.4)
-            if anello:
-                k = (dx / n + .5)
-                c2 = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
-                col = [col[i] * (1 - anello) + c2[i] * anello for i in range(3)]
-            punto = _liscio(d - n * .095, 1.4)
-            if punto:
-                c3 = [52, 211, 176]
-                col = [col[i] * (1 - punto) + c3[i] * punto for i in range(3)]
+            c2, anello, punto = _simbolo(x, y, n, .27, .055, .095, 1.4)
+            col = [col[i] * (1 - anello) + c2[i] * anello for i in range(3)]
+            col = [col[i] * (1 - punto) + _PUNTO[i] * punto for i in range(3)]
             r += bytes(int(max(0, min(255, v))) for v in col)
         righe.append(bytes(r))
     return _png(n, 2, righe)
@@ -2277,15 +2263,7 @@ def png_favicon(n=64):
     for y in range(n):
         r = bytearray([0])
         for x in range(n):
-            dx, dy = x + .5 - n / 2, y + .5 - n / 2
-            d = math.hypot(dx, dy)
-            a = _liscio(abs(d - n * .37) - n * .075, 1.1)
-            k = dx / n + .5
-            col = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
-            p = _liscio(d - n * .13, 1.1)
-            if p:
-                col = [col[i] * (1 - p) + (52, 211, 176)[i] * p for i in range(3)]
-                a = max(a, p)
+            col, a = _simbolo_trasparente(x, y, n)
             r += bytes(int(max(0, min(255, v))) for v in col) + bytes([int(a * 255)])
         righe.append(bytes(r))
     return _png(n, 6, righe)
@@ -2308,15 +2286,7 @@ def png_avvio(w, h):
     for y in range(n):
         r = bytearray(b"\x00" + fondo * x0)
         for x in range(n):
-            dx, dy = x + .5 - n / 2, y + .5 - n / 2
-            d = math.hypot(dx, dy)
-            a = _liscio(abs(d - n * .37) - n * .075, 1.1)
-            k = dx / n + .5
-            col = [255 - 60 * k, 107 + 90 * k, 87 - 20 * k]
-            pt = _liscio(d - n * .13, 1.1)
-            if pt:
-                col = [col[i] * (1 - pt) + (52, 211, 176)[i] * pt for i in range(3)]
-                a = max(a, pt)
+            col, a = _simbolo_trasparente(x, y, n)
             r += bytes(int(max(0, min(255, fondo[i] * (1 - a) + col[i] * a))) for i in range(3))
         r += fondo * (w - x0 - n)
         righe[y0 + y] = bytes(r)
@@ -2842,6 +2812,4 @@ class RaccoltaDemo(threading.Thread):
         while not self.fermo.wait(20):
             ts = int(time.time())
             rec = self.sim.record(ts, self.sim.passo(ts))
-            cambiati = self.app.db.salva(rec, ts)
-            for cb in list(self.app.bus):
-                cb(cambiati)
+            self.app.notifica(self.app.db.salva(rec, ts))

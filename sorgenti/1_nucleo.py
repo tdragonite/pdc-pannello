@@ -493,6 +493,16 @@ class DB:
     def _c(self):
         return sqlite3.connect(self.path, timeout=30)
 
+    def tutti(self, sql, *args):
+        """Una query di lettura: tutte le righe (la connessione si apre e si chiude da sola)."""
+        with closing(self._c()) as c:
+            return c.execute(sql, args).fetchall()
+
+    def uno(self, sql, *args):
+        """Una query di lettura: la prima riga, oppure None."""
+        with closing(self._c()) as c:
+            return c.execute(sql, args).fetchone()
+
     # Dal 5/11 17:25 la pompa rimanda a volte lo stesso istante con la portata corrotta (vedi docs/manutenzione-e-problemi.md):
     # i valori assurdi si scartano gia' in decodifica (max 60 L/min), qui si registrano solo le versioni diverse.
     DIAG_MAX_BYTE = 400_000  # il file di diagnostica smette di crescere oltre questa dimensione
@@ -986,11 +996,7 @@ class Raccoglitore(threading.Thread):
             ev.chiudi_prefisso(f"{s}_conn_")
             ev.chiudi(f"{s}_config")
             ev.chiudi(f"{s}_script")
-            for cb in list(self.app.bus):
-                try:
-                    cb(cambiati)
-                except Exception:
-                    log.exception("errore in un ascoltatore dati")
+            self.app.notifica(cambiati)
             return self.intervallo()
         except ErroreConfig as e:
             self.stato.update(ultimo_errore=int(time.time()), messaggio=str(e))
@@ -1535,11 +1541,7 @@ class ServizioNT(Raccoglitore):
                     self.seq["mod"] = seq
         cambiati = self.app.db.salva(rec, ts) if (rec.num or rec.stati) else []
         if cambiati:
-            for cb in list(self.app.bus):
-                try:
-                    cb(cambiati)
-                except Exception:
-                    log.exception("errore in un ascoltatore dati")
+            self.app.notifica(cambiati)
         if ambiguo:
             self._pianifica_lettura(WH_ATTESA_CONFERMA)
         return cambiati
@@ -1595,6 +1597,14 @@ class App:
         self.token_st = TokenST(self.cfg, self.db)
         self.token_nt = TokenNT(self.cfg)
         self.servizi = [] if demo else [ServizioST(self), ServizioNT(self)]
+
+    def notifica(self, cambiati):
+        """Avvisa chi ascolta i dati nuovi (tempo reale delle pagine, ecc.): l'errore di uno non ferma gli altri."""
+        for cb in list(self.bus):
+            try:
+                cb(cambiati)
+            except Exception:
+                log.exception("errore in un ascoltatore dati")
 
     def intervallo_pdc(self):
         if self.demo:
