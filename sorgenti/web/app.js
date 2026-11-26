@@ -1136,6 +1136,9 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
+  {v: '0.26.2', quando: '26 novembre 2026', titolo: 'Aggiornamenti senza aprire la pagina', righe: [
+    ['m', 'Aggiornamento a caldo da script', 'Su Linux lo script che pubblica i file nuovi può chiedere al pannello di applicarli a caldo e ricaricare i plugin, senza login e senza aprire la pagina; l’esito finisce nel registro. Su Windows non cambia niente.'],
+  ]},
   {v: '0.26.1', quando: '19 novembre 2026', titolo: 'Riprese del riscaldamento', righe: [
     ['s', 'Riscaldamento dopo l’acqua calda', 'Quando l’acqua calda parte a compressore acceso e, finita, il riscaldamento riprende senza che la pompa si sia fermata, quel secondo tratto non è più contato come un avvio nuovo: in Efficienza il numero di cicli, la durata media e i cicli brevi lo uniscono al riscaldamento di prima, e l’avviso «Cicli troppo brevi» non scatta più per queste riprese.'],
     ['s', 'Tooltip del grafico Modo di funzionamento', 'Passando sul riscaldamento che riprende dopo l’acqua calda, il tooltip mostra l’inizio del primo tratto, la fine dell’ultimo e la durata totale del riscaldamento, invece del solo secondo tratto.'],

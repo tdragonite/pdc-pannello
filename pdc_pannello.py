@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.26.1"
+VERSIONE = "0.26.2"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -43,6 +43,7 @@ import secrets
 import socket
 import sqlite3
 import sys
+import signal
 import threading
 import shutil
 import time
@@ -3350,6 +3351,9 @@ const CL_BREVE = [
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
+  {v: '0.26.2', quando: '26 novembre 2026', titolo: 'Aggiornamenti senza aprire la pagina', righe: [
+    ['m', 'Aggiornamento a caldo da script', 'Su Linux lo script che pubblica i file nuovi può chiedere al pannello di applicarli a caldo e ricaricare i plugin, senza login e senza aprire la pagina; l’esito finisce nel registro. Su Windows non cambia niente.'],
+  ]},
   {v: '0.26.1', quando: '19 novembre 2026', titolo: 'Riprese del riscaldamento', righe: [
     ['s', 'Riscaldamento dopo l’acqua calda', 'Quando l’acqua calda parte a compressore acceso e, finita, il riscaldamento riprende senza che la pompa si sia fermata, quel secondo tratto non è più contato come un avvio nuovo: in Efficienza il numero di cicli, la durata media e i cicli brevi lo uniscono al riscaldamento di prima, e l’avviso «Cicli troppo brevi» non scatta più per queste riprese.'],
     ['s', 'Tooltip del grafico Modo di funzionamento', 'Passando sul riscaldamento che riprende dopo l’acqua calda, il tooltip mostra l’inizio del primo tratto, la fine dell’ultimo e la durata totale del riscaldamento, invece del solo secondo tratto.'],
@@ -11723,6 +11727,21 @@ def applica_aggiornamento(app):
         _lock_aggiorna.release()
 
 
+def aggiorna_da_segnale(app):
+    """Come «Applica aggiornamento» + «Ricarica i plugin», chiesto dal sistema con il segnale SIGHUP (Linux: lo manda
+    chi pubblica i file nuovi, senza login). L'esito finisce nel registro con la riga «Segnale di aggiornamento: ...»."""
+    try:
+        r = applica_aggiornamento(app)
+        if r.get("ok"):
+            if "plugin_ricarica" in globals():
+                plugin_ricarica(app)
+            log.info("Segnale di aggiornamento: OK - %s", r.get("messaggio", ""))
+        else:
+            log.warning("Segnale di aggiornamento: %s - %s", "RIAVVIO" if r.get("riavvio") else "ERRORE", r.get("messaggio", ""))
+    except Exception:
+        log.exception("Segnale di aggiornamento: ERRORE - eccezione")
+
+
 @api("/api/aggiornamento")
 def api_aggiornamento(app, q):
     return stato_aggiornamento()
@@ -11971,6 +11990,8 @@ def main(argv=None, base=AQUI):
         print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))
         if not a.demo and not accesso_configurato(app):
             print("ATTENZIONE: manca la password. Lancia:  python pdc_pannello.py imposta-password")
+        if hasattr(signal, "SIGHUP"):          # solo Linux/macOS: su Windows non esiste, resta il pulsante nella pagina
+            signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=aggiorna_da_segnale, args=(app,), daemon=True).start())
         try:
             while True:
                 time.sleep(1)

@@ -235,6 +235,8 @@ def main(argv=None, base=AQUI):
         print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))
         if not a.demo and not accesso_configurato(app):
             print("ATTENZIONE: manca la password. Lancia:  python pdc_pannello.py imposta-password")
+        if hasattr(signal, "SIGHUP"):          # solo Linux/macOS: su Windows non esiste, resta il pulsante nella pagina
+            signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=aggiorna_da_segnale, args=(app,), daemon=True).start())
         try:
             while True:
                 time.sleep(1)

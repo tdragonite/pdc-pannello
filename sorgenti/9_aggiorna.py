@@ -138,6 +138,21 @@ def applica_aggiornamento(app):
         _lock_aggiorna.release()
 
 
+def aggiorna_da_segnale(app):
+    """Come «Applica aggiornamento» + «Ricarica i plugin», chiesto dal sistema con il segnale SIGHUP (Linux: lo manda
+    chi pubblica i file nuovi, senza login). L'esito finisce nel registro con la riga «Segnale di aggiornamento: ...»."""
+    try:
+        r = applica_aggiornamento(app)
+        if r.get("ok"):
+            if "plugin_ricarica" in globals():
+                plugin_ricarica(app)
+            log.info("Segnale di aggiornamento: OK - %s", r.get("messaggio", ""))
+        else:
+            log.warning("Segnale di aggiornamento: %s - %s", "RIAVVIO" if r.get("riavvio") else "ERRORE", r.get("messaggio", ""))
+    except Exception:
+        log.exception("Segnale di aggiornamento: ERRORE - eccezione")
+
+
 @api("/api/aggiornamento")
 def api_aggiornamento(app, q):
     return stato_aggiornamento()
