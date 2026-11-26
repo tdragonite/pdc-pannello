@@ -1143,6 +1143,7 @@ const CHANGELOG = [
     ['m', 'Testi per il server', 'Gli avvisi dicono «tunnel SSH» invece di «rete di casa», e per il riavvio indicano RunWisp.'],
     ['s', 'Spegnimento pulito su Linux', 'Quando il sistema ferma il pannello (Stop), si chiude come con Ctrl+C: ferma raccolta e plugin e lo scrive nel registro.'],
     ['s', 'Indirizzi dei plugin', 'In Integrazioni, dopo qualche secondo, gli indirizzi non diventano più quelli del browser (per esempio «localhost»): resta quello pubblico.'],
+    ['m', 'Meteo da impostare', 'Nelle installazioni nuove le coordinate del meteo partono vuote: si scrivono in config.json (sezione meteo). Chi le ha già non nota niente.'],
     ['s', 'File per le analisi', 'Il file del comando «analisi» non contiene più il numero di serie della pompa né gli identificativi Netatmo di casa e stanza.'],
   ]},
   {v: '0.26.2', quando: '26 novembre 2026', titolo: 'Aggiornamenti senza aprire la pagina', righe: [

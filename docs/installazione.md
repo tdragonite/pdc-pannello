@@ -4,26 +4,32 @@ Tutto quello che serve per far partire il pannello: Python, primo avvio, prova c
 
 ## Cosa serve
 
-- Un PC (qui si parla di **Windows**) che resta acceso: il pannello raccoglie i dati solo finché gira.
-- **Python 3.10 o più recente**. Per controllare, apri PowerShell e scrivi `python --version`. Se non c'è, installalo da python.org **spuntando “Add python.exe to PATH”**.
+- Una macchina **sempre accesa** (qui si parla di un **server Linux**; per provare va bene anche un Mac): il pannello raccoglie i dati solo finché gira.
+- **Python 3.10 o più recente** (`python3 --version`).
 - Un account SmartThings con la pompa di calore dentro (si usa l'API di SmartThings, non c'è nessun accesso diretto alla pompa).
 - Facoltativi: l'app Netatmo (Smarther), un bot Telegram, un reverse proxy per usarlo da fuori.
 
-Nessuna libreria da installare: usa solo quello che c'è già in Python.
+Nessuna libreria da installare per il pannello: usa solo quello che c'è già in Python. (Solo il plugin Alexa, per la «Verifica firma Amazon», vuole `cryptography`: su Debian `apt install python3-cryptography`.)
 
 
 ---
 
 ## Primo avvio
 
-1. Crea una cartella, per esempio `C:\pdc`, e mettici dentro **`pdc_pannello.py`** (e `pdc_strumenti.py`, che serve per SmartThings OAuth e per gli ID, vedi sotto).
-2. Apri PowerShell **in quella cartella**: da Esplora risorse tieni premuto *Maiusc*, clic destro su uno spazio vuoto → *Apri finestra PowerShell qui*.
-3. Lancia:
+1. Crea un utente senza accesso interattivo e la sua cartella, e mettici **`pdc_pannello.py`** e `pdc_strumenti.py`:
    ```
-   python pdc_pannello.py
+   sudo useradd --system --user-group --home-dir /opt/pdc --shell /usr/sbin/nologin pdc
+   sudo install -d -m 700 -o pdc -g pdc /opt/pdc
+   sudo install -m 600 -o pdc -g pdc pdc_pannello.py pdc_strumenti.py /opt/pdc/
+   ```
+2. Lancia il pannello una volta:
+   ```
+   sudo -u pdc python3 /opt/pdc/pdc_pannello.py
    ```
    La prima volta crea il file **`config.json`** (con tutte le impostazioni e dei valori predefiniti) e si ferma.
-4. Apri `config.json` con il Blocco note: è l'unico posto dove metti le tue chiavi. Quasi tutto si può poi cambiare anche dalla pagina **Impostazioni** del pannello.
+3. Apri `config.json` con un editor di testo (`sudo -u pdc nano /opt/pdc/config.json`): è l'unico posto dove metti le tue chiavi. Quasi tutto si può poi cambiare anche dalla pagina **Impostazioni** del pannello.
+
+Nei comandi di queste pagine `python pdc_pannello.py ...` sta per `sudo -u pdc python3 /opt/pdc/pdc_pannello.py ...` (vale anche per `pdc_strumenti.py`). **Usa sempre l'utente del pannello**: un file creato da un altro utente, poi il pannello non riesce a leggerlo.
 
 > **`config.json` contiene token e password. Non mandarlo a nessuno.**
 > Se lo modifichi a mano: ogni valore va tra `"virgolette"`, le righe di un blocco finiscono con la virgola tranne l'ultima, i numeri senza virgolette. Se sbagli, lo script ti dice che il JSON non è valido: controlla le virgole.
@@ -41,7 +47,7 @@ Prima di collegare qualsiasi cosa puoi vedere com'è fatto:
 python pdc_pannello.py --demo --porta 7010
 ```
 
-Apri `http://localhost:7010`: trovi 30 giorni di dati inventati, senza password. Premi `Ctrl+C` per chiudere. Non tocca niente di vero (usa un suo file, `dati\demo.db`).
+Apri `http://localhost:7010`: trovi 30 giorni di dati inventati, senza password. Premi `Ctrl+C` per chiudere. Non tocca niente di vero (usa un suo file, `dati/demo.db`).
 
 
 ---
@@ -70,7 +76,7 @@ Più lungo da preparare, ma poi non ci pensi più.
 
 > **Due avvertenze oneste.** Samsung ha detto che l'accesso OAuth alle API non sarà più gratuito; non so cosa succeda in concreto: potrebbe non funzionare o chiederti di pagare. Se la creazione dell'app fallisce, resta il PAT. E il *refresh token* è **monouso**: a ogni rinnovo ne arriva uno nuovo e il vecchio muore. Il pannello lo riscrive subito in `config.json`: per questo **non far girare due copie del pannello con lo stesso `config.json`** e non tenere il file aperto nel Blocco note mentre il pannello lavora.
 
-1. Installa la SmartThings CLI (Windows: installer dalla pagina *Releases* di <https://github.com/SmartThingsCommunity/smartthings-cli>; oppure, se hai Node.js, `npm install -g @smartthings/cli`).
+1. Installa la SmartThings CLI (sul tuo computer: dalla pagina *Releases* di <https://github.com/SmartThingsCommunity/smartthings-cli>, oppure, se hai Node.js, `npm install -g @smartthings/cli`).
 2. Lancia `smartthings apps:create` e rispondi: tipo **OAuth-In App**, nome a piacere, permessi (*scopes*) **`r:devices:*`** (lettura) e, se vuoi accendere/spegnere dal pannello, anche **`x:devices:*`** (comandi), Redirect URI **`https://httpbin.org/get`** (identico), il resto vuoto. Alla fine ti dà **Client ID** e **Client Secret**: il secret si vede **una volta sola**, copialo subito.
 3. Lancia:
    ```
@@ -115,38 +121,47 @@ Dopo 5 tentativi sbagliati lo stesso indirizzo viene bloccato per 15 minuti.
 
 ## Avviarlo davvero
 
-### Per provare (con la finestra visibile)
+### Per provare
 
 ```
-python pdc_pannello.py
+sudo -u pdc python3 /opt/pdc/pdc_pannello.py --host 127.0.0.1
 ```
 
-Stampa gli indirizzi da aprire, per esempio:
-
-```
-http://localhost:7000
-http://192.168.1.50:7000  (rete di casa, usa questo da iPhone)
-```
-
-Il primo è per il PC, il secondo per il telefono (stessa rete wifi). Alla **prima esecuzione Windows** può chiedere se consentire a Python di usare la rete: scegli *Reti private*, altrimenti il telefono non si collega. Per fermarlo: `Ctrl+C`.
-
-Per vedere subito che i collegamenti funzionino senza avviare il pannello:
+Per fermarlo: `Ctrl+C`. Per controllare i collegamenti senza avviare il pannello:
 
 ```
 python pdc_pannello.py --una-volta
 python pdc_pannello.py stato
 ```
 
-### Senza finestra (con il tuo pannello di script)
+### Come servizio (systemd)
 
-Fai partire lo script con **`pythonw`** invece di `python`: è identico ma non apre nessuna finestra.
+Crea `/etc/systemd/system/pdc.service`:
 
+```ini
+[Unit]
+Description=Pannello pompa di calore
+After=network.target
+
+[Service]
+User=pdc
+WorkingDirectory=/opt/pdc
+ExecStart=/usr/bin/python3 /opt/pdc/pdc_pannello.py --host 127.0.0.1 --porta 7000
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+ProtectSystem=strict
+ReadWritePaths=/opt/pdc
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
 ```
-pythonw C:\pdc\pdc_pannello.py
-```
 
-Imposta come cartella di lavoro `C:\pdc` (non è obbligatorio: i file stanno comunque accanto allo script). Gli eventuali messaggi finiscono nel file **`log\pdc_pannello.log`** nella stessa cartella: è il primo posto dove guardare se qualcosa non va.
+Poi `sudo systemctl daemon-reload && sudo systemctl enable --now pdc`. I messaggi si leggono con `journalctl -u pdc` e nel file **`/opt/pdc/log/pdc_pannello.log`**: è il primo posto dove guardare se qualcosa non va. `systemctl stop` lo chiude in modo pulito.
 
-Una sola copia alla volta: se ne parte una seconda, si ferma con un messaggio (serve a non rovinare i token). La porta di controllo è `porta_lock` in `config.json`, di solito non devi toccarla.
+Con `--host 127.0.0.1` il pannello si raggiunge solo da quel computer: da un altro si usa un **tunnel SSH** (`ssh -L 7000:127.0.0.1:7000 utente@server`, poi `http://localhost:7000`) oppure un reverse proxy con HTTPS (vedi [telegram-e-accesso.md](telegram-e-accesso.md)).
 
-Se il PC si riavvia, il pannello va fatto ripartire (da te o dal tuo gestore di script); lo storico che mancava nel frattempo purtroppo non si recupera: SmartThings non lo fornisce.
+Una sola copia alla volta, **anche su macchine diverse**: due copie con le stesse chiavi si invalidano i token. Sulla stessa macchina la seconda si ferma con un messaggio (porta di controllo `porta_lock`). I dati del tempo in cui il pannello è fermo non si recuperano: SmartThings non li fornisce.

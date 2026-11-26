@@ -1,6 +1,6 @@
 # Pannello pompa di calore (Samsung EHS)
 
-Un pannello web per la tua pompa di calore Samsung EHS e per lo Smarther 2, che gira sul tuo PC. **Legge e mostra** tutto (dati, storico, efficienza) e, se vuoi, ti lascia anche **comandare**: accendere/spegnere riscaldamento, acqua calda e Smarther, e (solo dalla rete di casa) cambiare le regolazioni della pompa e il boost dell'acqua calda, tutto dietro un lucchetto.
+Un pannello web per la tua pompa di calore Samsung EHS e per lo Smarther 2, che gira su un computer o un server Linux sempre acceso. **Legge e mostra** tutto (dati, storico, efficienza) e, se vuoi, ti lascia anche **comandare**: accendere/spegnere riscaldamento, acqua calda e Smarther, e (solo «da casa», non da internet) cambiare le regolazioni della pompa e il boost dell'acqua calda, tutto dietro un lucchetto.
 
 Ha le pagine **Dashboard**, **Analisi**, **Efficienza**, **Dispositivi** e **Impostazioni** (più il **Changelog**), funziona bene su iPhone, ti avvisa su Telegram se qualcosa non va e, se vuoi, lo raggiungi anche da fuori casa. Accetta integrazioni a plugin, come Alexa e il widget per iPhone.
 
@@ -8,16 +8,16 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 
 ## Per cominciare
 
-1. Serve un PC che resta acceso (qui si parla di Windows) con **Python 3.10 o più recente** e un account SmartThings con la pompa dentro. Facoltativi: Netatmo (Smarther), un bot Telegram, un reverse proxy per usarlo da fuori.
-2. Metti `pdc_pannello.py` e `pdc_strumenti.py` in una cartella, per esempio `C:\pdc`.
-3. Per provarlo subito con dati finti: `python pdc_pannello.py --demo --porta 7010`, poi apri `http://localhost:7010`.
+1. Serve una macchina sempre accesa (di solito un **server Linux**) con **Python 3.10 o più recente** e un account SmartThings con la pompa dentro. Facoltativi: Netatmo (Smarther), un bot Telegram, un reverse proxy per usarlo da fuori.
+2. Metti `pdc_pannello.py` e `pdc_strumenti.py` in una cartella, per esempio `/opt/pdc`.
+3. Per provarlo subito con dati finti: `python3 pdc_pannello.py --demo --porta 7010`, poi apri `http://localhost:7010`.
 4. Per usarlo davvero, segui [docs/installazione.md](docs/installazione.md): collegare SmartThings e Netatmo, scegliere la password, avviarlo.
 
 ## La documentazione
 
 | Documento | Che cosa trovi |
 |---|---|
-| [Installazione e primo avvio](docs/installazione.md) | Cosa serve, primo avvio, prova con i dati finti, SmartThings (PAT o OAuth), Netatmo, password, avvio senza finestra |
+| [Installazione e primo avvio](docs/installazione.md) | Cosa serve, primo avvio, prova con i dati finti, SmartThings (PAT o OAuth), Netatmo, password, avvio come servizio |
 | [Le pagine del pannello](docs/pagine.md) | Come leggere Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni e Changelog; usarlo su iPhone |
 | [Comandi e regolazioni](docs/comandi-e-regolazioni.md) | Accendere e spegnere dal pannello, regolazioni della pompa (FSV, acqua calda, boost) |
 | [Telegram e accesso da fuori casa](docs/telegram-e-accesso.md) | Gli avvisi su Telegram e l'accesso da internet con un reverse proxy |
@@ -27,7 +27,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 | [Strumenti di diagnostica](docs/strumenti.md) | `pdc_strumenti.py`: ID, OAuth, dump, analisi, prove |
 | [Per chi modifica il codice](docs/sviluppo.md) | Come si costruisce il file dai sorgenti |
 | [«Puoi chiudere»: come toglierlo](docs/ventilazione-rimozione.md) | Se la prova delle finestre aperte non ti serve, come toglierla |
-| [Piano e stato del progetto](docs/PIANO.md) | Architettura, decisioni, cose aperte |
+| [Note tecniche](docs/PIANO.md) | Architettura e note tecniche |
 
 ## Crediti
 

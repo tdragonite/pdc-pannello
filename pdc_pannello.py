@@ -3352,6 +3352,7 @@ const CHANGELOG = [
     ['m', 'Testi per il server', 'Gli avvisi dicono «tunnel SSH» invece di «rete di casa», e per il riavvio indicano RunWisp.'],
     ['s', 'Spegnimento pulito su Linux', 'Quando il sistema ferma il pannello (Stop), si chiude come con Ctrl+C: ferma raccolta e plugin e lo scrive nel registro.'],
     ['s', 'Indirizzi dei plugin', 'In Integrazioni, dopo qualche secondo, gli indirizzi non diventano più quelli del browser (per esempio «localhost»): resta quello pubblico.'],
+    ['m', 'Meteo da impostare', 'Nelle installazioni nuove le coordinate del meteo partono vuote: si scrivono in config.json (sezione meteo). Chi le ha già non nota niente.'],
     ['s', 'File per le analisi', 'Il file del comando «analisi» non contiene più il numero di serie della pompa né gli identificativi Netatmo di casa e stanza.'],
   ]},
   {v: '0.26.2', quando: '26 novembre 2026', titolo: 'Aggiornamenti senza aprire la pagina', righe: [
@@ -5129,7 +5130,7 @@ def modo_istantaneo(db, ora, tol, valvola):
 # Meteo del giorno (Open-Meteo, due modelli): una riga nella card «Esterna»
 # --------------------------------------------------------------------------
 
-METEO_PREDEFINITO = {"latitudine": "", "longitudine": ""}         # si cambia solo in config.json (sezione "meteo")
+METEO_PREDEFINITO = {"latitudine": "", "longitudine": ""}              # vuote = meteo spento; si scrivono in config.json (sezione "meteo")
 METEO_URL = "https://api.open-meteo.com/v1/forecast"
 METEO_MODELLI = ("italia_meteo_arpae_icon_2i", "ecmwf_ifs025")         # ICON-2I (2 km, modello italiano) + ECMWF come seconda opinione
 METEO_VARIABILI = ("temperature_2m", "precipitation", "cloud_cover", "weather_code", "is_day")
@@ -5332,13 +5333,13 @@ def meteo_demo(ora):
 
 def meteo_info(app):
     """Riassunto del meteo per la Dashboard, o None. Legge solo l'ultima lettura di Open-Meteo, fatta dal thread di fondo."""
+    ora = int(time.time())
+    if app.demo:                      # nella demo si vede sempre, anche senza coordinate
+        r = meteo_riassumi(meteo_demo(ora), ora)
+        return dict(r, agg=ora, modelli_nomi=list(METEO_MODELLI)) if r else None
     cfg = meteo_config(app)
     if not cfg:
         return None
-    ora = int(time.time())
-    if app.demo:
-        r = meteo_riassumi(meteo_demo(ora), ora)
-        return dict(r, agg=ora, modelli_nomi=list(METEO_MODELLI)) if r else None
     st = _meteo_stato(app)
     esterni_assicura(app)
     if not st["raw"] or ora - st["ts"] > METEO_VECCHIO:

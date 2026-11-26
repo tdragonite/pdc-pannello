@@ -11,7 +11,7 @@ python pdc_pannello.py stato                ultimi valori salvati e anomalie ape
 python pdc_pannello.py imposta-password     scegli utente e password
 python pdc_pannello.py telegram-prova       manda un messaggio di prova
 python pdc_pannello.py compatta             compatta ora lo storico vecchio
-python pdc_pannello.py backup               copia ora database e config.json nella cartella dati\backup
+python pdc_pannello.py backup               copia ora database e config.json nella cartella dati/backup
 python pdc_pannello.py ripristina           rimette una copia di backup o una fatta prima di un reset (a pannello fermo)
 python pdc_pannello.py ridecodifica         rifà la lettura dei dati grezzi del ciclo
 python pdc_pannello.py esporta-diagnostica  crea un file di diagnosi da mandare a chi ti aiuta
@@ -20,7 +20,7 @@ python pdc_pannello.py --versione
 
 Nella stessa cartella c'è anche `pdc_strumenti.py` (vedi [strumenti.md](strumenti.md)): oltre ai dump, `rip-diag` e `sbrinamenti [--giorni 7] [--salva]` (elenco degli sbrinamenti letti dal database). Anche `meteo-prova` (stazione meteo vicina, capitolo 7 di strumenti.md) e **`analisi`**: crea in un colpo solo un file `diagnostica/analisi_….json` con tutti i dati del database (impostazioni, cicli, sbrinamenti, serie nel tempo, senza token né indirizzi), da mandare a chi ti aiuta (capitolo 8 di strumenti.md). Ci sono anche `st-capacita` e `st-osserva` (i comandi della pompa e cosa cambia quando premi Boost, capitolo 9 di strumenti.md).
 
-Per pythonw usa gli stessi argomenti, ma non vedrai l'output: i comandi “da guardare” (`stato`, `telegram-prova`…) lanciali con `python`.
+I comandi «da guardare» (`stato`, `telegram-prova`…) si lanciano a mano con l'utente del pannello (vedi [installazione.md](installazione.md)).
 
 
 ---
@@ -29,7 +29,7 @@ Per pythonw usa gli stessi argomenti, ma non vedrai l'output: i comandi “da gu
 
 | Sezione | Cosa c'è |
 |---|---|
-| `generale` | `porta` (7000), `host` (`0.0.0.0` = raggiungibile dalla rete; `127.0.0.1` = solo dal PC), `intervallo_pdc_secondi` (60, minimo 20), `intervallo_netatmo_secondi` (120), `database`, `sessione_giorni` (30), `porta_lock` |
+| `generale` | `porta` (7000), `host` (`0.0.0.0` = raggiungibile dalla rete; `127.0.0.1` = solo da quella macchina; `--host` all'avvio ha la precedenza), `intervallo_pdc_secondi` (60, minimo 20), `intervallo_netatmo_secondi` (120), `database`, `sessione_giorni` (30), `porta_lock` |
 | `accesso` | utente e hash della password (non scrivere l'hash a mano); `chiave_proxy` (facoltativa, almeno 32 caratteri): login già fatto dal reverse proxy |
 | `smartthings` | `device_id`, `pat`, `oauth` (compilato da `st-oauth`; i token ruotano da soli) e `refresh` (`attivo`, `ogni_secondi`: vedi «Dati più freschi») |
 | `netatmo` | chiavi dell'app, token (ruotano da soli), `home_id`, `room_id` |
@@ -37,7 +37,7 @@ Per pythonw usa gli stessi argomenti, ma non vedrai l'output: i comandi “da gu
 | `allarmi` | soglie e interruttori di ogni allarme |
 | `dispositivi` | `ip_pdc`, `mac_pdc`, `ip_smarther`, `mac_smarther` (facoltativi, scritti a mano: solo per mostrarli), `modello_smarther`, `loghi_bianchi` |
 | `generale.indirizzo_pubblico` | l'indirizzo `https://...` da cui il pannello si raggiunge da internet: serve ai webhook Netatmo e agli indirizzi dei plugin |
-| `meteo` | `latitudine` e `longitudine` per il meteo di oggi nella card Esterna (Open-Meteo); vuote = meteo spento |
+| `meteo` | `latitudine` e `longitudine` per il meteo di oggi nella card Esterna (Open-Meteo), in gradi decimali; vuote (di partenza) = meteo spento |
 | `stazione` | `url`: indirizzo dei dati della stazione WeatherLink vicina (umidità esterna); vuoto = spenta. Si cambia da *Impostazioni → Collegamenti* |
 | `umidita` | `giallo` (60), `rosso` (70), `minuti` (30), `rientro_punti` (2): le soglie dell'umidità, uniche per Telegram, Dashboard e grafico |
 | `tariffa` | `prezzo_kwh`: euro per kWh (0 = non mostrare i costi) |

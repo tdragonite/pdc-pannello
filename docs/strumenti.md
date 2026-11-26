@@ -10,11 +10,10 @@ Non installa nulla e non ha dipendenze: serve solo Python 3.10 o più recente.
 
 1. Crea una cartella, per esempio `pdc`, e mettici dentro `pdc_strumenti.py`.
 2. Apri un terminale **dentro quella cartella**:
-   - **Windows**: apri la cartella in Esplora risorse, tieni premuto *Maiusc* e fai clic destro su uno spazio vuoto → *Apri finestra PowerShell qui*.
-   - **Mac**: tasto destro sulla cartella → *Nuovo Terminale nella cartella*.
+   Sul server del pannello i comandi si lanciano con il suo utente: `sudo -u pdc python3 /opt/pdc/pdc_strumenti.py ...` (vedi [installazione.md](installazione.md)). Sul Mac: tasto destro sulla cartella → *Nuovo Terminale nella cartella*.
 3. Controlla che Python ci sia: scrivi `python --version` (su Mac `python3 --version`). Deve comparire 3.10 o più.
    Nei comandi qui sotto uso `python`; su Mac scrivi `python3`.
-4. Lancia `python pdc_strumenti.py st-devices`. La prima volta crea un file **`config.json`** vuoto e si ferma. Apri `config.json` con il Blocco note: è l'unico file dove metterai le tue chiavi.
+4. Lancia `python pdc_strumenti.py st-devices`. La prima volta crea un file **`config.json`** vuoto e si ferma. Apri `config.json` con un editor di testo: è l'unico file dove metterai le tue chiavi.
 
 > `config.json` contiene password e token. **Non mandarlo mai a nessuno**, nemmeno a me.
 
@@ -50,7 +49,7 @@ Con il PAT dovresti incollarne uno nuovo ogni giorno. Con OAuth il pannello si r
 
 ### 2a. Installa la SmartThings CLI
 - **Mac**: `brew install smartthingscommunity/smartthings/smartthings`
-- **Windows / altri**: scarica l'installer dalla pagina *Releases* di <https://github.com/SmartThingsCommunity/smartthings-cli>, oppure, se hai Node.js, `npm install -g @smartthings/cli`.
+- **Linux / altri**: scarica l'installer dalla pagina *Releases* di <https://github.com/SmartThingsCommunity/smartthings-cli>, oppure, se hai Node.js, `npm install -g @smartthings/cli`.
 
 ### 2b. Crea l'app OAuth
 Nel terminale lancia `smartthings apps:create`. Al primo uso si apre il browser per accedere con l'account Samsung. Poi risponde a una serie di domande (le parole esatte possono cambiare):
@@ -82,7 +81,7 @@ Se tutto va bene scrive i token in `config.json` e hai finito.
    Stampa gli scope che il token ha davvero, i valori di temperatura/setpoint/caldaia che trova e se trova l'**umidità**. Crea:
    - `diagnostica/dump_netatmo_homesdata.json`
    - `diagnostica/dump_netatmo_homestatus_1.json` (e `_2`, ... se hai più case)
-5. **Allegali in chat.** Coordinate, città, email e indirizzi MAC sono già tolti, ma dai comunque un'occhiata con il Blocco note prima di mandarli.
+5. **Allegali in chat.** Coordinate, città, email e indirizzi MAC sono già tolti, ma dai comunque un'occhiata in un editor di testo prima di mandarli.
 
 ---
 
@@ -108,7 +107,7 @@ Tutti i file stanno nella cartella `diagnostica` accanto allo script.
 
 | Messaggio | Cosa significa |
 |---|---|
-| `python non e' riconosciuto` | Python non è installato o non è nel PATH. Installalo da python.org spuntando *Add to PATH*. |
+| `python: command not found` | Usa `python3`; se manca, installa Python dal gestore dei pacchetti del sistema. |
 | `config.json non e' un JSON valido` | Hai tolto o aggiunto una virgola/virgoletta. Ogni valore va tra `"virgolette"`, e tutte le righe tranne l'ultima di un blocco finiscono con la virgola. |
 | `SmartThings: 401` | Token scaduto o sbagliato (il PAT dura 24 ore). Generane uno nuovo. |
 | `SmartThings: 403` | Al token mancano i permessi. Rigeneralo spuntando *List* e *See devices*. |
@@ -161,15 +160,15 @@ python pdc_strumenti.py analisi                      ultimi 45 giorni, 1 giorno 
 python pdc_strumenti.py analisi --giorni 14          meno storico (file piu' piccolo)
 python pdc_strumenti.py analisi --grezzi 3           3 giorni di misure non mediate
 python pdc_strumenti.py analisi --ciclo 0            senza i campioni grezzi del ciclo (file piu' piccolo)
-python pdc_strumenti.py analisi --uscita C:\altro\dati.json   scrive il file dove dici tu invece che in diagnostica (lo usa il plugin «analisi»)
+python pdc_strumenti.py analisi --uscita /tmp/dati.json   scrive il file dove dici tu invece che in diagnostica (lo usa il plugin «analisi»)
 python pdc_strumenti.py analisi --ricircolo-off "13:30-17:00,21:30-08:00" --ricircolo-dal "2026-11-05 14:30"   fasce a ricircolo spento e da quando valgono (all'avvio le stampa)
 ```
 
 Crea `diagnostica/analisi_AAAAMMGG_HHMM.json`. Dentro: impostazioni (FSV, dispositivi), qualita' dei dati e buchi, riepilogo per giorno (con l'acqua nell'aria in g/m³ di casa e, se c'è la stazione meteo, di fuori), giornata tipica per ora, ogni ciclo dello Smarther (durata, quanto la casa sale oltre il target, isteresi vera), ogni avvio del compressore, profilo della PdC per temperatura esterna, curva climatica contro mandata misurata, efficienza, bollitore, sbrinamenti, ripartenza prevista, cambi di stato, allarmi, e tutte le serie mediate nel tempo (5 minuti gli ultimi 14 giorni, 30 minuti prima), più i byte grezzi del ciclo del compressore degli ultimi 7 giorni (`--ciclo`), che servono a cercare valori non ancora decodificati.
 
-Gli stessi dati, senza esportare il file a mano, li dà anche il plugin `analisi` (solo dalla rete di casa, con token: vedi plugin.md).
+Gli stessi dati, senza esportare il file a mano, li dà anche il plugin `analisi` (non da internet, con token: vedi plugin.md).
 
-Come si usa: lancialo da PowerShell nella cartella del pannello (anche con il pannello acceso), poi allega in chat il file nuovo di `diagnostica`. Se il file è troppo grande per la chat: `--giorni 14`. Il valore dell'isteresi impostato nello Smarther **non** c'è nel database: scrivilo tu insieme al file. Serve `pdc_pannello.py` nella stessa cartella (per i calcoli di efficienza, sbrinamenti e ripartenza; senza, le altre sezioni ci sono lo stesso).
+Come si usa: lancialo da terminale nella cartella del pannello (sul server: con l'utente del pannello) (anche con il pannello acceso), poi allega in chat il file nuovo di `diagnostica`. Se il file è troppo grande per la chat: `--giorni 14`. Il valore dell'isteresi impostato nello Smarther **non** c'è nel database: scrivilo tu insieme al file. Serve `pdc_pannello.py` nella stessa cartella (per i calcoli di efficienza, sbrinamenti e ripartenza; senza, le altre sezioni ci sono lo stesso).
 
 
 ## 9. Comandi della pompa e osservazione (st-capacita, st-osserva)

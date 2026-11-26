@@ -9,26 +9,26 @@ Backup, aggiornamenti, cosa fare se qualcosa non va e cosa è bene sapere sulla 
 - **Azzerare il database:** *Impostazioni → Dati → Azzera il database…*. Cancella tutto lo storico (misure, grafici, anomalie) e riparte da zero; restano impostazioni, password e collegamenti. Chiede di scrivere **RESETTA** e la tua password, e **prima** fa una copia di sicurezza nella cartella dei backup (`prima-del-reset-AAAAMMGG-OOMMSS.db`). Se la copia non riesce, non cancella niente. Per tornare indietro: ferma il pannello e lancia `python pdc_pannello.py ripristina`, che elenca anche queste copie.
 - **Registro:** in *Impostazioni → Registro* vedi le ultime righe del registro del pannello (password e token sono nascosti), le dimensioni di database e log e quando è stato fatto l'ultimo backup.
 - **Aggiornamento da script (solo Linux):** il segnale `SIGHUP` fa quello che fanno «Applica aggiornamento» e «Ricarica i plugin», senza login; nel registro compare `Segnale di aggiornamento: OK`, `ERRORE` o `RIAVVIO`.
-- **Backup a mano:** copia, **a pannello fermo**, `config.json` e `dati\pdc.db` (e le loro copie `pdc.db-wal`/`pdc.db-shm` se esistono). Basta questo per spostare tutto su un altro PC.
+- **Backup a mano:** copia, **a pannello fermo**, `config.json` e `dati/pdc.db` (e le loro copie `pdc.db-wal`/`pdc.db-shm` se esistono). Basta questo per spostare tutto su un'altra macchina.
 - **Aggiornare lo script:** ferma il pannello, sostituisci `pdc_pannello.py`, riavvia. `config.json` e lo storico restano; le nuove impostazioni vengono aggiunte da sole. (C'è anche l'aggiornamento senza fermare la raccolta, qui sotto.)
-- **Spostare su un altro PC:** copia l'intera cartella.
-- **Log:** `log\pdc_pannello.log` (si ruota da solo).
+- **Spostare su un'altra macchina:** ferma il pannello, copia l'intera cartella e **non riaccendere la copia vecchia**.
+- **Log:** `log/pdc_pannello.log` (si ruota da solo); come servizio anche `journalctl -u pdc`.
 - **Aggiornare senza fermare la raccolta:** sostituisci `pdc_pannello.py` **senza riavviare**, poi vai in *Impostazioni → Stato → Aggiornamento*. Il pannello confronta il file nuovo con quello in uso e ti dice cosa è cambiato:
   - *«È pronta la versione X»* → premi **Applica aggiornamento**: pagine, grafici, API, Impostazioni, Dispositivi, comandi allo Smarther e plugin vengono ricaricati a caldo e la lettura dei dati non si ferma mai (il server web non si riavvia, cambia solo il codice che risponde). Le pagine aperte si ricaricano da sole.
-  - *«Serve il riavvio completo»* → è cambiato il nucleo (lettura e decodifica dei dati, database), Telegram o il backup: chiudi il programma Python e rilancialo, come sempre. Il solo numero di versione non richiede riavvio.
+  - *«Serve il riavvio completo»* → è cambiato il nucleo (lettura e decodifica dei dati, database), Telegram o il backup: riavvia il pannello (`sudo systemctl restart pdc`). Il solo numero di versione non richiede riavvio.
   - Se il file nuovo ha un errore (di scrittura o durante il caricamento) non cambia niente: continua il codice di prima e il motivo è scritto nel messaggio. Dopo un aggiornamento a caldo, la riga «Aggiornamento a caldo applicato» compare nel registro.
   - Limiti: la prima volta (per far entrare la funzione) serve un riavvio completo; funziona solo in modalità normale, non nella demo.
 - **Come è organizzata la cartella:**
   ```
-  pdc\
+  pdc/
     pdc_pannello.py        il programma
     pdc_strumenti.py       lo strumento per SmartThings/ID
     config.json            le tue impostazioni (l'unico file che modifichi a mano)
-    dati\                  database (pdc.db), backup\ (copie notturne), loghi\ (i tuoi loghi)
-    log\                   pdc_pannello.log
-    diagnostica\           i file da mandare a chi ti aiuta: diagnostica.json e i dump di pdc_strumenti.py
-    plugin\                le integrazioni (alexa.py…): vedi [plugin.md](plugin.md)
-    docs\                  la documentazione (se la vuoi tenere qui)
+    dati/                  database (pdc.db), backup/ (copie notturne), loghi/ (i tuoi loghi)
+    log/                   pdc_pannello.log
+    diagnostica/           i file da mandare a chi ti aiuta: diagnostica.json e i dump di pdc_strumenti.py
+    plugin/                le integrazioni (alexa.py…): vedi [plugin.md](plugin.md)
+    docs/                  la documentazione (se la vuoi tenere qui)
   ```
 
 
@@ -38,10 +38,9 @@ Backup, aggiornamenti, cosa fare se qualcosa non va e cosa è bene sapere sulla 
 
 | Sintomo | Cosa fare |
 |---|---|
-| `python non è riconosciuto` | Python non è installato o non è nel PATH: reinstallalo da python.org spuntando *Add to PATH*. |
 | “config.json non è un JSON valido” | Una virgola o una virgoletta di troppo/in meno. Annulla l'ultima modifica o controlla le righe vicine a quelle che hai toccato. |
-| Non apro la pagina dal telefono | Stessa rete wifi? Hai consentito Python nel firewall (reti private)? Usa l'indirizzo `192.168.…` stampato all'avvio, non `localhost`. |
-| “Un'altra copia del pannello è già attiva” | Ne hai già una avviata (anche senza finestra): chiudila da Gestione attività (cerca `python`/`pythonw`). |
+| Non apro la pagina da un altro dispositivo | Con `--host 127.0.0.1` serve il tunnel SSH o il reverse proxy; senza, controlla il firewall e usa l'indirizzo della macchina, non `localhost`. |
+| “Un'altra copia del pannello è già attiva” | Ne hai già una avviata: `systemctl status pdc`, oppure cerca con `ps aux \| grep pdc_pannello`. |
 | “Non riesco ad aprire la porta web” | Un altro programma usa la 7000: cambia `generale.porta` in `config.json`. |
 | Non ricordo la password | `python pdc_pannello.py imposta-password` (a pannello fermo). |
 | SmartThings 401 | Token personale scaduto (dura 24 ore): generane uno nuovo, oppure configura OAuth. |
@@ -53,18 +52,18 @@ Backup, aggiornamenti, cosa fare se qualcosa non va e cosa è bene sapere sulla 
 | Netatmo: token rifiutato | Rigenera i token dal portale con gli scope dello Smarther e incollali (i vecchi sono invalidati). |
 | Il COP o le “ore di funzionamento” sono strani | Controlla l'avviso giallo in Efficienza: se mancano dati di potenza o portata, il COP è parziale. |
 | Mancano i dati del ciclo (frequenza, portata…) | Si aggiornano solo mentre la pdc è in funzione: da ferma non ci sono punti nuovi. |
-| La portata (o il COP) è strana dal 5/11 pomeriggio | La pompa rimanda a volte lo stesso istante con la portata corrotta (17-24 l/min senza senso). Dalla 0.25.2 la portata si legge dai byte 6-7 insieme (16 bit, ÷10) e tutto sopra 60 l/min si scarta; il `config.json` si aggiorna da solo se non hai cambiato la vecchia regola. Per rimettere a posto lo storico, a pannello fermo: `python pdc_pannello.py backup`, poi `python pdc_pannello.py ridecodifica`. Le versioni diverse dello stesso istante si leggono in `dati\diag_versioni_ciclo.txt`. |
+| La portata (o il COP) è strana dal 5/11 pomeriggio | La pompa rimanda a volte lo stesso istante con la portata corrotta (17-24 l/min senza senso). Dalla 0.25.2 la portata si legge dai byte 6-7 insieme (16 bit, ÷10) e tutto sopra 60 l/min si scarta; il `config.json` si aggiorna da solo se non hai cambiato la vecchia regola. Per rimettere a posto lo storico, a pannello fermo: `python pdc_pannello.py backup`, poi `python pdc_pannello.py ridecodifica`. Le versioni diverse dello stesso istante si leggono in `dati/diag_versioni_ciclo.txt`. |
 | Telegram non arriva | `python pdc_pannello.py telegram-prova` dice il motivo. Hai scritto almeno un messaggio al bot? |
-| Non so cosa succede | Guarda `log\pdc_pannello.log`; se devi chiedere aiuto, `python pdc_pannello.py esporta-diagnostica` crea `diagnostica\diagnostica.json`, senza password né token. |
+| Non so cosa succede | Guarda `log/pdc_pannello.log`; se devi chiedere aiuto, `python pdc_pannello.py esporta-diagnostica` crea `diagnostica/diagnostica.json`, senza password né token. |
 
 
 ---
 
 ## Sicurezza: cosa è bene sapere
 
-- Il pannello **legge** tutto e **comanda** solo quello che gli permetti (e solo se i token hanno il permesso di comando). Accendere/spegnere riscaldamento, acqua calda e Smarther si può anche da fuori casa; le **regolazioni della pompa** (codici FSV, temperatura e modo dell'acqua calda, modo della pompa, boost) solo dalla rete di casa, e il pannello rifiuta la richiesta se arriva da internet. In ogni caso il login è sempre richiesto e tutto sta dietro un lucchetto.
+- Il pannello **legge** tutto e **comanda** solo quello che gli permetti (e solo se i token hanno il permesso di comando). Accendere/spegnere riscaldamento, acqua calda e Smarther si può anche da fuori casa; le **regolazioni della pompa** (codici FSV, temperatura e modo dell'acqua calda, modo della pompa, boost) solo «da casa» (stessa rete o tunnel SSH), e il pannello rifiuta la richiesta se arriva da internet. In ogni caso il login è sempre richiesto e tutto sta dietro un lucchetto.
 - Il login è **sempre richiesto**. Le password sono salvate solo come impronta (PBKDF2), i tentativi sbagliati vengono limitati, i cookie di sessione sono protetti.
-- In **rete di casa** il collegamento è HTTP normale: chi è sul tuo wifi potrebbe, in teoria, leggere la password mentre la digiti. Su una rete domestica fidata è ragionevole; se non lo è, usa l'indirizzo pubblico (HTTPS) anche da casa.
+- Collegandosi **direttamente nella rete locale** il collegamento è HTTP normale: chi è sul tuo wifi potrebbe, in teoria, leggere la password mentre la digiti. Su una rete domestica fidata è ragionevole; se non lo è, usa l'indirizzo pubblico (HTTPS) anche da casa.
 - **`config.json` è riservato**: contiene token SmartThings/Netatmo, il token del bot Telegram e l'eventuale chiave del proxy. Non condividerlo, non metterlo in cartelle sincronizzate pubblicamente.
 - Se pubblichi il pannello su internet, scegli una password lunga e unica; meglio ancora un reverse proxy con un suo login a due fattori (vedi [telegram-e-accesso.md](telegram-e-accesso.md)).
 - Le **integrazioni a plugin** sono codice che gira con gli stessi permessi del pannello: copia nella cartella `plugin` solo file di cui ti fidi. Un plugin nuovo parte spento. Gli indirizzi pubblici dei plugin (`/plugin/…`) rispondono **senza login**: per questo ognuno deve difendersi da solo (Alexa usa un indirizzo segreto, riconosce solo la tua skill, scarta le richieste vecchie o ripetute e, se vuoi, controlla la firma di Amazon: vedi [plugin.md](plugin.md)) e il pannello limita comunque dimensione (64 KB) e frequenza (60 richieste al minuto per indirizzo).
