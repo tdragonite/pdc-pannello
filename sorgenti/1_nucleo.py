@@ -1346,6 +1346,8 @@ class WebhookNT(threading.Thread):
             if url not in json.dumps(self._api("GET")):
                 return self._fuori("Netatmo non conferma la registrazione", guasto=True)
             log.info("Webhook Netatmo registrato")
+        elif not self.registrato:   # primo controllo dopo l'avvio, o ritorno dopo un problema
+            log.info("Webhook Netatmo: iscrizione già presente")
         self.registrato, self.ultimo_ok = True, time.time()
         if time.time() >= self.sospeso_fino:
             self.motivo, self.guasto_dal = "", None

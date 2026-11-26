@@ -1346,6 +1346,8 @@ class WebhookNT(threading.Thread):
             if url not in json.dumps(self._api("GET")):
                 return self._fuori("Netatmo non conferma la registrazione", guasto=True)
             log.info("Webhook Netatmo registrato")
+        elif not self.registrato:   # primo controllo dopo l'avvio, o ritorno dopo un problema
+            log.info("Webhook Netatmo: iscrizione già presente")
         self.registrato, self.ultimo_ok = True, time.time()
         if time.time() >= self.sospeso_fino:
             self.motivo, self.guasto_dal = "", None
@@ -3344,8 +3346,9 @@ const CL_BREVE = [
 ];
 const CL_IC = {server: '☁', euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
-  {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro di avvio più pulito', righe: [
+  {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro più chiaro', righe: [
     ['m', 'Righe di avvio', 'Via il blocco senza data con «localhost»: l’avvio finisce con una sola riga, «Pannello pronto», con l’indirizzo pubblico (o quello locale se non c’è). I plugin avviati stanno in una riga sola.'],
+    ['s', 'Iscrizione ai webhook', 'All’avvio il registro dice anche quando l’iscrizione a Netatmo c’è già («iscrizione già presente»): prima scriveva qualcosa solo quando doveva iscriversi.'],
   ]},
   {v: '0.27.0', quando: '26 novembre 2026', titolo: 'Versione per il server', righe: [
     ['m', 'Niente più tunnel Cloudflare', 'Il pannello gira su un server dietro un reverse proxy: tolti la procedura guidata, i comandi del tunnel e il programma cloudflared.'],
