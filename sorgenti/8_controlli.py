@@ -378,7 +378,7 @@ def _registra_fsv_rifiutata(app, codice, prima, n, ip, motivo):
     log.info("FSV dal pannello non riuscito: %s %s -> %s (%s)", codice, prima, n, motivo)
 
 
-SOLO_CASA = "Questa modifica si fa solo da casa, collegato alla rete locale (non da fuori)."
+SOLO_CASA = "Questa modifica non si fa da internet: apri il pannello dal tunnel SSH."
 
 
 def _fuori_casa(gestore, cosa):

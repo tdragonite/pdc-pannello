@@ -189,7 +189,6 @@ main{min-width:0;padding:22px 26px 40px}
 
 /* ---------- impostazioni ---------- */
 #imp .card{margin-bottom:14px}
-.sez-t{margin:22px 2px 10px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
 .nota-sez,.fsv-edit small{text-wrap:pretty}
 .nota-sez{color:var(--mut);font-size:13px;margin:6px 0 4px}
 .campo input[type=text],.campo input[type=password],.campo input[type=time],.campo select,.campo textarea{width:100%;font:inherit;font-size:16px;background:var(--bg2);
@@ -231,12 +230,6 @@ button:disabled{opacity:.5;cursor:default}
   padding:11px 16px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:30;max-width:90vw;box-shadow:0 8px 30px rgba(0,0,0,.6)}
 #toast.on{opacity:1;transform:translate(-50%,0)}#toast.bad{border-color:var(--bad)}
 
-details.guida{margin:12px 0;background:var(--bg2);border:1px solid var(--linea);border-radius:12px;padding:10px 14px}
-details.guida summary{cursor:pointer;font-weight:650}
-details.guida ol{margin:10px 0 4px;padding-left:20px;display:grid;gap:8px;color:var(--mut);font-size:14px}
-details.guida b{color:var(--txt)}
-ul.passi{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px;font-size:14px}
-ul.passi li.ok{color:var(--ok)}ul.passi li.bad{color:var(--bad)}
 a{color:var(--acs)}
 
 /* ---------- curva ---------- */
@@ -429,8 +422,6 @@ details.riq .campi>.campo:first-child{padding-top:8px}
 details.riq .campi>.campo:last-child{padding-bottom:0}
 details.riq[open]{padding-bottom:7px}
 details.riq .riq-c>.nota-sez:first-child,details.riq .riq-c>h2:first-child+.nota-sez{margin-top:14px}
-#cf h2{display:none}
-#cf .ch{justify-content:flex-end}
 .lista-allarmi{display:grid;gap:8px}
 .lista-allarmi .allarme{position:relative;background:var(--bg2);border:1px solid var(--linea);border-radius:12px;padding:12px 36px 12px 14px}
 

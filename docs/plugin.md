@@ -5,7 +5,7 @@
 Le integrazioni opzionali sono file nella cartella `plugin`, accanto a `pdc_pannello.py` (se non c'è, creala). In *Impostazioni → Integrazioni* vedi ogni plugin con il suo stato, l'interruttore (**un plugin nuovo parte spento**), i suoi campi e gli indirizzi pubblici che espone. Dopo aver aggiunto o cambiato un file premi *Ricarica i plugin*: non serve riavviare il pannello.
 
 - Stato, numero di richieste e «ultima richiesta» di ogni plugin si aggiornano da soli ogni pochi secondi mentre guardi la scheda; quello che stai scrivendo nei campi non viene toccato.
-- Gli indirizzi pubblici si mostrano già completi, con il tuo indirizzo Cloudflare (se l'hai configurato), pronti da copiare con il pulsante **Copia**.
+- Gli indirizzi pubblici si mostrano già completi, con il tuo indirizzo pubblico (`generale.indirizzo_pubblico`, se l'hai scritto), pronti da copiare con il pulsante **Copia**.
 - Un errore dentro un plugin non ferma mai il pannello: il plugin va in «errore» e il motivo è scritto lì (e nel registro).
 - Un plugin gira con gli stessi permessi del pannello: metti nella cartella solo file di cui ti fidi.
 - Un plugin può esporre indirizzi **senza login** (`/plugin/nome/…`) solo da acceso; il pannello limita dimensione e frequenza delle richieste, ma l'autenticazione è compito del plugin.
@@ -15,12 +15,12 @@ Le integrazioni opzionali sono file nella cartella `plugin`, accanto a `pdc_pann
 
 ## Analisi dei dati (leggere i dati senza esportare il file)
 
-Il plugin `analisi.py` (versione 1.0.0) mette a disposizione, su un indirizzo di sola lettura, gli stessi dati del comando `python pdc_strumenti.py analisi` (capitolo 9 di [strumenti.md](strumenti.md)), così chi li deve analizzare non ha bisogno del file esportato a mano. Non può comandare né scrivere niente. Per non pesare sul pannello lancia il comando come programma a parte (con mesi di storico l'analisi usa qualche centinaio di MB e qualche secondo) e lo ferma se supera i 3 minuti; il database si apre in sola lettura e, come per il comando, nel risultato non ci sono token, password, indirizzi né identificativi.
+Il plugin `analisi.py` (versione 1.0.1) mette a disposizione, su un indirizzo di sola lettura, gli stessi dati del comando `python pdc_strumenti.py analisi` (capitolo 8 di [strumenti.md](strumenti.md)), così chi li deve analizzare non ha bisogno del file esportato a mano. Non può comandare né scrivere niente. Per non pesare sul pannello lancia il comando come programma a parte (con mesi di storico l'analisi usa qualche centinaio di MB e qualche secondo) e lo ferma se supera i 3 minuti; il database si apre in sola lettura e, come per il comando, nel risultato non ci sono token, password, indirizzi né identificativi.
 
 **Installazione**: copia `analisi.py` nella cartella `plugin` (`pdc_strumenti.py` deve stare accanto a `pdc_pannello.py`), premi *Ricarica i plugin* in *Impostazioni → Integrazioni*, scrivi un **Token** tuo (da 24 a 64 caratteri tra lettere, numeri, trattino e underscore) e accendi l'interruttore. Senza un token valido il plugin non risponde a nessuno. Il segreto dell'indirizzo lo genera da solo.
 
 **Sicurezza**: funziona solo se sono vere tutte e quattro queste cose, altrimenti risponde 404 (senza dire quale controllo è fallito):
-1. la richiesta arriva dalla **rete di casa**: quelle che passano dal tunnel Cloudflare o da un altro proxy, o da un indirizzo non privato, sono rifiutate come per le regolazioni della pompa. L'indirizzo con il dominio Cloudflare che compare in *Indirizzi pubblici* quindi non funziona da fuori, di proposito: da casa si usa l'indirizzo del PC con la porta;
+1. la richiesta è **«di casa»**: quelle che passano da un reverse proxy o arrivano da un indirizzo non privato sono rifiutate, come per le regolazioni della pompa. L'indirizzo pubblico che compare in *Indirizzi pubblici* quindi non funziona da fuori, di proposito: si usa l'indirizzo del pannello nella rete di casa oppure, se sta su un server, un tunnel SSH;
 2. l'indirizzo contiene il **segreto**;
 3. la richiesta porta il **token** nell'intestazione `X-Analisi-Token`;
 4. è una richiesta **GET**.
@@ -36,7 +36,7 @@ Per cambiare segreto o token basta scriverne uno nuovo e ricaricare i plugin.
 
 Plugin `alexa.py`, versione 1.4.2. Con una **skill personale** di Alexa (visibile solo al tuo account Amazon) e le **Routine** puoi chiedere al pannello cose come «che temperatura c'è» o «il riscaldamento è acceso», e accendere o spegnere lo Smarther, senza pronunciare il nome della skill: è la Routine a dirlo per te. I file stanno nella cartella `plugin_esempio`: `alexa.py` (il plugin), `alexa_modello_it.json` (il modello della skill), `ALEXA_FRASI.md` (l'elenco completo di frasi e risposte) e `ALEXA_CHANGELOG.md` (la cronologia del plugin).
 
-**Cosa serve**: il pannello raggiungibile da internet ([telegram-e-cloudflare.md](telegram-e-cloudflare.md)) e un account sviluppatore Amazon gratuito (developer.amazon.com; chiede la verifica dell'identità).
+**Cosa serve**: il pannello raggiungibile da internet ([telegram-e-accesso.md](telegram-e-accesso.md)) e un account sviluppatore Amazon gratuito (developer.amazon.com; chiede la verifica dell'identità).
 
 ### Installazione, passo per passo
 
@@ -44,7 +44,7 @@ Plugin `alexa.py`, versione 1.4.2. Con una **skill personale** di Alexa (visibil
 2. Nello stesso riquadro, sotto *Indirizzi pubblici*, premi **Copia** accanto all'indirizzo (`https://tuo-dominio/plugin/alexa/…`). Non condividerlo: chi lo conosce può provare a chiamare il plugin.
 3. Su <https://developer.amazon.com/alexa/console/ask> scegli *Create Skill*: nome a piacere, lingua **Italiano (Italia)**, tipo **Custom**, hosting **Provision your own**, template **Start from scratch**.
 4. Vai in *Build → Interaction Model → JSON Editor*, cancella tutto e incolla il contenuto di `alexa_modello_it.json` (nome di invocazione: `centrale termica`, cambialo se vuoi). **Save** e **Build**.
-5. In *Build → Endpoint* scegli **HTTPS**, incolla l'indirizzo copiato nel campo *Default Region* e, nel menu sotto, la voce che dice che l'endpoint ha un certificato di un'autorità riconosciuta (quello di Cloudflare lo è). **Save**.
+5. In *Build → Endpoint* scegli **HTTPS**, incolla l'indirizzo copiato nel campo *Default Region* e, nel menu sotto, la voce che dice che l'endpoint ha un certificato di un'autorità riconosciuta. **Save**.
 6. Nella scheda *Test* abilita la skill in **Development** (se resta *Off* non risponde). Prova nel simulatore: «apri centrale termica» e poi «temperatura».
 7. Nell'app **Alexa** crea una **Routine** per ogni frase che vuoi: *Quando* → «Voce» con la frase che dirai (per esempio «umidità»); *Azione* → **Personalizzata**, con il testo `chiedi a centrale termica umidità`. Ripeti per le altre (frasi in `ALEXA_FRASI.md`).
 
@@ -73,7 +73,7 @@ Il pannello limita comunque dimensione e frequenza delle richieste (vedi [manute
 | «Si è verificato un problema con la risposta della skill» | Guarda lo stato del plugin: se la richiesta non è arrivata, l'indirizzo nella console non è quello attuale (hai cambiato il segreto?) o il plugin è spento. |
 | Alexa risponde con altro («il termostato rileva…») | Alexa sta usando un'altra skill o una funzione sua: controlla il nome di invocazione (`centrale termica`), che la skill sia in *Development* e prova senza Alexa+. |
 | Non arriva niente a Alexa dopo il passaggio ad «Attiva» | Rimetti *Solo avviso* e leggi nello stato il motivo scritto fra parentesi dopo «firma NON valida». |
-| Il contatore non sale | Ricarica la scheda Integrazioni; controlla il tunnel (vedi [telegram-e-cloudflare.md](telegram-e-cloudflare.md)) e che l'interruttore del plugin sia acceso. |
+| Il contatore non sale | Ricarica la scheda Integrazioni; controlla che l'indirizzo pubblico risponda (vedi [telegram-e-accesso.md](telegram-e-accesso.md)) e che l'interruttore del plugin sia acceso. |
 
 
 ---

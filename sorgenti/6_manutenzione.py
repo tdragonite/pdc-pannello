@@ -286,3 +286,6 @@ def avvia_manutenzione(app):
 
 TEMPLATE["conservazione"] = copy.deepcopy(CONSERVAZIONE_DEFAULT)
 TEMPLATE["backup"] = copy.deepcopy(BACKUP_DEFAULT)
+
+
+aggiungi_default_pezzi()     # Telegram e allarmi: ora che le loro parti sono definite

@@ -935,7 +935,6 @@ function vistaImp() {
   $('#imp').hidden = reg; $('#reg').hidden = !reg;
   document.querySelectorAll('#imp .imp-tab').forEach(g => { g.hidden = g.dataset.t !== (cur || 'stato'); });
   if (reg) caricaRegistro();
-  else if (cur === 'accesso') cfCarica(false);      // appena apri la scheda, senza aspettare il giro dei 5 secondi
 }
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
@@ -1129,13 +1128,23 @@ window.addEventListener('scroll', chiudiPannelli, {passive: true});
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
-  ['webhook', 'Smarther in tempo reale', 'Con il tunnel attivo, Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
+  ['webhook', 'Smarther in tempo reale', 'Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
   ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
-  ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo da casa, con lucchetto e conferma.'],
+  ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo dal tunnel SSH, con lucchetto e conferma.'],
   ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
+  {v: '0.27.0', quando: '26 novembre 2026', titolo: 'Versione per il server', righe: [
+    ['m', 'Niente più tunnel Cloudflare', 'Il pannello gira su un server dietro un reverse proxy: tolti la procedura guidata, i comandi del tunnel e il programma cloudflared.'],
+    ['m', 'IP e MAC scritti a mano', 'Il server non è nella rete di casa: il MAC non si cerca più, si scrive in Impostazioni → Dispositivi accanto all’IP.'],
+    ['n', 'Login del reverse proxy', 'Se il proxy ha già controllato il tuo accesso (riga «chiave_proxy» di config.json), il pannello non ti richiede la sua password; i comandi di casa restano chiusi.'],
+    ['m', 'Indirizzo pubblico', 'Webhook Netatmo e indirizzi dei plugin usano la riga «indirizzo_pubblico» di config.json (sezione generale).'],
+    ['m', 'Testi per il server', 'Gli avvisi dicono «tunnel SSH» invece di «rete di casa», e per il riavvio indicano RunWisp.'],
+    ['s', 'Spegnimento pulito su Linux', 'Quando il sistema ferma il pannello (Stop), si chiude come con Ctrl+C: ferma raccolta e plugin e lo scrive nel registro.'],
+    ['s', 'Indirizzi dei plugin', 'In Integrazioni, dopo qualche secondo, gli indirizzi non diventano più quelli del browser (per esempio «localhost»): resta quello pubblico.'],
+    ['s', 'File per le analisi', 'Il file del comando «analisi» non contiene più il numero di serie della pompa né gli identificativi Netatmo di casa e stanza.'],
+  ]},
   {v: '0.26.2', quando: '26 novembre 2026', titolo: 'Aggiornamenti senza aprire la pagina', righe: [
     ['m', 'Aggiornamento a caldo da script', 'Su Linux lo script che pubblica i file nuovi può chiedere al pannello di applicarli a caldo e ricaricare i plugin, senza login e senza aprire la pagina; l’esito finisce nel registro. Su Windows non cambia niente.'],
   ]},
@@ -1731,7 +1740,7 @@ document.addEventListener('toggle', e => {
 }, true);
 // ---- impostazioni installatore: lettura, cronologia e modifica (lucchetto di 30 s, poi matita, poi conferma) ----
 // la matita ✎ sulla riga: attiva solo con le modifiche sbloccate e da casa
-const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo da casa' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
+const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo dal tunnel SSH' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
 S.sbloccoFsv = S.sbloccoFsv || 0; S.fsvMod = S.fsvMod || null; S.fsvVal = S.fsvVal || ''; S.fsvErr = S.fsvErr || ''; S.fsvOcc = false;
 // chiude gli editor aperti nella scheda Regolazioni (FSV, regolazione, boost): se ne tiene aperto uno alla volta
 function chiudiEditor() { S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = false; S.boostErr = ''; }
@@ -1873,7 +1882,7 @@ function cardRegolazioni(d) {
   const lock = S.fuori ? '' : `<span class="ch-b"><button type="button" class="sec piccolo ${sbl ? 'sbloccato' : ''}" id="b-lock-fsv">${sbl ? 'Modifiche sbloccate · Blocca' : 'Sblocca modifiche'}</button></span>`;
   const testo = S.fuori ? 'Qui sotto i valori attuali della pompa.'
     : 'Per cambiare un valore (qui sotto o negli FSV): «Sblocca modifiche» (restano sbloccate 30 secondi dall’ultima azione), la matita ✎, il nuovo valore e la conferma. La pompa deve poi comunicare il valore nuovo: SmartThings può metterci un po’, e finché non lo fa la riga dice «in attesa».';
-  const avviso = S.fuori ? '<div class="avviso warn"><span>⚠️</span><div>Sei collegato da fuori casa: le modifiche (FSV, acqua calda, Boost, modo della pompa) si fanno solo dalla rete di casa.</div></div>' : '';
+  const avviso = S.fuori ? '<div class="avviso warn"><span>⚠️</span><div>Sei collegato da internet: le modifiche (FSV, acqua calda, Boost, modo della pompa) si fanno solo aprendo il pannello dal tunnel SSH.</div></div>' : '';
   return `<article class="card dev"><div class="ch"><h2>Regolazioni</h2>${lock}</div>
     <p class="nota-sez">${testo}</p></article>${avviso}
     <article class="card dev"><div class="ch"><h2>Acqua calda</h2></div>${rigaReg(g.acs_setpoint)}${rigaReg(g.acs_modo)}${rigaBoost(d.boost)}</article>
@@ -2026,9 +2035,9 @@ function mostraCampo(el) {
   const g = el.closest('.imp-tab'); if (g && g.hidden) location.hash = '#/impostazioni' + (g.dataset.t === 'stato' ? '' : '/' + g.dataset.t);
 }
 // Mette i riquadri di ogni scheda in due colonne indipendenti, a turno da sinistra e nell'ordine di partenza: aprire o chiudere un riquadro
-// normale non sposta mai gli altri. I riquadri "larghi" (testi, avvisi, Cloudflare) stanno in colonna da chiusi; da aperti passano a tutta riga.
+// normale non sposta mai gli altri. I riquadri "larghi" (testi, avvisi) stanno in colonna da chiusi; da aperti passano a tutta riga.
 // Su telefono è una colonna sola, nell'ordine di prima.
-function riquadroLargo(f) { return !!(f.querySelector('textarea') || f.dataset.id === 'allarmi' || f.id === 'cf-d'); }
+function riquadroLargo(f) { return !!(f.querySelector('textarea') || f.dataset.id === 'allarmi'); }
 function disponiColonne() {
   document.querySelectorAll('#imp .imp-tab:not([data-t=stato])').forEach(tab => {
     tab.querySelectorAll(':scope > details.riq, :scope .imp-col > details.riq').forEach((f, n) => { if (f.dataset.ix === undefined) f.dataset.ix = n; });
@@ -2058,7 +2067,7 @@ document.addEventListener('toggle', e => { const t = e.target; if (t.classList &
 // ---------- Impostazioni > Integrazioni (plugin) ----------
 const PLG_STATO = {attivo: ['si', 'attivo'], spento: ['no', 'spento'], errore: ['bad', 'errore']};
 function pluginRighe(p) {
-  const base = p.base || location.origin;      // l'indirizzo da fuori casa, se il tunnel c'è
+  const base = p.base || location.origin;      // l'indirizzo pubblico, se è scritto in config.json
   const rotte = p.rotte.map(r => `<span class="cv"><span class="val-c">${esc(base + r)}</span><button type="button" class="copia" data-copia="${esc(base + r)}" aria-label="Copia l'indirizzo">Copia</button></span>`).join('<br>');
   return [
     p.messaggio ? riga('Stato', esc(p.messaggio)) : '',
@@ -2122,7 +2131,6 @@ function disegnaImpostazioni(d) {
       <div class="campo lg"><label for="p-at">Password attuale</label><input id="p-at" type="password" autocomplete="current-password"></div>
       <div class="campo lg"><label for="p-nu">Nuova password (almeno 10 caratteri)</label><input id="p-nu" type="password" autocomplete="new-password"></div></div>
       <div class="azioni"><button type="button" class="sec" id="b-pw">Cambia password</button><small class="msg" id="pw-msg"></small></div>`;
-  const m = impAperti(), cfAp = 'cf' in m ? m.cf : false;
   box.innerHTML = `
     <div class="imp-tab" data-t="stato">
       <article class="card" id="agg"><div class="ch"><h2>Aggiornamento</h2><button type="button" class="sec piccolo" id="agg-ricontrolla">Controlla</button></div><div id="agg-corpo" class="agg-corpo">Controllo…</div></article>
@@ -2133,8 +2141,7 @@ function disegnaImpostazioni(d) {
       ${riquadro('allarmi', 'Quando avvisarti', `<p class="nota-sez">Tocca un avviso per cambiarne le soglie o spegnerlo.</p><div class="lista-allarmi">${all}</div>`, false)}</div>
     <div class="imp-tab" data-t="integrazioni" hidden>${pluginTab(d)}</div>
     <div class="imp-tab" data-t="accesso" hidden>
-      ${riquadro('password', 'Password del pannello', pw, true)}
-      <details class="card imp riq" data-id="cf" id="cf-d" ${cfAp ? 'open' : ''}><summary><h2>Accesso da internet (Cloudflare)</h2></summary><div class="riq-c" id="cf"><div class="vuoto" style="padding:14px 0">Controllo l'accesso da internet…</div></div></details></div>
+      ${riquadro('password', 'Password del pannello', pw, true)}</div>
     <div class="imp-tab" data-t="dati" hidden>${sez('dati')}
       ${riquadro('reset', 'Azzera il database', `<p class="nota-sez">Cancella <b>tutti i dati raccolti</b> (storico, grafici, anomalie) e riparte da zero. Restano le impostazioni, la password e i collegamenti.<br>Prima di cancellare il pannello fa una <b>copia di sicurezza</b> nella cartella dei backup (<code>prima-del-reset-…db</code>); se la copia non riesce, non cancella niente. Si rimette con <code>python pdc_pannello.py ripristina</code>.</p>
         <div class="azioni"><button type="button" class="sec pericolo" id="rst-apri">Azzera il database…</button></div>
@@ -2147,9 +2154,6 @@ function disegnaImpostazioni(d) {
   disponiColonne();
   vistaImp();
   aggCarica();
-  cfCarica(true);
-  clearInterval(S.cfTimer);      // lo stato del tunnel si rilegge ogni 5 s, ma solo mentre guardi la scheda Accesso
-  S.cfTimer = setInterval(() => { if (S.pagina !== 'impostazioni') clearInterval(S.cfTimer); else if (S.sub === 'accesso' && !document.hidden) cfCarica(false); }, 5000);
 }
 
 function segnaModifica(e) {
@@ -2162,13 +2166,19 @@ function toast(t, cattivo) {
   let el = $('#toast'); if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
   el.textContent = t; el.className = 'on' + (cattivo ? ' bad' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => el.className = '', cattivo ? 12000 : 4200);
 }
+function loginProxyScaduto(r) {   // login del reverse proxy scaduto: la richiesta finisce sulle sue pagine /auth -> ricarico
+  if (!r.redirected || !new URL(r.url).pathname.startsWith('/auth')) return false;
+  location.reload(); return true;
+}
 async function leggiJson(url) {         // GET con sessione; se e' scaduta torna al login e ridà null
   const r = await fetch(url, {credentials: 'same-origin', cache: 'no-store'});
+  if (loginProxyScaduto(r)) return null;
   if (r.status === 401) { location.href = '/login'; return null; }
   return r;
 }
 async function inviaPost(url, corpo) {
   const r = await fetch(url, {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json', 'X-Pdc': '1'}, body: JSON.stringify(corpo)});
+  if (loginProxyScaduto(r)) return {};
   if (r.status === 401) { location.href = '/login'; return {}; }
   return r.json();
 }
@@ -2181,7 +2191,7 @@ async function aggCarica() {
     box.innerHTML = a.stato === 'applicabile'
       ? `<p class="agg-ok"><b>È pronta la versione ${esc(a.versione_disco)}</b> (cambiato: ${cosa}).<br>Si applica subito, <b>senza fermare la raccolta dei dati</b>.</p><div class="azioni"><button type="button" id="agg-applica">Applica aggiornamento</button></div>`
       : a.stato === 'riavvio'
-        ? `<p class="agg-riavvio"><b>Per la versione ${esc(a.versione_disco)} serve il riavvio completo</b>${cosa ? ' (cambiato: ' + cosa + ')' : ''}.<br>La raccolta dei dati continua finché non chiudi e rilanci il programma Python.${a.messaggio ? '<br>' + esc(a.messaggio) : ''}</p>`
+        ? `<p class="agg-riavvio"><b>Per la versione ${esc(a.versione_disco)} serve il riavvio completo</b>${cosa ? ' (cambiato: ' + cosa + ')' : ''}.<br>La raccolta dei dati continua finché non riavvii il pannello (da RunWisp: Stop, poi Start).${a.messaggio ? '<br>' + esc(a.messaggio) : ''}</p>`
         : a.stato === 'errore' ? `<p class="agg-riavvio">${esc(a.messaggio || 'Non riesco a controllare.')}</p>`
         : `<p class="agg-ok">Il pannello è aggiornato (versione ${esc(a.versione)}). Quando sostituisci il file, qui compare cosa è cambiato e se si può applicare a caldo.</p>`;
   } catch { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
@@ -2238,122 +2248,6 @@ async function azioniImpostazioni(e) {
     if (r.ok) { $('#p-at').value = ''; $('#p-nu').value = ''; }
   }
 }
-
-// ---------- Accesso da internet (Cloudflare) ----------
-const CFS = {zone: null, token: '', passi: null, occupato: false};
-async function cfLeggi() { const r = await leggiJson('/api/cloudflare'); return r && r.json(); }
-async function cfCarica(forza) {
-  const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
-  let st; try { st = await cfLeggi(); } catch { return; }
-  if (!st) return;
-  if (!st.configurato) { if (forza || !el.dataset.wiz) { el.dataset.wiz = '1'; el.innerHTML = cfWizard(st); } return; }
-  el.dataset.wiz = '';
-  if (CFS.occupato && !forza) return;
-  if (el.dataset.rimuovi === '1' && !forza) { const s = $('#cf-stato'); if (s) s.innerHTML = cfStatoHtml(st); return; }
-  el.innerHTML = cfGestione(st);
-}
-function cfWizard(st) {
-  return `<h2>Accesso da internet (Cloudflare)</h2>
-  <p class="nota-sez">Così apri il pannello anche fuori casa, all'indirizzo che scegli tu (es. <b>https://pdc.tuodominio.it</b>), sempre con utente e password. Non devi aprire porte sul router. Serve un dominio che usa i DNS di Cloudflare.</p>
-  ${st.demo ? '<p class="msg bad">In modalità demo la procedura non è disponibile.</p>' : ''}
-  <details class="guida"><summary>1 · Come creo il token di Cloudflare (2 minuti)</summary><ol>
-    <li>Apri <b>dash.cloudflare.com/profile/api-tokens</b> e premi <b>Create Token</b>, poi <b>Create Custom Token</b> (“Get started”).</li>
-    <li>Dagli un nome, per esempio <i>pannello PdC</i>.</li>
-    <li>In <b>Permissions</b> aggiungi tre righe:<br>• <b>Account</b> · <b>Cloudflare Tunnel</b> · <b>Edit</b><br>• <b>Zone</b> · <b>DNS</b> · <b>Edit</b><br>• <b>Zone</b> · <b>Zone</b> · <b>Read</b></li>
-    <li>In <b>Account Resources</b> scegli il tuo account; in <b>Zone Resources</b> scegli <b>Include → Specific zone</b> e il tuo dominio.</li>
-    <li>Premi <b>Continue to summary</b>, poi <b>Create Token</b> e <b>copia il token</b> (si vede una volta sola).</li></ol>
-    <p class="nota-sez">Il token serve solo adesso: il pannello <b>non lo conserva</b>. Dopo puoi anche cancellarlo dal sito di Cloudflare.</p></details>
-  <div class="campi" style="grid-template-columns:1fr">
-    <div class="campo lg"><label for="cf-tok">2 · Incolla qui il token</label><input id="cf-tok" type="password" autocomplete="off" placeholder="il token di Cloudflare"></div></div>
-  <div class="azioni"><button type="button" id="cf-verifica" ${st.demo ? 'disabled' : ''}>Verifica e cerca i miei domini</button><small class="msg" id="cf-msg"></small></div>
-  <div id="cf-passo2"></div>`;
-}
-function cfPasso2(zone) {
-  const opz = zone.map((z, i) => `<option value="${i}">${esc(z.nome)}</option>`).join('');
-  return `<h3 class="sez-t" style="margin-top:20px">3 · Scegli l'indirizzo</h3>
-  <div class="campi">
-    <div class="campo lg"><label for="cf-zona">Dominio</label><select id="cf-zona">${opz}</select></div>
-    <div class="campo lg"><label for="cf-sub">Sottodominio</label><input id="cf-sub" type="text" value="pdc" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
-    <div class="campo lg"><label for="cf-nome">Nome del tunnel (solo per riconoscerlo su Cloudflare)</label><input id="cf-nome" type="text" value="pannello-pdc" spellcheck="false"></div></div>
-  <p class="nota-sez" id="cf-anteprima"></p>
-  <div class="azioni"><button type="button" id="cf-crea">Crea tunnel e collega</button><small class="msg" id="cf-msg2"></small></div>
-  <ul class="passi" id="cf-passi"></ul>`;
-}
-function cfAnteprima() { const z = CFS.zone && CFS.zone[+$('#cf-zona').value]; const e = $('#cf-anteprima'); if (e && z) e.innerHTML = 'Il pannello sarà raggiungibile su <b>https://' + esc(($('#cf-sub').value || '…').toLowerCase()) + '.' + esc(z.nome) + '</b>'; }
-function cfStatoHtml(st) {
-  const p = (c, t) => `<span class="pill ${c}">${t}</span>`;
-  return [
-    riga('Indirizzo', `<a href="${esc(st.indirizzo)}" target="_blank" rel="noopener">${esc(st.hostname)}</a>`),
-    riga('Programma cloudflared', st.programma ? p('si', 'presente') : p('bad', 'manca')),
-    riga('Tunnel', st.collegato ? p('si', 'collegato a Cloudflare') : st.in_esecuzione ? p('no', 'in avvio…') : p('off', 'spento')),
-  ].join('') + (st.problema ? `<p class="msg bad" style="margin:8px 0 0">${esc(st.problema)}</p>` : '') +
-    (st.porta_diversa ? `<p class="msg bad" style="margin:8px 0 0">Il tunnel punta alla porta ${st.porta_servizio}, ma il pannello ora usa un'altra porta: rifai la procedura (Rimuovi, poi di nuovo).</p>` : '');
-}
-function cfGestione(st) {
-  return `<div class="ch"><h2>Accesso da internet (Cloudflare)</h2><button type="button" class="sec piccolo" id="cf-agg">Aggiorna</button></div>
-  <div class="righe" id="cf-stato">${cfStatoHtml(st)}</div>
-  <div class="azioni">
-    ${st.in_esecuzione ? '<button type="button" class="sec" id="cf-ferma">Ferma</button><button type="button" class="sec" id="cf-riavvia">Riavvia</button>' : `<button type="button" id="cf-avvia" ${st.programma ? '' : 'disabled'}>Avvia tunnel</button>`}
-    <button type="button" class="sec" id="cf-telegram">Invia il link su Telegram</button>
-    <button type="button" class="sec" id="cf-scarica">${st.programma ? 'Aggiorna cloudflared' : 'Scarica cloudflared'}</button></div>
-  <div class="campo riga-sw" style="margin-top:14px"><label for="cf-auto">Avvia il tunnel insieme al pannello</label><label class="sw"><input type="checkbox" id="cf-auto" ${st.avvio_automatico ? 'checked' : ''}><span></span></label></div>
-  <details class="guida" style="margin-top:12px" id="cf-rim"><summary>Rimuovi l'accesso da internet…</summary>
-    <p class="nota-sez">Ferma il tunnel e lo toglie dal pannello. Per cancellare anche tunnel e DNS su Cloudflare incolla un token con gli stessi permessi (altrimenti dovrai cancellarli tu dal loro sito).</p>
-    <div class="campo lg"><label for="cf-rtok">Token Cloudflare (facoltativo)</label><input id="cf-rtok" type="password" autocomplete="off"></div>
-    <div class="azioni"><button type="button" class="sec" id="cf-rimuovi" style="color:var(--bad)">Rimuovi</button><small class="msg" id="cf-rmsg"></small></div></details>
-  <p class="nota-sez">Il tunnel è protetto dal tuo login. Se cambi la porta del pannello, rifai la procedura.</p>`;
-}
-async function cfAzione(e) {
-  const id = e.target.id;
-  if (id === 'cf-agg') { toast('Stato aggiornato'); return cfCarica(true); }
-  if (id === 'cf-verifica') {
-    e.target.disabled = true; $('#cf-msg').textContent = 'Controllo…'; $('#cf-msg').className = 'msg';
-    CFS.token = $('#cf-tok').value.trim();
-    try { const r = await inviaPost('/api/cloudflare/verifica', {token: CFS.token});
-      if (r.ok) { CFS.zone = r.zone; $('#cf-msg').textContent = 'Token valido: ' + r.zone.length + ' dominio/i trovato/i.'; $('#cf-msg').className = 'msg ok'; $('#cf-passo2').innerHTML = cfPasso2(r.zone); cfAnteprima(); }
-      else { $('#cf-msg').textContent = r.messaggio; $('#cf-msg').className = 'msg bad'; }
-    } catch { $('#cf-msg').textContent = 'Server non raggiungibile'; $('#cf-msg').className = 'msg bad'; }
-    e.target.disabled = false;
-  } else if (id === 'cf-crea') {
-    const z = CFS.zone[+$('#cf-zona').value]; e.target.disabled = true; CFS.occupato = true;
-    const ul = $('#cf-passi'), m = $('#cf-msg2'); m.textContent = 'Lavoro su Cloudflare…'; m.className = 'msg'; ul.innerHTML = '';
-    const mostra = ps => ul.innerHTML = ps.map(p => `<li class="${p.ok ? 'ok' : 'bad'}">${p.ok ? '✓' : '✗'} ${esc(p.t)}</li>`).join('');
-    try {
-      const r = await inviaPost('/api/cloudflare/crea', {token: CFS.token, zone_id: z.id, sottodominio: $('#cf-sub').value, nome_tunnel: $('#cf-nome').value});
-      mostra(r.passi || []);
-      if (!r.ok) { m.textContent = r.messaggio || 'Non riuscito'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; return; }
-      CFS.token = ''; $('#cf-tok').value = '';
-      const st = await cfLeggi();
-      if (!st.programma) { m.textContent = 'Scarico cloudflared (circa 30 MB)…'; const d = await inviaPost('/api/cloudflare/scarica', {});
-        if (!d.ok) { m.textContent = ''; ul.insertAdjacentHTML('beforeend', `<li class="bad">✗ ${esc(d.messaggio)}</li>`); CFS.occupato = false; toast('Tunnel creato, ma manca cloudflared', true); return cfCarica(true); }
-        ul.insertAdjacentHTML('beforeend', `<li class="ok">✓ cloudflared scaricato (${esc(d.versione)})</li>`); }
-      const a = await inviaPost('/api/cloudflare/avvia', {});
-      ul.insertAdjacentHTML('beforeend', a.ok ? '<li class="ok">✓ Tunnel avviato</li>' : `<li class="bad">✗ ${esc(a.messaggio)}</li>`);
-      CFS.occupato = false; toast(a.ok ? 'Fatto! Tra qualche secondo l\'indirizzo risponde.' : 'Tunnel creato', !a.ok);
-      setTimeout(() => cfCarica(true), 1500);
-    } catch { m.textContent = 'Server non raggiungibile'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; }
-  } else if (id === 'cf-avvia' || id === 'cf-ferma' || id === 'cf-riavvia') {
-    e.target.disabled = true; CFS.occupato = true;
-    const r = await inviaPost('/api/cloudflare/' + id.slice(3), {}); CFS.occupato = false;
-    toast(r.ok ? 'Fatto' : (r.messaggio || 'Non riuscito'), !r.ok); setTimeout(() => cfCarica(true), 800);
-  } else if (id === 'cf-telegram') {
-    e.target.disabled = true; const r = await inviaPost('/api/cloudflare/telegram', {});
-    toast(r.messaggio || (r.ok ? 'Inviato' : 'Non riuscito'), !r.ok); e.target.disabled = false;
-  } else if (id === 'cf-scarica') {
-    e.target.disabled = true; CFS.occupato = true; toast('Scarico cloudflared…'); const r = await inviaPost('/api/cloudflare/scarica', {}); CFS.occupato = false;
-    toast(r.ok ? 'Scaricato: ' + r.versione : r.messaggio, !r.ok); cfCarica(true);
-  } else if (id === 'cf-rimuovi') {
-    if (!confirm('Rimuovere l\'accesso da internet?')) return;
-    e.target.disabled = true; const r = await inviaPost('/api/cloudflare/rimuovi', {token: $('#cf-rtok').value.trim()});
-    toast(r.avviso || 'Rimosso', !!r.avviso); if (r.avviso) alert(r.avviso); const el = $('#cf'); if (el) el.dataset.rimuovi = ''; cfCarica(true);
-  }
-}
-document.addEventListener('change', async e => {
-  if (e.target.id === 'cf-zona' || e.target.id === 'cf-sub') cfAnteprima();
-  if (e.target.id === 'cf-auto') { const r = await inviaPost('/api/cloudflare/opzioni', {avvio_automatico: e.target.checked}); toast(r.ok ? 'Salvato' : r.messaggio, !r.ok); }
-});
-document.addEventListener('input', e => { if (e.target.id === 'cf-sub') cfAnteprima(); if (e.target.id === 'cf-rtok') { const el = $('#cf'); if (el) el.dataset.rimuovi = '1'; } });
-document.addEventListener('toggle', e => { if (e.target.id === 'cf-rim') { const el = $('#cf'); if (el) el.dataset.rimuovi = e.target.open ? '1' : ''; } }, true);
 
 // ---------- dati e tempo reale ----------
 function finestra() {
@@ -2471,8 +2365,8 @@ function avvia() {
   document.addEventListener('pointerleave', togliCursore);
   document.addEventListener('input', segnaModifica); document.addEventListener('change', segnaModifica);
   document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') {
-    Promise.resolve(e.target.id.startsWith('cf-') ? cfAzione(e) : azioniImpostazioni(e))
-      .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; CFS.occupato = false; }); } });
+    Promise.resolve(azioniImpostazioni(e))
+      .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; }); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
   document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (!tooltipSotto(e)) muoviCursore(e); });

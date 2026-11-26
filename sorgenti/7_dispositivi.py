@@ -22,74 +22,16 @@ def elenco_loghi(app):
 
 
 # --------------------------------------------------------------------------
-# MAC dall'IP (best-effort: legge la tabella ARP del sistema)
+# MAC scritto a mano: riconosciuto e messo in forma standard
 # --------------------------------------------------------------------------
 
 _RE_MAC = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}[0-9a-fA-F]{2})(?![0-9a-fA-F])")
-_cache_mac = {}
-MAC_RICORDO = 7 * 86400     # un MAC trovato non cambia quasi mai: si ricorda una settimana (cambiando l'IP in Impostazioni si rilegge subito)
-MAC_RIPROVA = 120           # se non c'e' (dispositivo spento) si riprova presto
-
-
 def _mac_normale(testo):
     m = _RE_MAC.search(testo or "")
     if not m:
         return None
     mac = m.group(1).replace("-", ":").upper()
     return None if mac in ("FF:FF:FF:FF:FF:FF", "00:00:00:00:00:00") else mac
-
-
-def mac_da_righe(righe, ip):
-    """Cerca nelle righe dell'output di 'arp -a' / '/proc/net/arp' quella dell'IP dato."""
-    for riga in righe:
-        parti = riga.split()
-        if parti and parti[0].strip("()") == ip:
-            mac = _mac_normale(riga)
-            if mac:
-                return mac
-        elif f"({ip})" in riga:                        # formato Linux/macOS di 'arp -a'
-            mac = _mac_normale(riga)
-            if mac:
-                return mac
-    return None
-
-
-def mac_da_ip(ip):
-    """MAC di un dispositivo della rete locale, oppure None. Nessuna libreria esterna: 'arp' del sistema."""
-    ora = time.time()
-    c = _cache_mac.get(ip)
-    if c and ora - c[0] < (MAC_RICORDO if c[1] else MAC_RIPROVA):
-        return c[1]
-    mac = None
-    try:
-        ip = str(ipaddress.IPv4Address(ip))          # finisce tra gli argomenti di «arp»: solo un indirizzo vero (config.json si scrive anche a mano)
-        # una "bussata" UDP fa popolare la tabella ARP anche se il dispositivo non risponde
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.3)
-        try:
-            s.sendto(b"\x00", (ip, 9))
-        except OSError:
-            pass
-        finally:
-            s.close()
-        time.sleep(0.15)
-        import subprocess
-        if os.name == "nt":
-            r = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-                               creationflags=0x08000000)          # CREATE_NO_WINDOW
-            mac = mac_da_righe(r.stdout.splitlines(), ip)
-        else:
-            try:
-                mac = mac_da_righe(Path("/proc/net/arp").read_text().splitlines(), ip)
-            except OSError:
-                pass
-            if not mac:
-                r = subprocess.run(["arp", "-n", ip], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-                mac = mac_da_righe(r.stdout.splitlines(), ip) or _mac_normale(r.stdout)
-    except Exception:
-        mac = None
-    _cache_mac[ip] = (ora, mac)
-    return mac
 
 
 # --------------------------------------------------------------------------
@@ -135,22 +77,11 @@ def _stato_connessione(ult, ora, serie_stato, valore_ok, serie_dato, tol):
     return ("Online", "si") if d and ora - d[1] <= tol else ("—", "no")
 
 
-def _riga_rete(app, ip, mac_noto, etichetta_mac="MAC"):
-    righe = []
-    if not ip:
-        righe.append(_riga("IP", None, nota="Non impostato: scrivilo in Impostazioni → Dispositivi."))
-        if mac_noto:
-            righe.append(_riga(etichetta_mac, mac_noto, "c"))
-        return righe
-    righe.append(_riga("IP", ip, "c"))
-    mac = mac_da_ip(ip)
-    if mac_noto and not mac:
-        righe.append(_riga(etichetta_mac, mac_noto, "c"))
-    elif mac:
-        righe.append(_riga(etichetta_mac, mac, "c"))
-    else:
-        righe.append(_riga(etichetta_mac, None, nota="Non lo trovo nella rete: controlla l'IP e che il dispositivo sia acceso."))
-    return righe
+def _riga_rete(ip, mac, etichetta_mac="MAC"):
+    """IP e MAC come scritti in Impostazioni → Dispositivi: il server non e' nella rete di casa, non li puo' cercare."""
+    manca = "Non impostato: scrivilo in Impostazioni → Dispositivi."
+    return [_riga("IP", ip or None, "c", nota="" if ip else manca),
+            _riga(etichetta_mac, mac or None, "c", nota="" if mac else manca)]
 
 
 def _versioni_pdc(testo):
@@ -209,7 +140,7 @@ def _scheda_pdc(app, ult, cfg, ora, tol):
             _riga("ID profilo", t("info.pdc.vid"), "c"),
             _riga("Registrata su SmartThings", int(t("info.pdc.registrata")) if (t("info.pdc.registrata") or "").isdigit() else None, "d"),
         ]},
-        {"titolo": "Rete", "righe": _riga_rete(app, cfg["dispositivi"].get("ip_pdc", ""), None)},
+        {"titolo": "Rete", "righe": _riga_rete(cfg["dispositivi"].get("ip_pdc", ""), _mac_normale(cfg["dispositivi"].get("mac_pdc", "")))},
     ]
     r = ult.get("acs.temperatura")
     return {"id": "pdc", "titolo": "Pompa di calore", "sotto": "Samsung EHS · via SmartThings",
@@ -268,7 +199,7 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
             _riga("ID stanza Netatmo", cfg["netatmo"].get("room_id") or None, "c"),
             _riga("Installato su Netatmo", int(inst) if (inst or "").isdigit() else None, "d"),
         ]},
-        {"titolo": "Rete", "righe": _riga_rete(app, dc.get("ip_smarther", ""), mac_nt)},
+        {"titolo": "Rete", "righe": _riga_rete(dc.get("ip_smarther", ""), _mac_normale(dc.get("mac_smarther", "")) or mac_nt)},
         {"titolo": "Dal catalogo BTicino", "righe": (
             ([_riga("Installazione", arti[0]), _riga("Colorazione", arti[1])] if arti else []) +
             [_riga(a, b) for a, b in CATALOGO_SMARTHER])},

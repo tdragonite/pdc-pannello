@@ -1,19 +1,19 @@
 # Plugin Analisi: i dati dell'«analisi completa» (gli stessi del comando `python pdc_strumenti.py analisi`) su un indirizzo di SOLA LETTURA,
-# raggiungibile SOLO dalla rete di casa. Serve a chi deve analizzare i dati senza che tu li esporti a mano ogni volta.
+# NON raggiungibile da internet (si arriva dal tunnel SSH). Serve a chi deve analizzare i dati senza che tu li esporti a mano ogni volta.
 # Installazione: copia questo file nella cartella "plugin" accanto a pdc_pannello.py (pdc_strumenti.py deve stare accanto a
 # pdc_pannello.py), apri Impostazioni -> Integrazioni, premi "Ricarica i plugin", scrivi un TOKEN tuo e accendi l'interruttore.
 #
 # SICUREZZA (tutte e quattro le cose insieme, altrimenti 404):
-#  1. rete di casa: le richieste che arrivano dal tunnel Cloudflare (o da un altro proxy) o da un indirizzo non privato sono rifiutate,
-#     come per le regolazioni della pompa. L'indirizzo con il dominio Cloudflare che compare in «Indirizzi pubblici» quindi NON funziona
-#     da fuori, di proposito: da casa si usa l'indirizzo del PC con la porta;
+#  1. richiesta «di casa»: quelle che passano da un reverse proxy o da un indirizzo non privato sono rifiutate, come per le
+#     regolazioni della pompa. L'indirizzo pubblico che compare in «Indirizzi pubblici» quindi NON funziona da fuori, di
+#     proposito: si arriva dalla stessa rete del pannello o, se sta su un server, da un tunnel SSH;
 #  2. l'indirizzo contiene un segreto casuale, generato al primo avvio;
 #  3. serve il TOKEN (campo «Token», obbligatorio) nell'intestazione «X-Analisi-Token»: senza token il plugin non risponde a nessuno;
 #  4. solo GET: non comanda niente e non scrive niente nel pannello.
 # COME LAVORA: lancia il comando «analisi» di pdc_strumenti.py come programma a parte (lo stesso che lanci tu a mano) e ne manda il
 # risultato. Cosi' memoria e calcolo (centinaia di MB e qualche secondo, con mesi di storico) non pesano sul pannello, che continua a
 # raccogliere i dati; se il comando si pianta o ci mette troppo viene fermato, e il pannello non se ne accorge.
-# Il contenuto e' quello del comando: nessun token, password, indirizzo o identificativo (vedi capitolo 9 di strumenti.md).
+# Il contenuto e' quello del comando: nessun token, password, indirizzo o identificativo (vedi capitolo 8 di strumenti.md).
 # Come si legge: GET /plugin/analisi/<segreto>?giorni=45&grezzi=1&ciclo=7 con l'intestazione X-Analisi-Token; la risposta e' un JSON compresso (gzip).
 import gzip
 import hmac
@@ -30,12 +30,14 @@ from pathlib import Path
 
 INFO = {
     "titolo": "Analisi dei dati",
-    "versione": "1.0.0",
+    "versione": "1.0.1",
     "interfaccia": 1,
-    "descrizione": "Indirizzo di sola lettura, solo dalla rete di casa e con token, con i dati dell'analisi completa (gli stessi del comando "
+    "descrizione": "Indirizzo di sola lettura, non raggiungibile da internet (si usa dal tunnel SSH) e con token, con i dati dell'analisi completa (gli stessi del comando "
                    "«analisi» di pdc_strumenti.py). Non può comandare né scrivere niente.",
 }
 CHANGELOG = [
+    {"v": "1.0.1", "data": "2026-11-26T12:00", "titolo": "Pannello su un server", "righe": [
+        ["m", "Accesso dal tunnel SSH", "Rifiuta ogni richiesta passata da un reverse proxy, anche con intestazioni vuote; i testi parlano del tunnel SSH."]]},
     {"v": "1.0.0", "data": "2026-11-11T23:00", "titolo": "Primo rilascio", "righe": [
         ["n", "Analisi su richiesta", "Indirizzo di sola lettura con i dati dell'analisi completa, senza esportare il file a mano. Solo dalla rete di casa, con segreto e token."]]},
 ]
@@ -54,7 +56,7 @@ ATTESA_MAX = 180                    # secondi: oltre, il comando viene fermato
 CACHE_SECONDI = 60                  # la stessa richiesta entro un minuto riusa il risultato (per esempio se lo scaricamento si interrompe)
 NON_TROVATO = (404, "Non trovato", "text/plain; charset=utf-8")       # stessa risposta per tutti i rifiuti: non dice quale controllo e' fallito
 _DA_PROXY = ("cf-connecting-ip", "cf-ray", "cf-visitor", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
-             "forwarded", "x-real-ip", "true-client-ip")
+             "forwarded", "x-real-ip", "true-client-ip", "x-pdc-accesso")
 _RX_CHIAVE = re.compile(r"[A-Za-z0-9_\-]{24,64}")
 
 _ctx = {}
@@ -69,9 +71,9 @@ def _valida(ctx, chiave):
 
 
 def _da_casa(rich):
-    """Stessa regola delle regolazioni della pompa: niente intestazioni di tunnel o proxy, e indirizzo privato o locale.
+    """Stessa regola delle regolazioni della pompa: niente intestazioni di proxy, e indirizzo privato o locale.
     Copia di da_casa() in sorgenti/2_web.py (un plugin non vede le funzioni del pannello): se cambi una, cambia anche l'altra."""
-    if any(rich.intestazioni.get(x) for x in _DA_PROXY):
+    if any(rich.intestazioni.get(x) is not None for x in _DA_PROXY):      # anche vuota: basta che ci sia
         return False
     try:
         ip = ipaddress.ip_address(str(rich.ip).split("%")[0])

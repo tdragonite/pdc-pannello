@@ -1,6 +1,6 @@
 # Per chi modifica il codice
 
-Il programma che avvii (`pdc_pannello.py`) è un file **generato**. I sorgenti veri stanno in `sorgenti/` (una parte per argomento: nucleo, web, Telegram, impostazioni, Cloudflare, manutenzione, dispositivi, controlli, aggiornamento, comandi; in `sorgenti/web/` pagine, stile e script). Per rigenerarlo:
+Il programma che avvii (`pdc_pannello.py`) è un file **generato**. I sorgenti veri stanno in `sorgenti/` (una parte per argomento: nucleo, web, Telegram, impostazioni, manutenzione, dispositivi, controlli, plugin, aggiornamento, comandi; in `sorgenti/web/` pagine, stile e script). Per rigenerarlo:
 
 ```
 python costruisci.py

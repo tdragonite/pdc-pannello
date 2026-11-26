@@ -250,7 +250,16 @@ def plugin_ricarica(app):
 @api("/api/plugin/stato")
 def api_plugin_stato(app, q):
     """Solo i riquadri dei plugin (stato e contatori): la scheda Integrazioni li rilegge ogni 5 secondi, senza scaricare tutte le impostazioni."""
-    return {"sezioni": sezioni_plugin()}
+    return {"sezioni": plugin_con_base(sezioni_plugin(), app.cfg.leggi())}
+
+
+def plugin_con_base(sezioni, cfg):
+    """Aggiunge ai riquadri dei plugin l'indirizzo da internet: serve sia all'apertura sia all'aggiornamento ogni 5 secondi."""
+    base = indirizzo_pubblico(cfg)
+    for s in sezioni:
+        if s.get("plugin"):
+            s["plugin"]["base"] = base
+    return sezioni
 
 
 @api("/api/plugin/changelog")

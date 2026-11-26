@@ -1,6 +1,6 @@
 # Telegram e accesso da fuori casa
 
-Gli avvisi su Telegram e il tunnel Cloudflare per raggiungere il pannello da internet.
+Gli avvisi su Telegram e come raggiungere il pannello da internet.
 
 ## Telegram: gli avvisi
 
@@ -31,7 +31,7 @@ Tutte le anomalie compaiono sempre anche nel pannello (banner in alto); qui deci
 
 | Allarme | Scatta quando |
 |---|---|
-| Collegamenti e token | SmartThings o Netatmo non rispondono, token scaduto o in scadenza, pompa offline, errori dello script, tunnel Cloudflare che da internet non risponde per qualche minuto (si chiude da solo quando torna) |
+| Collegamenti e token | SmartThings o Netatmo non rispondono, token scaduto o in scadenza, pompa offline, errori dello script |
 | `nessun_dato` | nessun dato nuovo dalla pdc da 20 minuti |
 | `pdc_ferma_con_richiesta` | lo Smarther chiede calore da 60 minuti ma la pompa è ferma |
 | `casa_fredda` | meno di 17 °C in casa per 30 minuti |
@@ -61,31 +61,14 @@ Per spegnere un allarme: `"attivo": false`. Per spegnere intere famiglie, in `al
 
 ---
 
-## Accesso da fuori casa (Cloudflare)
+## Accesso da fuori casa (reverse proxy)
 
-Serve un **dominio che usa i DNS di Cloudflare** (anche gratuito). Non devi aprire porte sul router: il PC si collega a Cloudflare e Cloudflare porta qui chi visita il tuo indirizzo.
+Il pannello non crea tunnel: per usarlo da internet gli si mette davanti un **reverse proxy** con HTTPS (per esempio Caddy o nginx), di solito su un server. Cose da sistemare:
 
-Tutto da **Impostazioni → Accesso da internet**, con la procedura guidata:
+1. Avvia il pannello in ascolto solo sul computer: `--host 127.0.0.1` (o `generale.host`).
+2. In `config.json` → `generale.indirizzo_pubblico` scrivi l'indirizzo `https://...` da cui lo raggiungi: serve ai webhook Netatmo e agli indirizzi dei plugin.
+3. Il proxy **deve aggiungere `X-Forwarded-For`**: è dalle intestazioni di proxy che il pannello capisce che la richiesta viene da fuori. Un proxy che non ne aggiunge nessuna farebbe sembrare tutti «di casa», sbloccando le regolazioni della pompa.
 
-1. **Crea un token API su Cloudflare** (la guida è nella pagina): <https://dash.cloudflare.com/profile/api-tokens> → *Create Token* → *Create Custom Token*, nome a piacere, e tre permessi:
-   - **Account · Cloudflare Tunnel · Edit**
-   - **Zone · DNS · Edit**
-   - **Zone · Zone · Read**
+Di partenza il pannello chiede il suo utente e la sua password. **Facoltativo, login fatto dal proxy:** se il proxy ha un suo accesso (meglio se con codice a due fattori), scrivi in `accesso.chiave_proxy` una chiave segreta di almeno 32 caratteri e fai mandare al proxy l'intestazione `X-Pdc-Accesso` con quel valore, **solo dopo** aver controllato il visitatore. Il proxy deve sempre sovrascrivere o cancellare quella mandata dal visitatore, anche sui percorsi lasciati senza login: `/nt/*` (Netatmo), `/plugin/*` (Alexa, widget), `/icona.png`, `/favicon.png`, `/manifest.webmanifest`, `/avvio/*`. La chiave vale solo se la richiesta arriva dallo stesso computer del pannello.
 
-   In *Zone Resources* scegli *Include → Specific zone* e il tuo dominio. Copia il token.
-2. **Incollalo** e premi *Verifica*: il pannello trova i tuoi domini.
-3. **Scegli** dominio e sottodominio (per esempio `pdc` → `pdc.tuodominio.it`) e premi *Crea tunnel e collega*. Il pannello crea tunnel e record DNS, scarica `cloudflared` (controllando che il file corrisponda all'impronta SHA-256 pubblicata da GitHub: se non coincide lo scarta) e lo avvia.
-
-Il **token API non viene conservato**: lo usa e lo butta. In `config.json` resta solo il token del tunnel, che serve a far girare quel tunnel e nient'altro.
-
-Poi apri semplicemente `https://pdc.tuodominio.it` — **niente `:7000`** (la porta è solo un dettaglio interno). Chiede comunque utente e password.
-
-Cose da sapere:
-
-- L'indirizzo funziona **solo mentre il pannello è acceso** sul tuo PC.
-- Con l'interruttore *Avvia il tunnel insieme al pannello* parte da solo; se cade, il pannello lo riavvia, e dopo tre cadute di fila ti avvisa.
-- Se il tuo antivirus blocca `cloudflared.exe` (è il programma ufficiale Cloudflare, scaricato da GitHub), scaricalo a mano da <https://github.com/cloudflare/cloudflared/releases> e scrivi il percorso in `config.json` → `cloudflare` → `percorso_cloudflared`.
-- Se il tunnel non si collega perché la tua rete blocca il traffico UDP: in `config.json` → `cloudflare` → `protocollo` cambia `"auto"` in `"http2"`.
-- Se cambi la porta del pannello (`generale.porta`), rifai la procedura (*Rimuovi*, poi di nuovo).
-- Per smontare tutto: *Rimuovi* nella stessa pagina (se dai di nuovo un token cancella anche tunnel e DNS su Cloudflare, altrimenti li cancelli tu dal loro sito).
-- Il log del tunnel è in `log\cloudflared.log`.
+**«Da casa»** vuol dire: richiesta senza intestazioni di proxy, da un indirizzo privato o dallo stesso computer. Con il pannello su un server si ottiene con un **tunnel SSH** (poi serve la password del pannello). Da internet le regolazioni della pompa restano bloccate anche dopo il login.

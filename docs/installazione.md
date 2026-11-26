@@ -7,7 +7,7 @@ Tutto quello che serve per far partire il pannello: Python, primo avvio, prova c
 - Un PC (qui si parla di **Windows**) che resta acceso: il pannello raccoglie i dati solo finché gira.
 - **Python 3.10 o più recente**. Per controllare, apri PowerShell e scrivi `python --version`. Se non c'è, installalo da python.org **spuntando “Add python.exe to PATH”**.
 - Un account SmartThings con la pompa di calore dentro (si usa l'API di SmartThings, non c'è nessun accesso diretto alla pompa).
-- Facoltativi: l'app Netatmo (Smarther), un bot Telegram, un dominio su Cloudflare.
+- Facoltativi: l'app Netatmo (Smarther), un bot Telegram, un reverse proxy per usarlo da fuori.
 
 Nessuna libreria da installare: usa solo quello che c'è già in Python.
 

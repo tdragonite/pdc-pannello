@@ -7,7 +7,7 @@ Cosa fa:
   - legge a intervalli SmartThings (pompa) e Netatmo (Smarther) e salva tutto in SQLite (dati/pdc.db)
   - decodifica i dati "ehsCycleData" (mandata, ritorno, esterna, portata, Hz, pompa)
   - serve il pannello web (Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni, Changelog)
-  - avvisi Telegram, tunnel Cloudflare, plugin (Alexa, widget), backup e compattazione notturni
+  - avvisi Telegram, plugin (Alexa, widget), backup e compattazione notturni
   - configurazione in config.json (stesso file di pdc_strumenti.py)
 
 Solo libreria standard di Python (3.10 o piu' recente). Tutto vive nella cartella dello script.
@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.26.2"
+VERSIONE = "0.27.0"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -252,10 +252,11 @@ def iso_a_epoch(s):
 # ==========================================================================
 
 TEMPLATE = {
-    "_nota": "File di configurazione: modificalo con il Blocco note e salva; la maggior parte delle "
+    "_nota": "File di configurazione: modificalo con un editor di testo e salva; la maggior parte delle "
              "modifiche vale subito, senza riavviare. Non condividerlo mai (contiene password e token).",
     "generale": {
         "porta": 7000,
+        "indirizzo_pubblico": "",      # es. https://pdc.esempio.it: dove il pannello si raggiunge da internet (dietro un reverse proxy)
         "host": "0.0.0.0",
         "porta_lock": 7099,
         "intervallo_pdc_secondi": 60,
@@ -291,6 +292,7 @@ TEMPLATE = {
         "_nota": "Scrivi utente e password in chiaro qui, al prossimo avvio vengono trasformati in un hash "
                  "e la password in chiaro viene cancellata. Oppure: python pdc_pannello.py imposta-password",
         "utente": "", "password": "", "password_hash": "",
+        "chiave_proxy": "",      # facoltativa (almeno 32 caratteri): login gia' fatto dal reverse proxy, vedi accesso_dal_proxy()
     },
     "smartthings": {
         "device_id": "",
@@ -308,13 +310,12 @@ TEMPLATE = {
                 "expires_at": 0, "home_id": "", "room_id": "",
                 "webhook_attivo": True, "webhook_segreto": ""},
     "dispositivi": {
-        "_nota": "Facoltativo. Gli IP servono solo per mostrare l'IP e ricavare il MAC nella pagina Dispositivi. "
+        "_nota": "Facoltativo. IP e MAC si scrivono a mano e servono solo per mostrarli nella pagina Dispositivi. "
                  "I loghi si mettono nella cartella 'dati/loghi' (smarther.svg, samsung.svg, ...).",
-        "ip_pdc": "", "ip_smarther": "", "modello_smarther": "", "loghi_bianchi": False,
+        "ip_pdc": "", "ip_smarther": "", "mac_pdc": "", "mac_smarther": "", "modello_smarther": "", "loghi_bianchi": False,
     },
     "telegram": {},        # riempito sotto da TELEGRAM_DEFAULT (parte Telegram)
     "allarmi": {},         # idem da ALLARMI_DEFAULT
-    "cloudflare": {},      # idem da CLOUDFLARE_DEFAULT
     "plugin": {},          # una sottosezione per plugin (cartella plugin): {"nome": {"attivo": false, ...}}
     "mappa_ciclo": MAPPA_CICLO_DEFAULT,
 }
@@ -324,7 +325,12 @@ def aggiungi_default_pezzi():
     """I valori predefiniti di Telegram e allarmi sono definiti nella loro parte del file."""
     TEMPLATE["telegram"] = copy.deepcopy(TELEGRAM_DEFAULT)
     TEMPLATE["allarmi"] = copy.deepcopy(ALLARMI_DEFAULT)
-    TEMPLATE["cloudflare"] = copy.deepcopy(CLOUDFLARE_DEFAULT)
+
+
+def indirizzo_pubblico(cfg):
+    """L'indirizzo da internet scritto in config.json (generale.indirizzo_pubblico), senza barra finale; '' se manca o non e' https."""
+    u = str((cfg.get("generale") or {}).get("indirizzo_pubblico") or "").strip().rstrip("/")
+    return u if u.startswith("https://") else ""
 
 
 def unisci(base, extra):
@@ -1225,8 +1231,8 @@ WH_ATTESA_CONFERMA = 15        # secondi: dopo due eventi di setpoint non ordina
 
 
 class WebhookNT(threading.Thread):
-    """Webhook Netatmo: registra il nostro indirizzo (quello del tunnel Cloudflare) e controlla ogni minuto che ci resti.
-    Se qualcosa non va (tunnel spento, registrazione persa, dati che non tornano) il pannello fa come prima: legge lo Smarther
+    """Webhook Netatmo: registra il nostro indirizzo pubblico e controlla ogni due minuti che ci resti.
+    Se qualcosa non va (indirizzo mancante, registrazione persa, dati che non tornano) il pannello fa come prima: legge lo Smarther
     a intervalli. Il silenzio di Netatmo NON e' un problema (gli eventi arrivano solo quando qualcosa cambia): a controllare i dati
     resta sempre la lettura vera ogni 15 minuti."""
 
@@ -1324,12 +1330,9 @@ class WebhookNT(threading.Thread):
         n = self._cfg()
         if not n.get("webhook_attivo", True):
             return self._fuori("spenti nelle impostazioni")
-        tun = tunnel(self.app).stato()
-        if not tun["configurato"]:
-            return self._fuori("tunnel Cloudflare non configurato")
-        if not tun["collegato"]:
-            return self._fuori("tunnel Cloudflare non collegato")
-        base = tun["indirizzo"]
+        base = indirizzo_pubblico(self.app.cfg.leggi())
+        if not base:
+            return self._fuori("manca generale.indirizzo_pubblico (https://...) in config.json")
         url = f"{base}/nt/{self.segreto()}"
         testo = json.dumps(self._api("GET"))
         if url not in testo:
@@ -1849,7 +1852,6 @@ main{min-width:0;padding:22px 26px 40px}
 
 /* ---------- impostazioni ---------- */
 #imp .card{margin-bottom:14px}
-.sez-t{margin:22px 2px 10px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
 .nota-sez,.fsv-edit small{text-wrap:pretty}
 .nota-sez{color:var(--mut);font-size:13px;margin:6px 0 4px}
 .campo input[type=text],.campo input[type=password],.campo input[type=time],.campo select,.campo textarea{width:100%;font:inherit;font-size:16px;background:var(--bg2);
@@ -1891,12 +1893,6 @@ button:disabled{opacity:.5;cursor:default}
   padding:11px 16px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:30;max-width:90vw;box-shadow:0 8px 30px rgba(0,0,0,.6)}
 #toast.on{opacity:1;transform:translate(-50%,0)}#toast.bad{border-color:var(--bad)}
 
-details.guida{margin:12px 0;background:var(--bg2);border:1px solid var(--linea);border-radius:12px;padding:10px 14px}
-details.guida summary{cursor:pointer;font-weight:650}
-details.guida ol{margin:10px 0 4px;padding-left:20px;display:grid;gap:8px;color:var(--mut);font-size:14px}
-details.guida b{color:var(--txt)}
-ul.passi{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px;font-size:14px}
-ul.passi li.ok{color:var(--ok)}ul.passi li.bad{color:var(--bad)}
 a{color:var(--acs)}
 
 /* ---------- curva ---------- */
@@ -2089,8 +2085,6 @@ details.riq .campi>.campo:first-child{padding-top:8px}
 details.riq .campi>.campo:last-child{padding-bottom:0}
 details.riq[open]{padding-bottom:7px}
 details.riq .riq-c>.nota-sez:first-child,details.riq .riq-c>h2:first-child+.nota-sez{margin-top:14px}
-#cf h2{display:none}
-#cf .ch{justify-content:flex-end}
 .lista-allarmi{display:grid;gap:8px}
 .lista-allarmi .allarme{position:relative;background:var(--bg2);border:1px solid var(--linea);border-radius:12px;padding:12px 36px 12px 14px}
 
@@ -3150,7 +3144,6 @@ function vistaImp() {
   $('#imp').hidden = reg; $('#reg').hidden = !reg;
   document.querySelectorAll('#imp .imp-tab').forEach(g => { g.hidden = g.dataset.t !== (cur || 'stato'); });
   if (reg) caricaRegistro();
-  else if (cur === 'accesso') cfCarica(false);      // appena apri la scheda, senza aspettare il giro dei 5 secondi
 }
 async function caricaRegistro() {
   const box = $('#reg'); if (!box) return;
@@ -3344,13 +3337,23 @@ window.addEventListener('scroll', chiudiPannelli, {passive: true});
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
-  ['webhook', 'Smarther in tempo reale', 'Con il tunnel attivo, Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
+  ['webhook', 'Smarther in tempo reale', 'Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
   ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
-  ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo da casa, con lucchetto e conferma.'],
+  ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo dal tunnel SSH, con lucchetto e conferma.'],
   ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
 ];
 const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
+  {v: '0.27.0', quando: '26 novembre 2026', titolo: 'Versione per il server', righe: [
+    ['m', 'Niente più tunnel Cloudflare', 'Il pannello gira su un server dietro un reverse proxy: tolti la procedura guidata, i comandi del tunnel e il programma cloudflared.'],
+    ['m', 'IP e MAC scritti a mano', 'Il server non è nella rete di casa: il MAC non si cerca più, si scrive in Impostazioni → Dispositivi accanto all’IP.'],
+    ['n', 'Login del reverse proxy', 'Se il proxy ha già controllato il tuo accesso (riga «chiave_proxy» di config.json), il pannello non ti richiede la sua password; i comandi di casa restano chiusi.'],
+    ['m', 'Indirizzo pubblico', 'Webhook Netatmo e indirizzi dei plugin usano la riga «indirizzo_pubblico» di config.json (sezione generale).'],
+    ['m', 'Testi per il server', 'Gli avvisi dicono «tunnel SSH» invece di «rete di casa», e per il riavvio indicano RunWisp.'],
+    ['s', 'Spegnimento pulito su Linux', 'Quando il sistema ferma il pannello (Stop), si chiude come con Ctrl+C: ferma raccolta e plugin e lo scrive nel registro.'],
+    ['s', 'Indirizzi dei plugin', 'In Integrazioni, dopo qualche secondo, gli indirizzi non diventano più quelli del browser (per esempio «localhost»): resta quello pubblico.'],
+    ['s', 'File per le analisi', 'Il file del comando «analisi» non contiene più il numero di serie della pompa né gli identificativi Netatmo di casa e stanza.'],
+  ]},
   {v: '0.26.2', quando: '26 novembre 2026', titolo: 'Aggiornamenti senza aprire la pagina', righe: [
     ['m', 'Aggiornamento a caldo da script', 'Su Linux lo script che pubblica i file nuovi può chiedere al pannello di applicarli a caldo e ricaricare i plugin, senza login e senza aprire la pagina; l’esito finisce nel registro. Su Windows non cambia niente.'],
   ]},
@@ -3946,7 +3949,7 @@ document.addEventListener('toggle', e => {
 }, true);
 // ---- impostazioni installatore: lettura, cronologia e modifica (lucchetto di 30 s, poi matita, poi conferma) ----
 // la matita ✎ sulla riga: attiva solo con le modifiche sbloccate e da casa
-const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo da casa' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
+const bottoneMatita = (attr, sbl, occ, aria, titolo) => `<button type="button" class="matita" ${attr} ${sbl && !occ && !S.fuori ? '' : 'disabled'} aria-label="${aria}" title="${S.fuori ? 'Solo dal tunnel SSH' : sbl ? titolo : 'Prima sblocca le modifiche'}">✎</button>`;
 S.sbloccoFsv = S.sbloccoFsv || 0; S.fsvMod = S.fsvMod || null; S.fsvVal = S.fsvVal || ''; S.fsvErr = S.fsvErr || ''; S.fsvOcc = false;
 // chiude gli editor aperti nella scheda Regolazioni (FSV, regolazione, boost): se ne tiene aperto uno alla volta
 function chiudiEditor() { S.fsvMod = null; S.fsvErr = ''; S.regMod = null; S.regErr = ''; S.boostApri = false; S.boostErr = ''; }
@@ -4088,7 +4091,7 @@ function cardRegolazioni(d) {
   const lock = S.fuori ? '' : `<span class="ch-b"><button type="button" class="sec piccolo ${sbl ? 'sbloccato' : ''}" id="b-lock-fsv">${sbl ? 'Modifiche sbloccate · Blocca' : 'Sblocca modifiche'}</button></span>`;
   const testo = S.fuori ? 'Qui sotto i valori attuali della pompa.'
     : 'Per cambiare un valore (qui sotto o negli FSV): «Sblocca modifiche» (restano sbloccate 30 secondi dall’ultima azione), la matita ✎, il nuovo valore e la conferma. La pompa deve poi comunicare il valore nuovo: SmartThings può metterci un po’, e finché non lo fa la riga dice «in attesa».';
-  const avviso = S.fuori ? '<div class="avviso warn"><span>⚠️</span><div>Sei collegato da fuori casa: le modifiche (FSV, acqua calda, Boost, modo della pompa) si fanno solo dalla rete di casa.</div></div>' : '';
+  const avviso = S.fuori ? '<div class="avviso warn"><span>⚠️</span><div>Sei collegato da internet: le modifiche (FSV, acqua calda, Boost, modo della pompa) si fanno solo aprendo il pannello dal tunnel SSH.</div></div>' : '';
   return `<article class="card dev"><div class="ch"><h2>Regolazioni</h2>${lock}</div>
     <p class="nota-sez">${testo}</p></article>${avviso}
     <article class="card dev"><div class="ch"><h2>Acqua calda</h2></div>${rigaReg(g.acs_setpoint)}${rigaReg(g.acs_modo)}${rigaBoost(d.boost)}</article>
@@ -4241,9 +4244,9 @@ function mostraCampo(el) {
   const g = el.closest('.imp-tab'); if (g && g.hidden) location.hash = '#/impostazioni' + (g.dataset.t === 'stato' ? '' : '/' + g.dataset.t);
 }
 // Mette i riquadri di ogni scheda in due colonne indipendenti, a turno da sinistra e nell'ordine di partenza: aprire o chiudere un riquadro
-// normale non sposta mai gli altri. I riquadri "larghi" (testi, avvisi, Cloudflare) stanno in colonna da chiusi; da aperti passano a tutta riga.
+// normale non sposta mai gli altri. I riquadri "larghi" (testi, avvisi) stanno in colonna da chiusi; da aperti passano a tutta riga.
 // Su telefono è una colonna sola, nell'ordine di prima.
-function riquadroLargo(f) { return !!(f.querySelector('textarea') || f.dataset.id === 'allarmi' || f.id === 'cf-d'); }
+function riquadroLargo(f) { return !!(f.querySelector('textarea') || f.dataset.id === 'allarmi'); }
 function disponiColonne() {
   document.querySelectorAll('#imp .imp-tab:not([data-t=stato])').forEach(tab => {
     tab.querySelectorAll(':scope > details.riq, :scope .imp-col > details.riq').forEach((f, n) => { if (f.dataset.ix === undefined) f.dataset.ix = n; });
@@ -4273,7 +4276,7 @@ document.addEventListener('toggle', e => { const t = e.target; if (t.classList &
 // ---------- Impostazioni > Integrazioni (plugin) ----------
 const PLG_STATO = {attivo: ['si', 'attivo'], spento: ['no', 'spento'], errore: ['bad', 'errore']};
 function pluginRighe(p) {
-  const base = p.base || location.origin;      // l'indirizzo da fuori casa, se il tunnel c'è
+  const base = p.base || location.origin;      // l'indirizzo pubblico, se è scritto in config.json
   const rotte = p.rotte.map(r => `<span class="cv"><span class="val-c">${esc(base + r)}</span><button type="button" class="copia" data-copia="${esc(base + r)}" aria-label="Copia l'indirizzo">Copia</button></span>`).join('<br>');
   return [
     p.messaggio ? riga('Stato', esc(p.messaggio)) : '',
@@ -4337,7 +4340,6 @@ function disegnaImpostazioni(d) {
       <div class="campo lg"><label for="p-at">Password attuale</label><input id="p-at" type="password" autocomplete="current-password"></div>
       <div class="campo lg"><label for="p-nu">Nuova password (almeno 10 caratteri)</label><input id="p-nu" type="password" autocomplete="new-password"></div></div>
       <div class="azioni"><button type="button" class="sec" id="b-pw">Cambia password</button><small class="msg" id="pw-msg"></small></div>`;
-  const m = impAperti(), cfAp = 'cf' in m ? m.cf : false;
   box.innerHTML = `
     <div class="imp-tab" data-t="stato">
       <article class="card" id="agg"><div class="ch"><h2>Aggiornamento</h2><button type="button" class="sec piccolo" id="agg-ricontrolla">Controlla</button></div><div id="agg-corpo" class="agg-corpo">Controllo…</div></article>
@@ -4348,8 +4350,7 @@ function disegnaImpostazioni(d) {
       ${riquadro('allarmi', 'Quando avvisarti', `<p class="nota-sez">Tocca un avviso per cambiarne le soglie o spegnerlo.</p><div class="lista-allarmi">${all}</div>`, false)}</div>
     <div class="imp-tab" data-t="integrazioni" hidden>${pluginTab(d)}</div>
     <div class="imp-tab" data-t="accesso" hidden>
-      ${riquadro('password', 'Password del pannello', pw, true)}
-      <details class="card imp riq" data-id="cf" id="cf-d" ${cfAp ? 'open' : ''}><summary><h2>Accesso da internet (Cloudflare)</h2></summary><div class="riq-c" id="cf"><div class="vuoto" style="padding:14px 0">Controllo l'accesso da internet…</div></div></details></div>
+      ${riquadro('password', 'Password del pannello', pw, true)}</div>
     <div class="imp-tab" data-t="dati" hidden>${sez('dati')}
       ${riquadro('reset', 'Azzera il database', `<p class="nota-sez">Cancella <b>tutti i dati raccolti</b> (storico, grafici, anomalie) e riparte da zero. Restano le impostazioni, la password e i collegamenti.<br>Prima di cancellare il pannello fa una <b>copia di sicurezza</b> nella cartella dei backup (<code>prima-del-reset-…db</code>); se la copia non riesce, non cancella niente. Si rimette con <code>python pdc_pannello.py ripristina</code>.</p>
         <div class="azioni"><button type="button" class="sec pericolo" id="rst-apri">Azzera il database…</button></div>
@@ -4362,9 +4363,6 @@ function disegnaImpostazioni(d) {
   disponiColonne();
   vistaImp();
   aggCarica();
-  cfCarica(true);
-  clearInterval(S.cfTimer);      // lo stato del tunnel si rilegge ogni 5 s, ma solo mentre guardi la scheda Accesso
-  S.cfTimer = setInterval(() => { if (S.pagina !== 'impostazioni') clearInterval(S.cfTimer); else if (S.sub === 'accesso' && !document.hidden) cfCarica(false); }, 5000);
 }
 
 function segnaModifica(e) {
@@ -4377,13 +4375,19 @@ function toast(t, cattivo) {
   let el = $('#toast'); if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
   el.textContent = t; el.className = 'on' + (cattivo ? ' bad' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => el.className = '', cattivo ? 12000 : 4200);
 }
+function loginProxyScaduto(r) {   // login del reverse proxy scaduto: la richiesta finisce sulle sue pagine /auth -> ricarico
+  if (!r.redirected || !new URL(r.url).pathname.startsWith('/auth')) return false;
+  location.reload(); return true;
+}
 async function leggiJson(url) {         // GET con sessione; se e' scaduta torna al login e ridà null
   const r = await fetch(url, {credentials: 'same-origin', cache: 'no-store'});
+  if (loginProxyScaduto(r)) return null;
   if (r.status === 401) { location.href = '/login'; return null; }
   return r;
 }
 async function inviaPost(url, corpo) {
   const r = await fetch(url, {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json', 'X-Pdc': '1'}, body: JSON.stringify(corpo)});
+  if (loginProxyScaduto(r)) return {};
   if (r.status === 401) { location.href = '/login'; return {}; }
   return r.json();
 }
@@ -4396,7 +4400,7 @@ async function aggCarica() {
     box.innerHTML = a.stato === 'applicabile'
       ? `<p class="agg-ok"><b>È pronta la versione ${esc(a.versione_disco)}</b> (cambiato: ${cosa}).<br>Si applica subito, <b>senza fermare la raccolta dei dati</b>.</p><div class="azioni"><button type="button" id="agg-applica">Applica aggiornamento</button></div>`
       : a.stato === 'riavvio'
-        ? `<p class="agg-riavvio"><b>Per la versione ${esc(a.versione_disco)} serve il riavvio completo</b>${cosa ? ' (cambiato: ' + cosa + ')' : ''}.<br>La raccolta dei dati continua finché non chiudi e rilanci il programma Python.${a.messaggio ? '<br>' + esc(a.messaggio) : ''}</p>`
+        ? `<p class="agg-riavvio"><b>Per la versione ${esc(a.versione_disco)} serve il riavvio completo</b>${cosa ? ' (cambiato: ' + cosa + ')' : ''}.<br>La raccolta dei dati continua finché non riavvii il pannello (da RunWisp: Stop, poi Start).${a.messaggio ? '<br>' + esc(a.messaggio) : ''}</p>`
         : a.stato === 'errore' ? `<p class="agg-riavvio">${esc(a.messaggio || 'Non riesco a controllare.')}</p>`
         : `<p class="agg-ok">Il pannello è aggiornato (versione ${esc(a.versione)}). Quando sostituisci il file, qui compare cosa è cambiato e se si può applicare a caldo.</p>`;
   } catch { box.textContent = 'Non riesco a controllare gli aggiornamenti.'; }
@@ -4453,122 +4457,6 @@ async function azioniImpostazioni(e) {
     if (r.ok) { $('#p-at').value = ''; $('#p-nu').value = ''; }
   }
 }
-
-// ---------- Accesso da internet (Cloudflare) ----------
-const CFS = {zone: null, token: '', passi: null, occupato: false};
-async function cfLeggi() { const r = await leggiJson('/api/cloudflare'); return r && r.json(); }
-async function cfCarica(forza) {
-  const el = $('#cf'); if (!el || S.pagina !== 'impostazioni') return;
-  let st; try { st = await cfLeggi(); } catch { return; }
-  if (!st) return;
-  if (!st.configurato) { if (forza || !el.dataset.wiz) { el.dataset.wiz = '1'; el.innerHTML = cfWizard(st); } return; }
-  el.dataset.wiz = '';
-  if (CFS.occupato && !forza) return;
-  if (el.dataset.rimuovi === '1' && !forza) { const s = $('#cf-stato'); if (s) s.innerHTML = cfStatoHtml(st); return; }
-  el.innerHTML = cfGestione(st);
-}
-function cfWizard(st) {
-  return `<h2>Accesso da internet (Cloudflare)</h2>
-  <p class="nota-sez">Così apri il pannello anche fuori casa, all'indirizzo che scegli tu (es. <b>https://pdc.tuodominio.it</b>), sempre con utente e password. Non devi aprire porte sul router. Serve un dominio che usa i DNS di Cloudflare.</p>
-  ${st.demo ? '<p class="msg bad">In modalità demo la procedura non è disponibile.</p>' : ''}
-  <details class="guida"><summary>1 · Come creo il token di Cloudflare (2 minuti)</summary><ol>
-    <li>Apri <b>dash.cloudflare.com/profile/api-tokens</b> e premi <b>Create Token</b>, poi <b>Create Custom Token</b> (“Get started”).</li>
-    <li>Dagli un nome, per esempio <i>pannello PdC</i>.</li>
-    <li>In <b>Permissions</b> aggiungi tre righe:<br>• <b>Account</b> · <b>Cloudflare Tunnel</b> · <b>Edit</b><br>• <b>Zone</b> · <b>DNS</b> · <b>Edit</b><br>• <b>Zone</b> · <b>Zone</b> · <b>Read</b></li>
-    <li>In <b>Account Resources</b> scegli il tuo account; in <b>Zone Resources</b> scegli <b>Include → Specific zone</b> e il tuo dominio.</li>
-    <li>Premi <b>Continue to summary</b>, poi <b>Create Token</b> e <b>copia il token</b> (si vede una volta sola).</li></ol>
-    <p class="nota-sez">Il token serve solo adesso: il pannello <b>non lo conserva</b>. Dopo puoi anche cancellarlo dal sito di Cloudflare.</p></details>
-  <div class="campi" style="grid-template-columns:1fr">
-    <div class="campo lg"><label for="cf-tok">2 · Incolla qui il token</label><input id="cf-tok" type="password" autocomplete="off" placeholder="il token di Cloudflare"></div></div>
-  <div class="azioni"><button type="button" id="cf-verifica" ${st.demo ? 'disabled' : ''}>Verifica e cerca i miei domini</button><small class="msg" id="cf-msg"></small></div>
-  <div id="cf-passo2"></div>`;
-}
-function cfPasso2(zone) {
-  const opz = zone.map((z, i) => `<option value="${i}">${esc(z.nome)}</option>`).join('');
-  return `<h3 class="sez-t" style="margin-top:20px">3 · Scegli l'indirizzo</h3>
-  <div class="campi">
-    <div class="campo lg"><label for="cf-zona">Dominio</label><select id="cf-zona">${opz}</select></div>
-    <div class="campo lg"><label for="cf-sub">Sottodominio</label><input id="cf-sub" type="text" value="pdc" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
-    <div class="campo lg"><label for="cf-nome">Nome del tunnel (solo per riconoscerlo su Cloudflare)</label><input id="cf-nome" type="text" value="pannello-pdc" spellcheck="false"></div></div>
-  <p class="nota-sez" id="cf-anteprima"></p>
-  <div class="azioni"><button type="button" id="cf-crea">Crea tunnel e collega</button><small class="msg" id="cf-msg2"></small></div>
-  <ul class="passi" id="cf-passi"></ul>`;
-}
-function cfAnteprima() { const z = CFS.zone && CFS.zone[+$('#cf-zona').value]; const e = $('#cf-anteprima'); if (e && z) e.innerHTML = 'Il pannello sarà raggiungibile su <b>https://' + esc(($('#cf-sub').value || '…').toLowerCase()) + '.' + esc(z.nome) + '</b>'; }
-function cfStatoHtml(st) {
-  const p = (c, t) => `<span class="pill ${c}">${t}</span>`;
-  return [
-    riga('Indirizzo', `<a href="${esc(st.indirizzo)}" target="_blank" rel="noopener">${esc(st.hostname)}</a>`),
-    riga('Programma cloudflared', st.programma ? p('si', 'presente') : p('bad', 'manca')),
-    riga('Tunnel', st.collegato ? p('si', 'collegato a Cloudflare') : st.in_esecuzione ? p('no', 'in avvio…') : p('off', 'spento')),
-  ].join('') + (st.problema ? `<p class="msg bad" style="margin:8px 0 0">${esc(st.problema)}</p>` : '') +
-    (st.porta_diversa ? `<p class="msg bad" style="margin:8px 0 0">Il tunnel punta alla porta ${st.porta_servizio}, ma il pannello ora usa un'altra porta: rifai la procedura (Rimuovi, poi di nuovo).</p>` : '');
-}
-function cfGestione(st) {
-  return `<div class="ch"><h2>Accesso da internet (Cloudflare)</h2><button type="button" class="sec piccolo" id="cf-agg">Aggiorna</button></div>
-  <div class="righe" id="cf-stato">${cfStatoHtml(st)}</div>
-  <div class="azioni">
-    ${st.in_esecuzione ? '<button type="button" class="sec" id="cf-ferma">Ferma</button><button type="button" class="sec" id="cf-riavvia">Riavvia</button>' : `<button type="button" id="cf-avvia" ${st.programma ? '' : 'disabled'}>Avvia tunnel</button>`}
-    <button type="button" class="sec" id="cf-telegram">Invia il link su Telegram</button>
-    <button type="button" class="sec" id="cf-scarica">${st.programma ? 'Aggiorna cloudflared' : 'Scarica cloudflared'}</button></div>
-  <div class="campo riga-sw" style="margin-top:14px"><label for="cf-auto">Avvia il tunnel insieme al pannello</label><label class="sw"><input type="checkbox" id="cf-auto" ${st.avvio_automatico ? 'checked' : ''}><span></span></label></div>
-  <details class="guida" style="margin-top:12px" id="cf-rim"><summary>Rimuovi l'accesso da internet…</summary>
-    <p class="nota-sez">Ferma il tunnel e lo toglie dal pannello. Per cancellare anche tunnel e DNS su Cloudflare incolla un token con gli stessi permessi (altrimenti dovrai cancellarli tu dal loro sito).</p>
-    <div class="campo lg"><label for="cf-rtok">Token Cloudflare (facoltativo)</label><input id="cf-rtok" type="password" autocomplete="off"></div>
-    <div class="azioni"><button type="button" class="sec" id="cf-rimuovi" style="color:var(--bad)">Rimuovi</button><small class="msg" id="cf-rmsg"></small></div></details>
-  <p class="nota-sez">Il tunnel è protetto dal tuo login. Se cambi la porta del pannello, rifai la procedura.</p>`;
-}
-async function cfAzione(e) {
-  const id = e.target.id;
-  if (id === 'cf-agg') { toast('Stato aggiornato'); return cfCarica(true); }
-  if (id === 'cf-verifica') {
-    e.target.disabled = true; $('#cf-msg').textContent = 'Controllo…'; $('#cf-msg').className = 'msg';
-    CFS.token = $('#cf-tok').value.trim();
-    try { const r = await inviaPost('/api/cloudflare/verifica', {token: CFS.token});
-      if (r.ok) { CFS.zone = r.zone; $('#cf-msg').textContent = 'Token valido: ' + r.zone.length + ' dominio/i trovato/i.'; $('#cf-msg').className = 'msg ok'; $('#cf-passo2').innerHTML = cfPasso2(r.zone); cfAnteprima(); }
-      else { $('#cf-msg').textContent = r.messaggio; $('#cf-msg').className = 'msg bad'; }
-    } catch { $('#cf-msg').textContent = 'Server non raggiungibile'; $('#cf-msg').className = 'msg bad'; }
-    e.target.disabled = false;
-  } else if (id === 'cf-crea') {
-    const z = CFS.zone[+$('#cf-zona').value]; e.target.disabled = true; CFS.occupato = true;
-    const ul = $('#cf-passi'), m = $('#cf-msg2'); m.textContent = 'Lavoro su Cloudflare…'; m.className = 'msg'; ul.innerHTML = '';
-    const mostra = ps => ul.innerHTML = ps.map(p => `<li class="${p.ok ? 'ok' : 'bad'}">${p.ok ? '✓' : '✗'} ${esc(p.t)}</li>`).join('');
-    try {
-      const r = await inviaPost('/api/cloudflare/crea', {token: CFS.token, zone_id: z.id, sottodominio: $('#cf-sub').value, nome_tunnel: $('#cf-nome').value});
-      mostra(r.passi || []);
-      if (!r.ok) { m.textContent = r.messaggio || 'Non riuscito'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; return; }
-      CFS.token = ''; $('#cf-tok').value = '';
-      const st = await cfLeggi();
-      if (!st.programma) { m.textContent = 'Scarico cloudflared (circa 30 MB)…'; const d = await inviaPost('/api/cloudflare/scarica', {});
-        if (!d.ok) { m.textContent = ''; ul.insertAdjacentHTML('beforeend', `<li class="bad">✗ ${esc(d.messaggio)}</li>`); CFS.occupato = false; toast('Tunnel creato, ma manca cloudflared', true); return cfCarica(true); }
-        ul.insertAdjacentHTML('beforeend', `<li class="ok">✓ cloudflared scaricato (${esc(d.versione)})</li>`); }
-      const a = await inviaPost('/api/cloudflare/avvia', {});
-      ul.insertAdjacentHTML('beforeend', a.ok ? '<li class="ok">✓ Tunnel avviato</li>' : `<li class="bad">✗ ${esc(a.messaggio)}</li>`);
-      CFS.occupato = false; toast(a.ok ? 'Fatto! Tra qualche secondo l\'indirizzo risponde.' : 'Tunnel creato', !a.ok);
-      setTimeout(() => cfCarica(true), 1500);
-    } catch { m.textContent = 'Server non raggiungibile'; m.className = 'msg bad'; e.target.disabled = false; CFS.occupato = false; }
-  } else if (id === 'cf-avvia' || id === 'cf-ferma' || id === 'cf-riavvia') {
-    e.target.disabled = true; CFS.occupato = true;
-    const r = await inviaPost('/api/cloudflare/' + id.slice(3), {}); CFS.occupato = false;
-    toast(r.ok ? 'Fatto' : (r.messaggio || 'Non riuscito'), !r.ok); setTimeout(() => cfCarica(true), 800);
-  } else if (id === 'cf-telegram') {
-    e.target.disabled = true; const r = await inviaPost('/api/cloudflare/telegram', {});
-    toast(r.messaggio || (r.ok ? 'Inviato' : 'Non riuscito'), !r.ok); e.target.disabled = false;
-  } else if (id === 'cf-scarica') {
-    e.target.disabled = true; CFS.occupato = true; toast('Scarico cloudflared…'); const r = await inviaPost('/api/cloudflare/scarica', {}); CFS.occupato = false;
-    toast(r.ok ? 'Scaricato: ' + r.versione : r.messaggio, !r.ok); cfCarica(true);
-  } else if (id === 'cf-rimuovi') {
-    if (!confirm('Rimuovere l\'accesso da internet?')) return;
-    e.target.disabled = true; const r = await inviaPost('/api/cloudflare/rimuovi', {token: $('#cf-rtok').value.trim()});
-    toast(r.avviso || 'Rimosso', !!r.avviso); if (r.avviso) alert(r.avviso); const el = $('#cf'); if (el) el.dataset.rimuovi = ''; cfCarica(true);
-  }
-}
-document.addEventListener('change', async e => {
-  if (e.target.id === 'cf-zona' || e.target.id === 'cf-sub') cfAnteprima();
-  if (e.target.id === 'cf-auto') { const r = await inviaPost('/api/cloudflare/opzioni', {avvio_automatico: e.target.checked}); toast(r.ok ? 'Salvato' : r.messaggio, !r.ok); }
-});
-document.addEventListener('input', e => { if (e.target.id === 'cf-sub') cfAnteprima(); if (e.target.id === 'cf-rtok') { const el = $('#cf'); if (el) el.dataset.rimuovi = '1'; } });
-document.addEventListener('toggle', e => { if (e.target.id === 'cf-rim') { const el = $('#cf'); if (el) el.dataset.rimuovi = e.target.open ? '1' : ''; } }, true);
 
 // ---------- dati e tempo reale ----------
 function finestra() {
@@ -4686,8 +4574,8 @@ function avvia() {
   document.addEventListener('pointerleave', togliCursore);
   document.addEventListener('input', segnaModifica); document.addEventListener('change', segnaModifica);
   document.addEventListener('click', e => { if (e.target.closest && e.target.closest('#imp') && e.target.tagName === 'BUTTON') {
-    Promise.resolve(e.target.id.startsWith('cf-') ? cfAzione(e) : azioniImpostazioni(e))
-      .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; CFS.occupato = false; }); } });
+    Promise.resolve(azioniImpostazioni(e))
+      .catch(() => { toast('Server non raggiungibile', true); e.target.disabled = false; }); } });
   let rid = null;
   window.addEventListener('resize', () => { clearTimeout(rid); rid = setTimeout(() => { if (S.dati && S.pagina !== 'dashboard') { const b = $('#grafici') || $('#eff'); if (b) b.dataset.f = ''; disegna(); } }, 250); });
   document.addEventListener('pointerdown', e => { spostaGiu(e); zoomaGiu(e); if (dita.size > 1) return; if (!tooltipSotto(e)) muoviCursore(e); });
@@ -5183,7 +5071,7 @@ def finestra(q, ora):
     try:
         a = int(float(q.get("a", [ora])[0]))
         da = int(float(q.get("da", [a - 86400])[0]))
-    except ValueError:
+    except (ValueError, OverflowError):
         a, da = ora, ora - 86400
     a = min(a, ora)
     da = max(da, a - 90 * 86400)
@@ -7114,16 +7002,18 @@ CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dat
 
 def ip_client(h):
     ip = h.client_address[0]
-    if ip in ("127.0.0.1", "::1"):  # dietro cloudflared: l'indirizzo vero sta nell'intestazione
+    if ip in ("127.0.0.1", "::1"):  # dietro il reverse proxy (con Cloudflare davanti): l'indirizzo vero sta nell'intestazione
         return h.headers.get("CF-Connecting-IP") or ip
     return ip
 
 
 def da_casa(h):
-    """True solo se la richiesta arriva dalla rete di casa: niente intestazioni del tunnel Cloudflare (le mette sempre
-    lui) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno.
+    """True solo se la richiesta arriva «da casa» (qui: dal tunnel SSH): niente intestazioni di un proxy (le mettono
+    sempre Caddy e Cloudflare) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno.
     Ne esiste una copia in plugin_esempio/analisi.py (_da_casa): un plugin non vede le funzioni del pannello. Se cambi una, cambia anche l'altra."""
-    if any(h.headers.get(x) for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "Cf-Visitor")):
+    # conta la PRESENZA dell'intestazione, anche vuota: un proxy puo' mandarne una senza valore
+    if any(h.headers.get(x) is not None for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "X-Forwarded-Host",
+                                                   "X-Forwarded-Proto", "Cf-Visitor", INTESTAZIONE_PROXY)):
         return False
     try:
         ip = ipaddress.ip_address(h.client_address[0].split("%")[0])
@@ -7132,6 +7022,25 @@ def da_casa(h):
     except ValueError:
         return False
     return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+INTESTAZIONE_PROXY = "X-Pdc-Accesso"
+
+
+def accesso_dal_proxy(h):
+    """True se il reverse proxy dice che il visitatore ha gia' fatto il suo login: serve l'intestazione X-Pdc-Accesso uguale
+    ad accesso.chiave_proxy di config.json (almeno 32 caratteri; vuota = funzione spenta) e la richiesta deve arrivare da
+    questa stessa macchina. Il proxy DEVE sovrascrivere o cancellare sempre l'intestazione mandata dal visitatore.
+    Vale solo come login: da_casa() resta falso (il proxy aggiunge X-Forwarded-For), quindi i comandi di casa restano chiusi."""
+    chiave = str(h.server.app.cfg.leggi()["accesso"].get("chiave_proxy") or "")
+    if len(chiave) < 32:
+        return False
+    try:
+        if not ipaddress.ip_address(h.client_address[0].split("%")[0]).is_loopback:
+            return False
+    except ValueError:
+        return False
+    return hmac.compare_digest(str(h.headers.get(INTESTAZIONE_PROXY) or "").encode(), chiave.encode())
 
 
 def e_https(h):
@@ -7150,7 +7059,7 @@ class Gestore(BaseHTTPRequestHandler):
     def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None, gz_chiave=None):
         dati = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
         compresso = False
-        # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto via tunnel, dove passano dalla tua linea in upload
+        # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto da fuori casa e da telefono
         if (len(dati) > 1024 and tipo.split(";")[0] in TIPI_COMPRIMIBILI and "gzip" in self.headers.get("Accept-Encoding", "")
                 and codice == 200):
             if gz_chiave:       # file fissi (app.js, app.css): si comprimono una volta per versione, non a ogni richiesta
@@ -7262,7 +7171,7 @@ class Gestore(BaseHTTPRequestHandler):
     def _smista(self):
         app = self.server.app
         # Una richiesta con un corpo (POST) che poi nessuno legge lascerebbe quel corpo in coda sulla connessione, e verrebbe scambiato per la
-        # richiesta successiva (dietro il tunnel le connessioni sono condivise tra piu' visitatori): chi legge il corpo per intero rimette False.
+        # richiesta successiva (dietro un reverse proxy le connessioni sono condivise tra piu' visitatori): chi legge il corpo per intero rimette False.
         self._chiudi = self.headers.get("Content-Length", "0").strip() not in ("", "0") or bool(self.headers.get("Transfer-Encoding"))
         try:
             u = urlparse(self.path)
@@ -7271,7 +7180,7 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(503, self._pagina("setup.html"))
             pubbliche = {"/app.css": "text/css; charset=utf-8", "/app.js": "text/javascript; charset=utf-8"}
             if p in pubbliche and p[1:] in WEB_ASSETS:
-                etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta via tunnel)
+                etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta da fuori casa)
                 # con ?v= uguale alla versione in corso il file non cambia mai: il browser lo tiene senza nemmeno chiedere (un giro in meno)
                 fisso = q.get("v") == [BUILD]
                 extra = [("Cache-Control", "public, max-age=31536000, immutable" if fisso else "no-cache"), ("ETag", etag)]
@@ -7286,7 +7195,10 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(200, favicon(), "image/png", [("Cache-Control", "max-age=86400")])
             if p == "/manifest.webmanifest":
                 return self._invia(200, json.dumps(MANIFEST), "application/manifest+json")
+            dal_proxy = accesso_dal_proxy(self)
             if p == "/login":
+                if dal_proxy:
+                    return self._vai("/")
                 if self.command == "POST":
                     return self._login(app)
                 if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
@@ -7296,8 +7208,10 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._webhook_nt(app, p)
             if p.startswith("/plugin/"):      # rotte pubbliche dei plugin (l'autenticazione e' del plugin)
                 return plugin_pubblico(app, self, p, q)
-            autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
+            autenticato = app.demo or dal_proxy or app.sessioni.valida(self._cookie("pdc_sid"))
             if p == "/logout" and self.command == "POST":
+                if dal_proxy:           # il login e' del proxy: «Esci» chiude quello (indirizzo del portale AuthCrunch/caddy-security)
+                    return self._vai("/auth/logout")
                 app.sessioni.elimina(self._cookie("pdc_sid"))
                 return self._vai("/login", [("Set-Cookie", "pdc_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")])
             if not autenticato:
@@ -8397,7 +8311,7 @@ def schema_impostazioni():
         ]},
         {"id": "telegram_file", "titolo": "Telegram: credenziali da un tuo file (facoltativo)", "nota": "Se il token e la chat sono già in un tuo "
          "file .json (per esempio quello di un altro bot), scrivi qui dove sta e come si chiamano le chiavi.", "campi": [
-            _c("telegram.file_credenziali", "testo", "Percorso del file", "Per es. C:\\bot\\telegram.json"),
+            _c("telegram.file_credenziali", "testo", "Percorso del file", "Per es. /opt/pdc/telegram.json"),
             _c("telegram.chiave_token", "testo", "Chiave del token nel file", "Per chiavi annidate: a.b"),
             _c("telegram.chiave_chat", "testo", "Chiave della chat nel file"),
         ]},
@@ -8446,9 +8360,9 @@ def schema_impostazioni():
             _c("netatmo.home_id", "testo", "ID della casa"),
             _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
             _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
-            _c("netatmo.webhook_attivo", "bool", "Usa i webhook di Netatmo (solo se il tunnel Cloudflare è collegato)",
+            _c("netatmo.webhook_attivo", "bool", "Usa i webhook di Netatmo (serve l’indirizzo pubblico in config.json)",
                "Netatmo avvisa il pannello appena lo Smarther cambia qualcosa, e lo Smarther si legge davvero solo ogni 15 minuti. "
-               "Se il tunnel è spento o qualcosa non torna, il pannello legge come prima."),
+               "Se manca l’indirizzo o qualcosa non torna, il pannello legge come prima."),
         ]},
         {"id": "stazione", "titolo": "Stazione meteo vicina (umidità e sole)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
          "stazione WeatherLink vicina (non quello della pagina: lo trovi con «python pdc_strumenti.py meteo-prova», che lo stampa pronto da incollare; "
@@ -8475,8 +8389,10 @@ def schema_impostazioni():
          "metti i tuoi file nella cartella \"dati/loghi\" (smarther.svg, samsung.svg, netatmo.svg, bticino.svg; "
          "vanno bene anche .png).", "campi": [
             _c("dispositivi.ip_pdc", "testo", "IP della pompa di calore", "Per es. 192.168.1.50. SmartThings non lo dice: "
-               "serve solo per mostrarlo e ricavare il MAC."),
+               "serve solo per mostrarlo nella pagina Dispositivi."),
+            _c("dispositivi.mac_pdc", "testo", "MAC della pompa di calore", "Per es. 28:6B:B4:00:00:00. Lo trovi nel router."),
             _c("dispositivi.ip_smarther", "testo", "IP dello Smarther", "Per es. 192.168.1.51."),
+            _c("dispositivi.mac_smarther", "testo", "MAC dello Smarther", "Se lo lasci vuoto si usa quello che comunica Netatmo."),
             _c("dispositivi.modello_smarther", "scelta", "Modello dello Smarther", "Netatmo dice solo \"BNS\": qui scegli "
                "l'articolo che hai (è scritto sulla scatola o sul retro).", opzioni=MODELLI_SMARTHER),
             _c("dispositivi.loghi_bianchi", "bool", "Mostra i loghi in bianco",
@@ -8612,11 +8528,7 @@ def api_impostazioni(app, q):
                 c["valore"], c["impostato"] = "", bool(v)
             else:
                 c["valore"] = v if v is not None else ("" if c["tipo"] in ("testo", "lungo", "ora", "scelta") else (False if c["tipo"] == "bool" else 0))
-    cf = cfg.get("cloudflare") or {}
-    base = f"https://{cf['hostname']}" if cf.get("tunnel_token") and cf.get("hostname") else ""      # indirizzo da fuori casa, per i plugin
-    for s in sezioni:
-        if s.get("plugin"):
-            s["plugin"]["base"] = base
+    plugin_con_base(sezioni, cfg)
     out = cornice(app, ora)
     out.update({"stato": stato_collegamenti(app, ora), "sezioni": sezioni, "allarmi": allarmi,
                 "utente": cfg["accesso"].get("utente") or ""})
@@ -8666,6 +8578,11 @@ def _valida(c, v):
             ipaddress.IPv4Address(s)
         except ValueError:
             return None, "Scrivi un indirizzo IP, per es. 192.168.1.50"
+    if c["chiave"] in ("dispositivi.mac_pdc", "dispositivi.mac_smarther") and s:
+        mac = _mac_normale(s)
+        if not mac or len(s) != 17:
+            return None, "Scrivi un indirizzo MAC, per es. 28:6B:B4:00:00:00"
+        return mac, None
     return s, None
 
 
@@ -8848,628 +8765,6 @@ def reset_database(app, corpo, h):
     for s in app.servizi:
         s.sveglia.set()     # rileggi subito: i primi dati ricompaiono in pochi secondi
     return {"ok": True, "messaggio": "Database azzerato. I dati ricominciano da adesso.", "copia": copia.name}
-#@@PARTE cloudflare@@
-# ==========================================================================
-# PEZZO 6: ACCESSO DA INTERNET CON UN TUNNEL CLOUDFLARE (procedura guidata)
-# ==========================================================================
-
-import subprocess
-
-CF_API = "https://api.cloudflare.com/client/v4"
-CF_DOWNLOAD = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
-TITOLI["cf_tunnel"] = "Tunnel Cloudflare"
-TITOLI["cf_esterno"] = "Pannello raggiungibile da internet"
-
-CLOUDFLARE_DEFAULT = {
-    "_nota": "Compilato dalla procedura guidata (Impostazioni > Accesso da internet). Il token del tunnel permette solo di "
-             "far girare QUEL tunnel: tieni comunque config.json riservato.",
-    "attivo": False,
-    "avvio_automatico": True,
-    "hostname": "", "nome_tunnel": "", "tunnel_id": "", "account_id": "", "zone_id": "",
-    "tunnel_token": "", "porta_servizio": 0,
-    "percorso_cloudflared": "",
-    "protocollo": "auto",
-}
-
-
-class ErroreCF(Exception):
-    pass
-
-
-def cf_chiama(token, metodo, percorso, corpo=None, query=None):
-    """Una chiamata all'API Cloudflare -> result. Solleva ErroreCF con un messaggio in italiano."""
-    url = CF_API + percorso + (("?" + urlencode(query)) if query else "")
-    dati = json.dumps(corpo).encode() if corpo is not None else None
-    h = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    if dati is not None:
-        h["Content-Type"] = "application/json"
-    try:
-        code, js = http_json(metodo, url, h, dati, timeout=30)
-    except ErroreAPI as e:
-        raise ErroreCF(f"Non riesco a raggiungere Cloudflare ({e.messaggio}).")
-    if js.get("success") is True:
-        return js.get("result")
-    errs = js.get("errors") or []
-    testo = "; ".join(f"{e.get('message', '?')} (codice {e.get('code', '?')})" for e in errs) or f"errore HTTP {code}"
-    if code in (401, 403) or any(e.get("code") in (10000, 9109, 9106, 9103) for e in errs):
-        raise ErroreCF("Cloudflare rifiuta il token: scaduto, copiato male o senza tutti i permessi richiesti. "
-                       f"Dettaglio: {testo}")
-    if code == 429:
-        raise ErroreCF("Cloudflare dice di rallentare (troppe richieste): riprova fra un minuto.")
-    raise ErroreCF(f"Cloudflare: {testo}")
-
-
-def _percorso_exe(app, cfg=None):
-    c = (cfg or app.cfg.leggi())["cloudflare"]
-    if c.get("percorso_cloudflared"):
-        p = Path(c["percorso_cloudflared"])
-        return p if p.is_absolute() else app.base / p
-    nome = "cloudflared.exe" if os.name == "nt" else "cloudflared"
-    locale = app.base / "cloudflared" / nome
-    if locale.exists():
-        return locale
-    import shutil
-    trovato = shutil.which("cloudflared")
-    return Path(trovato) if trovato else locale
-
-
-def _url_download():
-    macchina = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or "").lower()
-    import platform
-    m = (platform.machine() or macchina).lower()
-    if sys.platform.startswith("win"):
-        return CF_DOWNLOAD + ("cloudflared-windows-386.exe" if m in ("x86", "i386", "i686") else "cloudflared-windows-amd64.exe")
-    if sys.platform.startswith("linux"):
-        return CF_DOWNLOAD + ("cloudflared-linux-arm64" if m in ("aarch64", "arm64") else "cloudflared-linux-amd64")
-    return None
-
-
-def _digest_ufficiale(nome_file):
-    """SHA-256 che GitHub pubblica per il file dell'ultima versione (campo «digest» dell'API): None se non si riesce a leggerlo."""
-    try:
-        code, js = http_json("GET", "https://api.github.com/repos/cloudflare/cloudflared/releases/latest",
-                             {"User-Agent": "pdc-pannello", "Accept": "application/vnd.github+json"}, timeout=20)
-    except Exception:                                            # noqa: BLE001
-        return None
-    if code != 200 or not isinstance(js, dict):
-        return None
-    for a in js.get("assets") or []:
-        if isinstance(a, dict) and a.get("name") == nome_file:
-            d = str(a.get("digest") or "")
-            return d[7:].lower() if d.startswith("sha256:") and len(d) == 71 else None
-    return None
-
-
-def scarica_cloudflared(app):
-    url = _url_download()
-    if not url:
-        raise ErroreCF("Su questo sistema non so scaricare cloudflared da solo: installalo a mano e scrivi il percorso in "
-                       "config.json (cloudflare -> percorso_cloudflared).")
-    dest = app.base / "cloudflared" / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
-    dest.parent.mkdir(exist_ok=True)
-    tmp = dest.with_name(dest.name + ".scarico")
-    try:
-        req = Request(url, headers={"User-Agent": "pdc-pannello"})
-        with urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
-            tot = 0
-            impronta = hashlib.sha256()
-            while True:
-                blocco = r.read(1 << 16)
-                if not blocco:
-                    break
-                impronta.update(blocco)
-                tot += len(blocco)
-                if tot > 150_000_000:
-                    raise ErroreCF("Il file scaricato e' troppo grande: lo scarto.")
-                f.write(blocco)
-    except (URLError, OSError) as e:
-        tmp.unlink(missing_ok=True)
-        raise ErroreCF(f"Download non riuscito ({getattr(e, 'reason', e)}). Controlla internet e il firewall, oppure scarica "
-                       "cloudflared a mano da github.com/cloudflare/cloudflared/releases e metti il percorso in config.json.")
-    if tot < 5_000_000:
-        tmp.unlink(missing_ok=True)
-        raise ErroreCF("Il file scaricato e' troppo piccolo per essere cloudflared.")
-    atteso = _digest_ufficiale(url.rsplit("/", 1)[1])
-    if atteso and atteso != impronta.hexdigest():
-        tmp.unlink(missing_ok=True)
-        raise ErroreCF("Il file scaricato non corrisponde all'impronta (SHA-256) pubblicata da GitHub: lo scarto. Riprova fra poco.")
-    if not atteso:
-        log.warning("cloudflared: impronta SHA-256 ufficiale non disponibile, controllo solo dimensione e tipo di file")
-    if os.name == "nt":
-        with open(tmp, "rb") as f:
-            if f.read(2) != b"MZ":
-                tmp.unlink(missing_ok=True)
-                raise ErroreCF("Il file scaricato non e' un programma Windows valido.")
-    os.replace(tmp, dest)
-    if os.name != "nt":
-        dest.chmod(0o755)
-    return versione_cloudflared(dest)
-
-
-def versione_cloudflared(exe):
-    try:
-        r = subprocess.run([str(exe), "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return (r.stdout or r.stderr).strip().splitlines()[0][:80]
-    except (OSError, subprocess.SubprocessError, IndexError):
-        return None
-
-
-class TunnelCF:
-    """Tiene acceso cloudflared (processo figlio, senza finestra) e lo rilancia se si ferma."""
-
-    def __init__(self, app):
-        self.app = app
-        self.proc = None
-        self.voluto = False
-        self.thread = None
-        self.lock = threading.RLock()
-        self.log_path = cartella_log(app.base) / "cloudflared.log"
-        self.pid_path = app.base / "cloudflared" / "cloudflared.pid"
-        try:
-            self.pid_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        self.partito_il = 0
-        self.fallimenti = 0
-        self.fermo = threading.Event()
-        self.ultimo_errore = None
-        self.esterno_ts = 0       # ultimo controllo dall'esterno
-        self.esterno_ko = 0       # controlli falliti di fila
-
-    # ----- ciclo di vita -----
-    def _cfg(self):
-        return self.app.cfg.leggi()["cloudflare"]
-
-    def pronto(self):
-        c = self._cfg()
-        return bool(c["tunnel_token"] and c["hostname"] and _percorso_exe(self.app).exists())
-
-    def _pulisci_vecchio(self):
-        """Se una copia precedente del pannello e' stata chiusa a forza, il suo cloudflared puo' essere rimasto."""
-        try:
-            pid = int(self.pid_path.read_text().strip())
-        except (OSError, ValueError):
-            return
-        try:
-            if os.name == "nt":
-                # l'output di tasklist usa la tabella di caratteri di Windows (non UTF-8, ha le lettere accentate): lo leggo
-                # come byte e cerco solo il nome del programma, cosi' nessun carattere strano puo' far fallire l'avvio
-                r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True,
-                                   timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                if b"cloudflared" in (r.stdout or b"").lower():
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=15,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            else:
-                if "cloudflared" in Path(f"/proc/{pid}/cmdline").read_text().lower():
-                    os.kill(pid, 15)
-        except Exception as e:      # ripulire un vecchio processo non deve mai impedire al pannello di partire
-            log.warning("cloudflared: non riesco a controllare il processo vecchio (%s)", e)
-        try:
-            self.pid_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    def avvia(self):
-        with self.lock:
-            if self.app.demo:
-                raise ErroreCF("In modalita' demo il tunnel non parte.")
-            c = self._cfg()
-            exe = _percorso_exe(self.app)
-            if not c["tunnel_token"]:
-                raise ErroreCF("Il tunnel non e' ancora stato creato: usa la procedura guidata.")
-            if not exe.exists():
-                raise ErroreCF("Manca il programma cloudflared: scaricalo dalla procedura guidata.")
-            self.voluto = True
-            self.app.cfg.aggiorna(lambda r: r.setdefault("cloudflare", {}).update(attivo=True))
-            if self.proc and self.proc.poll() is None:
-                return
-            self._lancia(exe, c)
-            if not self.thread or not self.thread.is_alive():
-                self.fermo.clear()
-                self.thread = threading.Thread(target=self._guardia, daemon=True, name="tunnel-cf")
-                self.thread.start()
-
-    def _lancia(self, exe, c):
-        self._pulisci_vecchio()
-        env = dict(os.environ)
-        env["TUNNEL_TOKEN"] = c["tunnel_token"]      # via ambiente: cosi' non compare nell'elenco dei processi
-        args = [str(exe), "tunnel", "--no-autoupdate", "--loglevel", "info"]
-        if c.get("protocollo") in ("http2", "quic"):
-            args += ["--protocol", c["protocollo"]]
-        args.append("run")
-        try:
-            if self.log_path.exists() and self.log_path.stat().st_size > 500_000:     # oltre 500 KB: si tiene la parte finale, da un inizio di avvio
-                dati = self.log_path.read_bytes()[-400_000:]
-                i = dati.find(b"\n--- avvio")
-                self.log_path.write_bytes(dati[i + 1:] if i >= 0 else dati)
-        except OSError:
-            pass
-        logf = open(self.log_path, "ab")
-        logf.write(f"\n--- avvio {time.strftime('%d/%m/%Y %H:%M:%S')} ---\n".encode())
-        logf.flush()
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        try:
-            self.proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
-                                         creationflags=flags, cwd=str(self.app.base))
-        except OSError as e:
-            logf.close()
-            raise ErroreCF(f"Non riesco ad avviare cloudflared: {e}")
-        logf.close()
-        self.partito_il = time.time()
-        try:
-            self.pid_path.write_text(str(self.proc.pid))
-        except OSError:
-            pass
-        log.info("cloudflared avviato (pid %s)", self.proc.pid)
-
-    def ferma(self, spegni=True):
-        with self.lock:
-            self.voluto = False
-            self.fermo.set()
-            if spegni and not self.app.demo:
-                try:
-                    self.app.cfg.aggiorna(lambda r: r.setdefault("cloudflare", {}).update(attivo=False))
-                except ErroreConfig:
-                    pass
-            p, self.proc = self.proc, None
-            if p and p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-            self.pid_path.unlink(missing_ok=True)
-            self.app.eventi.chiudi("cf_tunnel")
-
-    def chiudi_con_il_pannello(self):
-        """All'uscita del pannello ferma il processo ma ricorda che il tunnel e' 'attivo'."""
-        self.ferma(spegni=False)
-
-    def avvia_se_serve(self):
-        c = self._cfg()
-        if c["attivo"] and c["avvio_automatico"] and self.pronto():
-            try:
-                self.avvia()
-            except ErroreCF as e:
-                log.warning("Tunnel Cloudflare: %s", e)
-                self.ultimo_errore = str(e)
-
-    def _guardia(self):
-        """Controllo del tunnel: se per un imprevisto (per esempio database non scrivibile) si ferma, riparte."""
-        while not self.fermo.is_set():
-            try:
-                return self._guardia_interna()
-            except Exception:
-                log.exception("errore nel controllo del tunnel Cloudflare; riprovo tra 30 secondi")
-                self.fermo.wait(30)
-
-    def _guardia_interna(self):
-        attesa = 5
-        while not self.fermo.wait(5):
-            pausa = 0
-            with self.lock:
-                if not self.voluto:
-                    return
-                p = self.proc
-                if p is None or p.poll() is not None:
-                    self.fallimenti += 1
-                    codice = None if p is None else p.returncode
-                    self.ultimo_errore = f"cloudflared si e' fermato (codice {codice}). " + self._ultima_riga_problema()
-                    log.warning("%s", self.ultimo_errore)
-                    if self.fallimenti >= 3:
-                        self.app.eventi.apri("cf_tunnel", f"Il tunnel Cloudflare continua a fermarsi: {self._ultima_riga_problema()}", "avviso")
-                    try:
-                        self._lancia(_percorso_exe(self.app), self._cfg())
-                    except ErroreCF as e:
-                        self.ultimo_errore = str(e)
-                    pausa = min(300, attesa)         # l'attesa si fa FUORI dal lucchetto: Ferma/Riavvia non restano bloccati
-                    attesa = min(300, attesa * 2)
-                elif self.collegato():
-                    self.fallimenti, attesa = 0, 5
-                    self.app.eventi.chiudi("cf_tunnel")
-                elif time.time() - self.partito_il > 180:
-                    self.app.eventi.apri("cf_tunnel", "Il tunnel e' avviato ma non risulta collegato a Cloudflare da oltre 3 minuti. "
-                                         + self._ultima_riga_problema(), "avviso")
-            if pausa:
-                self.fermo.wait(pausa)
-                continue
-            try:
-                self._controllo_esterno()
-            except Exception:
-                log.exception("controllo del pannello da internet in errore")
-
-    # ----- il pannello e' raggiungibile da internet? -----
-    CONTROLLO_OGNI = 120        # secondi fra un controllo e l'altro
-    CONTROLLO_FALLITI = 3       # controlli falliti di fila prima di avvisare (circa 6 minuti)
-
-    def _controllo_esterno(self):
-        """Prova il percorso intero, come lo farebbe il tuo iPhone da fuori casa: da qui a Cloudflare e di nuovo al pannello.
-        Usa la pagina pubblica manifest.webmanifest (non serve la password). Avvisa solo dopo alcuni fallimenti di fila, per
-        non disturbare con un singolo intoppo; quando torna tutto a posto l'avviso si chiude da solo."""
-        if self.app.demo or not self.proc or self.proc.poll() is not None or time.time() - self.partito_il < 120:
-            return
-        if time.time() - self.esterno_ts < self.CONTROLLO_OGNI:
-            return
-        self.esterno_ts = time.time()
-        host = self._cfg()["hostname"]
-        if not host:
-            return
-        motivo = ""
-        try:
-            code, js = http_json("GET", f"https://{host}/manifest.webmanifest",
-                                 {"User-Agent": "pdc-pannello", "Accept": "application/json"}, timeout=15)
-            if code == 200 and isinstance(js, dict) and "start_url" in js:
-                self.esterno_ko = 0
-                self.app.eventi.chiudi("cf_esterno")
-                return
-            if code in (530, 1033):
-                motivo = f"Cloudflare non trova il tunnel (codice {code})"
-            elif code in (502, 504, 521, 522, 523, 524):
-                motivo = f"Cloudflare risponde ma il pannello no (codice {code})"
-            else:
-                motivo = f"risposta inattesa (codice {code})"
-        except ErroreAPI as e:
-            motivo = str(e)
-        self.esterno_ko += 1
-        if self.esterno_ko >= self.CONTROLLO_FALLITI:
-            self.app.eventi.apri("cf_esterno", f"Da internet il pannello non risponde ({host}): {motivo}.", "avviso")
-
-    # ----- stato -----
-    def _coda_log(self, n=12000):
-        try:
-            with open(self.log_path, "rb") as f:
-                f.seek(0, 2)
-                f.seek(max(0, f.tell() - n))
-                testo = f.read().decode("utf-8", "replace")
-            return testo[testo.rfind("--- avvio"):] if "--- avvio" in testo else testo
-        except OSError:
-            return ""
-
-    def collegato(self):
-        return "Registered tunnel connection" in self._coda_log()
-
-    def _ultima_riga_problema(self):
-        for riga in reversed(self._coda_log().splitlines()):
-            if " ERR " in riga or "error" in riga.lower() or "failed" in riga.lower():
-                return re.sub(r"^\S+\s+\w+\s+", "", riga).strip()[:220]
-        return ""
-
-    def stato(self):
-        c = self._cfg()
-        exe = _percorso_exe(self.app)
-        in_esecuzione = bool(self.proc and self.proc.poll() is None)
-        s = {"configurato": bool(c["tunnel_token"] and c["hostname"]), "hostname": c["hostname"],
-             "indirizzo": f"https://{c['hostname']}" if c["hostname"] else "", "nome_tunnel": c["nome_tunnel"],
-             "avvio_automatico": c["avvio_automatico"], "attivo": c["attivo"],
-             "programma": exe.exists(), "in_esecuzione": in_esecuzione,
-             "collegato": in_esecuzione and self.collegato(), "problema": self.ultimo_errore if not in_esecuzione else self._ultima_riga_problema() if not self.collegato() else "",
-             "porta_diversa": bool(c["porta_servizio"] and int(c["porta_servizio"]) != int(self.app.cfg.leggi()["generale"]["porta"])),
-             "porta_servizio": c["porta_servizio"], "demo": self.app.demo}
-        return s
-
-
-def tunnel(app):
-    t = getattr(app, "tunnel", None)
-    if t is None:
-        t = app.tunnel = TunnelCF(app)
-    return t
-
-
-# --------------------------------------------------------------------------
-# API della procedura guidata
-# --------------------------------------------------------------------------
-
-def _controllo_token(corpo):
-    tok = str(corpo.get("token", "")).strip()
-    if len(tok) < 20 or any(ch.isspace() for ch in tok):
-        raise ErroreCF("Il token sembra incompleto: copialo per intero (senza spazi) dalla pagina di Cloudflare.")
-    return tok
-
-
-def _risposta_errore(e):
-    return {"ok": False, "messaggio": str(e)}
-
-
-@api("/api/cloudflare")
-def api_cloudflare(app, q):
-    return tunnel(app).stato()
-
-
-@api_post("/api/cloudflare/verifica")
-def cf_verifica(app, corpo, h):
-    if app.demo:
-        return {"ok": False, "messaggio": "In modalità demo la procedura non è disponibile."}
-    try:
-        tok = _controllo_token(corpo)
-        zone = cf_chiama(tok, "GET", "/zones", query={"per_page": 50, "status": "active"}) or []
-    except ErroreCF as e:
-        return _risposta_errore(e)
-    if not zone:
-        return {"ok": False, "messaggio": "Il token funziona ma non vede nessun dominio. Nel token, alla voce 'Zone Resources' "
-                                          "scegli il tuo dominio (o 'All zones') e aggiungi il permesso Zone > Zone > Read."}
-    return {"ok": True, "zone": [{"id": z["id"], "nome": z["name"], "account_id": (z.get("account") or {}).get("id", ""),
-                                  "account_nome": (z.get("account") or {}).get("name", "")} for z in zone]}
-
-
-@api_post("/api/cloudflare/crea")
-def cf_crea(app, corpo, h):
-    if app.demo:
-        return {"ok": False, "messaggio": "In modalità demo la procedura non è disponibile."}
-    passi = []
-
-    def ok(t):
-        passi.append({"t": t, "ok": True})
-    tunnel_id = account = None
-    tok = None
-    try:
-        tok = _controllo_token(corpo)
-        sub = str(corpo.get("sottodominio", "")).strip().lower()
-        nome = str(corpo.get("nome_tunnel", "")).strip() or "pannello-pdc"
-        if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", sub):
-            raise ErroreCF("Il nome del sottodominio può contenere solo lettere minuscole, numeri e trattini (es. pdc).")
-        if not re.fullmatch(r"[A-Za-z0-9 _.-]{1,60}", nome):
-            raise ErroreCF("Il nome del tunnel può contenere solo lettere, numeri, spazi, trattino, punto e underscore.")
-        zona_id = str(corpo.get("zone_id", ""))
-        if not re.fullmatch(r"[0-9a-f]{32}", zona_id):          # finisce dentro l'indirizzo della richiesta a Cloudflare: solo un identificativo vero
-            raise ErroreCF("Dominio non valido: riparti dal primo passo della procedura.")
-        zona = cf_chiama(tok, "GET", f"/zones/{zona_id}")
-        account = (zona.get("account") or {}).get("id")
-        if not account:
-            raise ErroreCF("Non riesco a capire a quale account appartiene il dominio.")
-        host = f"{sub}.{zona['name']}"
-        ok(f"Dominio verificato: {zona['name']}")
-        esistenti = cf_chiama(tok, "GET", f"/zones/{zona['id']}/dns_records", query={"name": host}) or []
-        record = None
-        for r in esistenti:
-            if r.get("type") == "CNAME" and str(r.get("content", "")).endswith(".cfargotunnel.com"):
-                record = r
-            else:
-                raise ErroreCF(f"Esiste già un record DNS '{r.get('type')}' per {host}: non lo tocco. Scegli un altro sottodominio "
-                               "oppure cancella quel record dal pannello DNS di Cloudflare.")
-        doppi = cf_chiama(tok, "GET", f"/accounts/{account}/cfd_tunnel", query={"name": nome, "is_deleted": "false"}) or []
-        if doppi:
-            raise ErroreCF(f"Esiste già un tunnel chiamato '{nome}' nel tuo account: scegli un altro nome.")
-        ok("Nome e sottodominio liberi")
-        t = cf_chiama(tok, "POST", f"/accounts/{account}/cfd_tunnel", {"name": nome, "config_src": "cloudflare"})
-        tunnel_id = t["id"]
-        tunnel_token = t.get("token") or cf_chiama(tok, "GET", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/token")
-        ok(f"Tunnel '{nome}' creato")
-        porta = int(app.cfg.leggi()["generale"]["porta"])
-        cf_chiama(tok, "PUT", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/configurations",
-                  {"config": {"ingress": [{"hostname": host, "service": f"http://127.0.0.1:{porta}", "originRequest": {}},
-                                          {"service": "http_status:404"}]}})
-        ok(f"Il tunnel porta {host} al pannello (porta {porta})")
-        contenuto = f"{tunnel_id}.cfargotunnel.com"
-        dati_dns = {"type": "CNAME", "name": host, "content": contenuto, "proxied": True}
-        if record:
-            cf_chiama(tok, "PUT", f"/zones/{zona['id']}/dns_records/{record['id']}", dati_dns)
-        else:
-            cf_chiama(tok, "POST", f"/zones/{zona['id']}/dns_records", dati_dns)
-        ok("Record DNS creato")
-    except ErroreCF as e:
-        if tunnel_id and account and tok:               # a meta' strada: riporto tutto com'era
-            try:
-                cf_chiama(tok, "DELETE", f"/accounts/{account}/cfd_tunnel/{tunnel_id}")
-                passi.append({"t": "Ho annullato il tunnel creato a metà", "ok": True})
-            except ErroreCF:
-                passi.append({"t": f"Attenzione: il tunnel '{nome}' è rimasto nel tuo account Cloudflare, cancellalo a mano", "ok": False})
-        passi.append({"t": str(e), "ok": False})
-        return {"ok": False, "messaggio": str(e), "passi": passi}
-
-    def salva(raw):
-        raw.setdefault("cloudflare", {}).update(
-            hostname=host, nome_tunnel=nome, tunnel_id=tunnel_id, account_id=account, zone_id=zona["id"],
-            tunnel_token=tunnel_token, porta_servizio=porta, attivo=False)
-    app.cfg.aggiorna(salva)
-    ok("Impostazioni salvate (il token di Cloudflare NON è stato conservato)")
-    log.info("Tunnel Cloudflare creato per %s", host)
-    return {"ok": True, "passi": passi, "indirizzo": f"https://{host}"}
-
-
-@api_post("/api/cloudflare/scarica")
-def cf_scarica(app, corpo, h):
-    if app.demo:
-        return {"ok": False, "messaggio": "In modalità demo non scarico nulla."}
-    try:
-        v = scarica_cloudflared(app)
-    except ErroreCF as e:
-        return _risposta_errore(e)
-    return {"ok": True, "versione": v or "installato"}
-
-
-def _avvia_tunnel(app, riavvia=False):
-    try:
-        t = tunnel(app)
-        if riavvia:
-            t.ferma(spegni=False)
-        t.ultimo_errore = None
-        t.avvia()
-    except ErroreCF as e:
-        return _risposta_errore(e)
-    return {"ok": True}
-
-
-@api_post("/api/cloudflare/avvia")
-def cf_avvia(app, corpo, h):
-    return _avvia_tunnel(app)
-
-
-@api_post("/api/cloudflare/ferma")
-def cf_ferma(app, corpo, h):
-    tunnel(app).ferma()
-    return {"ok": True}
-
-
-@api_post("/api/cloudflare/telegram")
-def cf_telegram(app, corpo, h):
-    """Manda su Telegram l'indirizzo per raggiungere il pannello da fuori casa."""
-    if app.demo:
-        return {"ok": False, "messaggio": "In modalità demo non si invia nulla."}
-    c = app.cfg.leggi().get("cloudflare") or {}
-    if not c.get("hostname"):
-        return {"ok": False, "messaggio": "L'accesso da internet non è ancora configurato."}
-    tg, err = telegram_pronto(app)
-    if err:
-        return {"ok": False, "messaggio": err}
-    nome = esc_html(tg.cfg().get("nome_impianto") or "Pompa di calore")
-    ok, msg = tg.invia_ora(f"🔗 <b>{nome}</b>\nPannello da fuori casa:\nhttps://{esc_html(c['hostname'])}")
-    return {"ok": ok, "messaggio": "Inviato: guarda Telegram." if ok else msg}
-
-
-@api_post("/api/cloudflare/riavvia")
-def cf_riavvia(app, corpo, h):
-    return _avvia_tunnel(app, riavvia=True)
-
-
-@api_post("/api/cloudflare/opzioni")
-def cf_opzioni(app, corpo, h):
-    if app.demo:
-        return {"ok": False, "messaggio": "In modalità demo non si salva nulla."}
-    val = bool(corpo.get("avvio_automatico"))
-    app.cfg.aggiorna(lambda raw: raw.setdefault("cloudflare", {}).update(avvio_automatico=val))
-    return {"ok": True}
-
-
-@api_post("/api/cloudflare/rimuovi")
-def cf_rimuovi(app, corpo, h):
-    """Ferma il tunnel e lo toglie dal pannello. Con un token Cloudflare cancella anche DNS e tunnel online."""
-    if app.demo:
-        return {"ok": False, "messaggio": "In modalità demo non si cambia nulla."}
-    c = app.cfg.leggi()["cloudflare"]
-    tunnel(app).ferma()
-    passi, avviso = [], None
-    tok = str(corpo.get("token", "")).strip()
-    if tok and c["tunnel_id"]:
-        try:
-            tok = _controllo_token(corpo)
-            for r in cf_chiama(tok, "GET", f"/zones/{c['zone_id']}/dns_records", query={"name": c["hostname"]}) or []:
-                if r.get("type") == "CNAME" and str(r.get("content", "")).endswith(".cfargotunnel.com"):
-                    cf_chiama(tok, "DELETE", f"/zones/{c['zone_id']}/dns_records/{r['id']}")
-            passi.append("Record DNS cancellato")
-            try:    # le connessioni appena chiuse possono risultare ancora attive per qualche secondo
-                cf_chiama(tok, "DELETE", f"/accounts/{c['account_id']}/cfd_tunnel/{c['tunnel_id']}/connections")
-            except ErroreCF:
-                pass
-            cf_chiama(tok, "DELETE", f"/accounts/{c['account_id']}/cfd_tunnel/{c['tunnel_id']}")
-            passi.append("Tunnel cancellato da Cloudflare")
-        except ErroreCF as e:
-            avviso = f"Online non sono riuscito a cancellare tutto ({e}). Puoi farlo a mano dal sito di Cloudflare."
-    elif c["tunnel_id"]:
-        avviso = ("Ho spento il tunnel qui, ma su Cloudflare restano il tunnel e il record DNS: cancellali dal loro sito "
-                  "(Zero Trust > Networks > Tunnels, e DNS del dominio) oppure rifai questo passaggio dando un token.")
-    app.cfg.aggiorna(lambda raw: raw.setdefault("cloudflare", {}).update(
-        hostname="", nome_tunnel="", tunnel_id="", account_id="", zone_id="", tunnel_token="", porta_servizio=0, attivo=False))
-    log.info("Tunnel Cloudflare rimosso dal pannello")
-    return {"ok": True, "passi": passi, "avviso": avviso}
-
-
-def avvia_tunnel_se_serve(app):
-    if not app.demo:
-        tunnel(app).avvia_se_serve()
-
-
-aggiungi_default_pezzi()
 #@@PARTE manutenzione@@
 # ==========================================================================
 # PEZZO 7: MANUTENZIONE DELLO STORICO (il database non cresce all'infinito)
@@ -9759,6 +9054,9 @@ def avvia_manutenzione(app):
 
 TEMPLATE["conservazione"] = copy.deepcopy(CONSERVAZIONE_DEFAULT)
 TEMPLATE["backup"] = copy.deepcopy(BACKUP_DEFAULT)
+
+
+aggiungi_default_pezzi()     # Telegram e allarmi: ora che le loro parti sono definite
 #@@PARTE dispositivi@@
 # ==========================================================================
 # PEZZO 8 (v0.9): PAGINA DISPOSITIVI (pompa di calore e Smarther: identita', versioni, rete, storico delle versioni)
@@ -9784,74 +9082,16 @@ def elenco_loghi(app):
 
 
 # --------------------------------------------------------------------------
-# MAC dall'IP (best-effort: legge la tabella ARP del sistema)
+# MAC scritto a mano: riconosciuto e messo in forma standard
 # --------------------------------------------------------------------------
 
 _RE_MAC = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}[0-9a-fA-F]{2})(?![0-9a-fA-F])")
-_cache_mac = {}
-MAC_RICORDO = 7 * 86400     # un MAC trovato non cambia quasi mai: si ricorda una settimana (cambiando l'IP in Impostazioni si rilegge subito)
-MAC_RIPROVA = 120           # se non c'e' (dispositivo spento) si riprova presto
-
-
 def _mac_normale(testo):
     m = _RE_MAC.search(testo or "")
     if not m:
         return None
     mac = m.group(1).replace("-", ":").upper()
     return None if mac in ("FF:FF:FF:FF:FF:FF", "00:00:00:00:00:00") else mac
-
-
-def mac_da_righe(righe, ip):
-    """Cerca nelle righe dell'output di 'arp -a' / '/proc/net/arp' quella dell'IP dato."""
-    for riga in righe:
-        parti = riga.split()
-        if parti and parti[0].strip("()") == ip:
-            mac = _mac_normale(riga)
-            if mac:
-                return mac
-        elif f"({ip})" in riga:                        # formato Linux/macOS di 'arp -a'
-            mac = _mac_normale(riga)
-            if mac:
-                return mac
-    return None
-
-
-def mac_da_ip(ip):
-    """MAC di un dispositivo della rete locale, oppure None. Nessuna libreria esterna: 'arp' del sistema."""
-    ora = time.time()
-    c = _cache_mac.get(ip)
-    if c and ora - c[0] < (MAC_RICORDO if c[1] else MAC_RIPROVA):
-        return c[1]
-    mac = None
-    try:
-        ip = str(ipaddress.IPv4Address(ip))          # finisce tra gli argomenti di «arp»: solo un indirizzo vero (config.json si scrive anche a mano)
-        # una "bussata" UDP fa popolare la tabella ARP anche se il dispositivo non risponde
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.3)
-        try:
-            s.sendto(b"\x00", (ip, 9))
-        except OSError:
-            pass
-        finally:
-            s.close()
-        time.sleep(0.15)
-        import subprocess
-        if os.name == "nt":
-            r = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-                               creationflags=0x08000000)          # CREATE_NO_WINDOW
-            mac = mac_da_righe(r.stdout.splitlines(), ip)
-        else:
-            try:
-                mac = mac_da_righe(Path("/proc/net/arp").read_text().splitlines(), ip)
-            except OSError:
-                pass
-            if not mac:
-                r = subprocess.run(["arp", "-n", ip], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-                mac = mac_da_righe(r.stdout.splitlines(), ip) or _mac_normale(r.stdout)
-    except Exception:
-        mac = None
-    _cache_mac[ip] = (ora, mac)
-    return mac
 
 
 # --------------------------------------------------------------------------
@@ -9897,22 +9137,11 @@ def _stato_connessione(ult, ora, serie_stato, valore_ok, serie_dato, tol):
     return ("Online", "si") if d and ora - d[1] <= tol else ("—", "no")
 
 
-def _riga_rete(app, ip, mac_noto, etichetta_mac="MAC"):
-    righe = []
-    if not ip:
-        righe.append(_riga("IP", None, nota="Non impostato: scrivilo in Impostazioni → Dispositivi."))
-        if mac_noto:
-            righe.append(_riga(etichetta_mac, mac_noto, "c"))
-        return righe
-    righe.append(_riga("IP", ip, "c"))
-    mac = mac_da_ip(ip)
-    if mac_noto and not mac:
-        righe.append(_riga(etichetta_mac, mac_noto, "c"))
-    elif mac:
-        righe.append(_riga(etichetta_mac, mac, "c"))
-    else:
-        righe.append(_riga(etichetta_mac, None, nota="Non lo trovo nella rete: controlla l'IP e che il dispositivo sia acceso."))
-    return righe
+def _riga_rete(ip, mac, etichetta_mac="MAC"):
+    """IP e MAC come scritti in Impostazioni → Dispositivi: il server non e' nella rete di casa, non li puo' cercare."""
+    manca = "Non impostato: scrivilo in Impostazioni → Dispositivi."
+    return [_riga("IP", ip or None, "c", nota="" if ip else manca),
+            _riga(etichetta_mac, mac or None, "c", nota="" if mac else manca)]
 
 
 def _versioni_pdc(testo):
@@ -9971,7 +9200,7 @@ def _scheda_pdc(app, ult, cfg, ora, tol):
             _riga("ID profilo", t("info.pdc.vid"), "c"),
             _riga("Registrata su SmartThings", int(t("info.pdc.registrata")) if (t("info.pdc.registrata") or "").isdigit() else None, "d"),
         ]},
-        {"titolo": "Rete", "righe": _riga_rete(app, cfg["dispositivi"].get("ip_pdc", ""), None)},
+        {"titolo": "Rete", "righe": _riga_rete(cfg["dispositivi"].get("ip_pdc", ""), _mac_normale(cfg["dispositivi"].get("mac_pdc", "")))},
     ]
     r = ult.get("acs.temperatura")
     return {"id": "pdc", "titolo": "Pompa di calore", "sotto": "Samsung EHS · via SmartThings",
@@ -10030,7 +9259,7 @@ def _scheda_smarther(app, ult, cfg, ora, tol):
             _riga("ID stanza Netatmo", cfg["netatmo"].get("room_id") or None, "c"),
             _riga("Installato su Netatmo", int(inst) if (inst or "").isdigit() else None, "d"),
         ]},
-        {"titolo": "Rete", "righe": _riga_rete(app, dc.get("ip_smarther", ""), mac_nt)},
+        {"titolo": "Rete", "righe": _riga_rete(dc.get("ip_smarther", ""), _mac_normale(dc.get("mac_smarther", "")) or mac_nt)},
         {"titolo": "Dal catalogo BTicino", "righe": (
             ([_riga("Installazione", arti[0]), _riga("Colorazione", arti[1])] if arti else []) +
             [_riga(a, b) for a, b in CATALOGO_SMARTHER])},
@@ -10938,7 +10167,7 @@ def _registra_fsv_rifiutata(app, codice, prima, n, ip, motivo):
     log.info("FSV dal pannello non riuscito: %s %s -> %s (%s)", codice, prima, n, motivo)
 
 
-SOLO_CASA = "Questa modifica si fa solo da casa, collegato alla rete locale (non da fuori)."
+SOLO_CASA = "Questa modifica non si fa da internet: apri il pannello dal tunnel SSH."
 
 
 def _fuori_casa(gestore, cosa):
@@ -11496,7 +10725,16 @@ def plugin_ricarica(app):
 @api("/api/plugin/stato")
 def api_plugin_stato(app, q):
     """Solo i riquadri dei plugin (stato e contatori): la scheda Integrazioni li rilegge ogni 5 secondi, senza scaricare tutte le impostazioni."""
-    return {"sezioni": sezioni_plugin()}
+    return {"sezioni": plugin_con_base(sezioni_plugin(), app.cfg.leggi())}
+
+
+def plugin_con_base(sezioni, cfg):
+    """Aggiunge ai riquadri dei plugin l'indirizzo da internet: serve sia all'apertura sia all'aggiornamento ogni 5 secondi."""
+    base = indirizzo_pubblico(cfg)
+    for s in sezioni:
+        if s.get("plugin"):
+            s["plugin"]["base"] = base
+    return sezioni
 
 
 @api("/api/plugin/changelog")
@@ -11593,12 +10831,12 @@ def api_plugin_ricarica(app, corpo, h):
 # AGGIORNAMENTO A CALDO: ricarica le parti di interfaccia senza fermare la raccolta dei dati
 # ==========================================================================
 # Il file e' costruito a "parti" (segnalibri #@@PARTE nome@@). Le parti di interfaccia (pagine, API, Impostazioni, Dispositivi,
-# comandi) si possono rieseguire dentro il programma gia' acceso; le altre (nucleo della raccolta, Telegram, tunnel, backup,
+# comandi) si possono rieseguire dentro il programma gia' acceso; le altre (nucleo della raccolta, Telegram, backup,
 # avvio) no: se cambiano serve il riavvio completo. Il server web non si ferma: gli si cambia solo la classe che risponde.
 
 RICARICABILI = ("web", "impostazioni", "dispositivi", "controlli", "plugin")
 NOMI_PARTI = {"nucleo": "nucleo della raccolta dati", "web": "pagine e API", "telegram": "avvisi Telegram",
-              "impostazioni": "Impostazioni", "cloudflare": "tunnel Cloudflare", "manutenzione": "backup e manutenzione",
+              "impostazioni": "Impostazioni", "manutenzione": "backup e manutenzione",
               "dispositivi": "Dispositivi", "controlli": "comandi allo Smarther", "plugin": "plugin e integrazioni", "aggiorna": "aggiornamento a caldo",
               "comandi": "avvio e comandi"}
 _RX_PARTE = re.compile(r"^#@@PARTE (\w+)@@\n", re.M)
@@ -11843,7 +11081,7 @@ def cmd_imposta_password(app):
 
 
 def indirizzi(host, porta, app=None):
-    """Righe da mostrare all'avvio: la rete di casa (quella da usare con l'iPhone) e, se c'e', l'indirizzo Cloudflare.
+    """Righe da mostrare all'avvio: la rete locale e, se c'e', l'indirizzo pubblico.
     L'IP 'di rete' si ricava dalla route verso internet (niente pacchetti inviati davvero), cosi' si evitano
     gli adattatori virtuali di WSL/Hyper-V/VPN."""
     ip = None
@@ -11860,9 +11098,9 @@ def indirizzi(host, porta, app=None):
             ip = None
     out = [f"Rete di casa:    http://{ip}:{porta}" if ip else f"Su questo computer: http://localhost:{porta}"]
     try:
-        cf = app.cfg.leggi().get("cloudflare") or {} if app else {}
-        if cf.get("tunnel_token") and cf.get("hostname"):
-            out.append(f"Da fuori casa:   https://{cf['hostname']}")
+        base = indirizzo_pubblico(app.cfg.leggi()) if app else ""
+        if base:
+            out.append(f"Da internet:     {base}")
     except Exception:
         pass
     return out
@@ -11892,7 +11130,7 @@ def main(argv=None, base=AQUI):
     if not cfg.esiste():
         cfg.crea_modello()
         print(f"Ho creato config.json (vuoto) in:\n  {base}\n"
-              "Aprilo con il Blocco note, compila almeno la sezione smartthings (e netatmo), poi rilancia.")
+              "Aprilo con un editor di testo, compila almeno la sezione smartthings (e netatmo), poi rilancia.")
         if not a.demo:
             return 0
     imposta_log(base)
@@ -11974,7 +11212,6 @@ def main(argv=None, base=AQUI):
             log.error(msg)
             app.ferma()
             return 1
-        avvia_tunnel_se_serve(app)
         try:
             n_plugin = plugin_ricarica(app)
             if n_plugin:
@@ -11992,6 +11229,7 @@ def main(argv=None, base=AQUI):
             print("ATTENZIONE: manca la password. Lancia:  python pdc_pannello.py imposta-password")
         if hasattr(signal, "SIGHUP"):          # solo Linux/macOS: su Windows non esiste, resta il pulsante nella pagina
             signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=aggiorna_da_segnale, args=(app,), daemon=True).start())
+        signal.signal(signal.SIGTERM, signal.default_int_handler)     # «stop» del sistema (systemd): si chiude come con Ctrl+C
         try:
             while True:
                 time.sleep(1)
@@ -12002,8 +11240,6 @@ def main(argv=None, base=AQUI):
             plugin_ferma_tutti()
         except Exception:
             log.exception("arresto dei plugin")
-        if getattr(app, "tunnel", None):
-            app.tunnel.chiudi_con_il_pannello()
         if getattr(app, "telegram", None):
             app.telegram.ferma()
             app.sentinella.fermo.set()

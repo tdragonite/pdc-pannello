@@ -409,7 +409,7 @@ def finestra(q, ora):
     try:
         a = int(float(q.get("a", [ora])[0]))
         da = int(float(q.get("da", [a - 86400])[0]))
-    except ValueError:
+    except (ValueError, OverflowError):
         a, da = ora, ora - 86400
     a = min(a, ora)
     da = max(da, a - 90 * 86400)
@@ -2340,16 +2340,18 @@ CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dat
 
 def ip_client(h):
     ip = h.client_address[0]
-    if ip in ("127.0.0.1", "::1"):  # dietro cloudflared: l'indirizzo vero sta nell'intestazione
+    if ip in ("127.0.0.1", "::1"):  # dietro il reverse proxy (con Cloudflare davanti): l'indirizzo vero sta nell'intestazione
         return h.headers.get("CF-Connecting-IP") or ip
     return ip
 
 
 def da_casa(h):
-    """True solo se la richiesta arriva dalla rete di casa: niente intestazioni del tunnel Cloudflare (le mette sempre
-    lui) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno.
+    """True solo se la richiesta arriva «da casa» (qui: dal tunnel SSH): niente intestazioni di un proxy (le mettono
+    sempre Caddy e Cloudflare) e indirizzo privato o locale. Serve per le modifiche delicate, che da fuori non si fanno.
     Ne esiste una copia in plugin_esempio/analisi.py (_da_casa): un plugin non vede le funzioni del pannello. Se cambi una, cambia anche l'altra."""
-    if any(h.headers.get(x) for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "Cf-Visitor")):
+    # conta la PRESENZA dell'intestazione, anche vuota: un proxy puo' mandarne una senza valore
+    if any(h.headers.get(x) is not None for x in ("CF-Connecting-IP", "CF-Ray", "X-Forwarded-For", "X-Forwarded-Host",
+                                                   "X-Forwarded-Proto", "Cf-Visitor", INTESTAZIONE_PROXY)):
         return False
     try:
         ip = ipaddress.ip_address(h.client_address[0].split("%")[0])
@@ -2358,6 +2360,25 @@ def da_casa(h):
     except ValueError:
         return False
     return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+INTESTAZIONE_PROXY = "X-Pdc-Accesso"
+
+
+def accesso_dal_proxy(h):
+    """True se il reverse proxy dice che il visitatore ha gia' fatto il suo login: serve l'intestazione X-Pdc-Accesso uguale
+    ad accesso.chiave_proxy di config.json (almeno 32 caratteri; vuota = funzione spenta) e la richiesta deve arrivare da
+    questa stessa macchina. Il proxy DEVE sovrascrivere o cancellare sempre l'intestazione mandata dal visitatore.
+    Vale solo come login: da_casa() resta falso (il proxy aggiunge X-Forwarded-For), quindi i comandi di casa restano chiusi."""
+    chiave = str(h.server.app.cfg.leggi()["accesso"].get("chiave_proxy") or "")
+    if len(chiave) < 32:
+        return False
+    try:
+        if not ipaddress.ip_address(h.client_address[0].split("%")[0]).is_loopback:
+            return False
+    except ValueError:
+        return False
+    return hmac.compare_digest(str(h.headers.get(INTESTAZIONE_PROXY) or "").encode(), chiave.encode())
 
 
 def e_https(h):
@@ -2376,7 +2397,7 @@ class Gestore(BaseHTTPRequestHandler):
     def _invia(self, codice, corpo, tipo="text/html; charset=utf-8", extra=None, gz_chiave=None):
         dati = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
         compresso = False
-        # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto via tunnel, dove passano dalla tua linea in upload
+        # testo, JSON, CSV e SVG si comprimono (da 5 a 10 volte più piccoli): conta soprattutto da fuori casa e da telefono
         if (len(dati) > 1024 and tipo.split(";")[0] in TIPI_COMPRIMIBILI and "gzip" in self.headers.get("Accept-Encoding", "")
                 and codice == 200):
             if gz_chiave:       # file fissi (app.js, app.css): si comprimono una volta per versione, non a ogni richiesta
@@ -2488,7 +2509,7 @@ class Gestore(BaseHTTPRequestHandler):
     def _smista(self):
         app = self.server.app
         # Una richiesta con un corpo (POST) che poi nessuno legge lascerebbe quel corpo in coda sulla connessione, e verrebbe scambiato per la
-        # richiesta successiva (dietro il tunnel le connessioni sono condivise tra piu' visitatori): chi legge il corpo per intero rimette False.
+        # richiesta successiva (dietro un reverse proxy le connessioni sono condivise tra piu' visitatori): chi legge il corpo per intero rimette False.
         self._chiudi = self.headers.get("Content-Length", "0").strip() not in ("", "0") or bool(self.headers.get("Transfer-Encoding"))
         try:
             u = urlparse(self.path)
@@ -2497,7 +2518,7 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(503, self._pagina("setup.html"))
             pubbliche = {"/app.css": "text/css; charset=utf-8", "/app.js": "text/javascript; charset=utf-8"}
             if p in pubbliche and p[1:] in WEB_ASSETS:
-                etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta via tunnel)
+                etag = f'"{BUILD}-{p[1:]}"'     # il browser chiede «e' cambiato?» e di solito riceve solo un 304 (conta da fuori casa)
                 # con ?v= uguale alla versione in corso il file non cambia mai: il browser lo tiene senza nemmeno chiedere (un giro in meno)
                 fisso = q.get("v") == [BUILD]
                 extra = [("Cache-Control", "public, max-age=31536000, immutable" if fisso else "no-cache"), ("ETag", etag)]
@@ -2512,7 +2533,10 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._invia(200, favicon(), "image/png", [("Cache-Control", "max-age=86400")])
             if p == "/manifest.webmanifest":
                 return self._invia(200, json.dumps(MANIFEST), "application/manifest+json")
+            dal_proxy = accesso_dal_proxy(self)
             if p == "/login":
+                if dal_proxy:
+                    return self._vai("/")
                 if self.command == "POST":
                     return self._login(app)
                 if not app.demo and app.sessioni.valida(self._cookie("pdc_sid")):
@@ -2522,8 +2546,10 @@ class Gestore(BaseHTTPRequestHandler):
                 return self._webhook_nt(app, p)
             if p.startswith("/plugin/"):      # rotte pubbliche dei plugin (l'autenticazione e' del plugin)
                 return plugin_pubblico(app, self, p, q)
-            autenticato = app.demo or app.sessioni.valida(self._cookie("pdc_sid"))
+            autenticato = app.demo or dal_proxy or app.sessioni.valida(self._cookie("pdc_sid"))
             if p == "/logout" and self.command == "POST":
+                if dal_proxy:           # il login e' del proxy: «Esci» chiude quello (indirizzo del portale AuthCrunch/caddy-security)
+                    return self._vai("/auth/logout")
                 app.sessioni.elimina(self._cookie("pdc_sid"))
                 return self._vai("/login", [("Set-Cookie", "pdc_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")])
             if not autenticato:

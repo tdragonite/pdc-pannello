@@ -68,7 +68,7 @@ def schema_impostazioni():
         ]},
         {"id": "telegram_file", "titolo": "Telegram: credenziali da un tuo file (facoltativo)", "nota": "Se il token e la chat sono già in un tuo "
          "file .json (per esempio quello di un altro bot), scrivi qui dove sta e come si chiamano le chiavi.", "campi": [
-            _c("telegram.file_credenziali", "testo", "Percorso del file", "Per es. C:\\bot\\telegram.json"),
+            _c("telegram.file_credenziali", "testo", "Percorso del file", "Per es. /opt/pdc/telegram.json"),
             _c("telegram.chiave_token", "testo", "Chiave del token nel file", "Per chiavi annidate: a.b"),
             _c("telegram.chiave_chat", "testo", "Chiave della chat nel file"),
         ]},
@@ -117,9 +117,9 @@ def schema_impostazioni():
             _c("netatmo.home_id", "testo", "ID della casa"),
             _c("netatmo.room_id", "testo", "ID della stanza (Smarther)"),
             _c("generale.intervallo_netatmo_secondi", "int", "Leggi lo Smarther ogni (secondi)", min=30, max=3600),
-            _c("netatmo.webhook_attivo", "bool", "Usa i webhook di Netatmo (solo se il tunnel Cloudflare è collegato)",
+            _c("netatmo.webhook_attivo", "bool", "Usa i webhook di Netatmo (serve l’indirizzo pubblico in config.json)",
                "Netatmo avvisa il pannello appena lo Smarther cambia qualcosa, e lo Smarther si legge davvero solo ogni 15 minuti. "
-               "Se il tunnel è spento o qualcosa non torna, il pannello legge come prima."),
+               "Se manca l’indirizzo o qualcosa non torna, il pannello legge come prima."),
         ]},
         {"id": "stazione", "titolo": "Stazione meteo vicina (umidità e sole)", "nota": "Facoltativo. Incolla l'indirizzo dei dati grezzi di una "
          "stazione WeatherLink vicina (non quello della pagina: lo trovi con «python pdc_strumenti.py meteo-prova», che lo stampa pronto da incollare; "
@@ -146,8 +146,10 @@ def schema_impostazioni():
          "metti i tuoi file nella cartella \"dati/loghi\" (smarther.svg, samsung.svg, netatmo.svg, bticino.svg; "
          "vanno bene anche .png).", "campi": [
             _c("dispositivi.ip_pdc", "testo", "IP della pompa di calore", "Per es. 192.168.1.50. SmartThings non lo dice: "
-               "serve solo per mostrarlo e ricavare il MAC."),
+               "serve solo per mostrarlo nella pagina Dispositivi."),
+            _c("dispositivi.mac_pdc", "testo", "MAC della pompa di calore", "Per es. 28:6B:B4:00:00:00. Lo trovi nel router."),
             _c("dispositivi.ip_smarther", "testo", "IP dello Smarther", "Per es. 192.168.1.51."),
+            _c("dispositivi.mac_smarther", "testo", "MAC dello Smarther", "Se lo lasci vuoto si usa quello che comunica Netatmo."),
             _c("dispositivi.modello_smarther", "scelta", "Modello dello Smarther", "Netatmo dice solo \"BNS\": qui scegli "
                "l'articolo che hai (è scritto sulla scatola o sul retro).", opzioni=MODELLI_SMARTHER),
             _c("dispositivi.loghi_bianchi", "bool", "Mostra i loghi in bianco",
@@ -283,11 +285,7 @@ def api_impostazioni(app, q):
                 c["valore"], c["impostato"] = "", bool(v)
             else:
                 c["valore"] = v if v is not None else ("" if c["tipo"] in ("testo", "lungo", "ora", "scelta") else (False if c["tipo"] == "bool" else 0))
-    cf = cfg.get("cloudflare") or {}
-    base = f"https://{cf['hostname']}" if cf.get("tunnel_token") and cf.get("hostname") else ""      # indirizzo da fuori casa, per i plugin
-    for s in sezioni:
-        if s.get("plugin"):
-            s["plugin"]["base"] = base
+    plugin_con_base(sezioni, cfg)
     out = cornice(app, ora)
     out.update({"stato": stato_collegamenti(app, ora), "sezioni": sezioni, "allarmi": allarmi,
                 "utente": cfg["accesso"].get("utente") or ""})
@@ -337,6 +335,11 @@ def _valida(c, v):
             ipaddress.IPv4Address(s)
         except ValueError:
             return None, "Scrivi un indirizzo IP, per es. 192.168.1.50"
+    if c["chiave"] in ("dispositivi.mac_pdc", "dispositivi.mac_smarther") and s:
+        mac = _mac_normale(s)
+        if not mac or len(s) != 17:
+            return None, "Scrivi un indirizzo MAC, per es. 28:6B:B4:00:00:00"
+        return mac, None
     return s, None
 
 

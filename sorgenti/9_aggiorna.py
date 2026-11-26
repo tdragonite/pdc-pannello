@@ -4,12 +4,12 @@
 # AGGIORNAMENTO A CALDO: ricarica le parti di interfaccia senza fermare la raccolta dei dati
 # ==========================================================================
 # Il file e' costruito a "parti" (segnalibri #@@PARTE nome@@). Le parti di interfaccia (pagine, API, Impostazioni, Dispositivi,
-# comandi) si possono rieseguire dentro il programma gia' acceso; le altre (nucleo della raccolta, Telegram, tunnel, backup,
+# comandi) si possono rieseguire dentro il programma gia' acceso; le altre (nucleo della raccolta, Telegram, backup,
 # avvio) no: se cambiano serve il riavvio completo. Il server web non si ferma: gli si cambia solo la classe che risponde.
 
 RICARICABILI = ("web", "impostazioni", "dispositivi", "controlli", "plugin")
 NOMI_PARTI = {"nucleo": "nucleo della raccolta dati", "web": "pagine e API", "telegram": "avvisi Telegram",
-              "impostazioni": "Impostazioni", "cloudflare": "tunnel Cloudflare", "manutenzione": "backup e manutenzione",
+              "impostazioni": "Impostazioni", "manutenzione": "backup e manutenzione",
               "dispositivi": "Dispositivi", "controlli": "comandi allo Smarther", "plugin": "plugin e integrazioni", "aggiorna": "aggiornamento a caldo",
               "comandi": "avvio e comandi"}
 _RX_PARTE = re.compile(r"^#@@PARTE (\w+)@@\n", re.M)

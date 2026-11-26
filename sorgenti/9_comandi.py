@@ -88,7 +88,7 @@ def cmd_imposta_password(app):
 
 
 def indirizzi(host, porta, app=None):
-    """Righe da mostrare all'avvio: la rete di casa (quella da usare con l'iPhone) e, se c'e', l'indirizzo Cloudflare.
+    """Righe da mostrare all'avvio: la rete locale e, se c'e', l'indirizzo pubblico.
     L'IP 'di rete' si ricava dalla route verso internet (niente pacchetti inviati davvero), cosi' si evitano
     gli adattatori virtuali di WSL/Hyper-V/VPN."""
     ip = None
@@ -105,9 +105,9 @@ def indirizzi(host, porta, app=None):
             ip = None
     out = [f"Rete di casa:    http://{ip}:{porta}" if ip else f"Su questo computer: http://localhost:{porta}"]
     try:
-        cf = app.cfg.leggi().get("cloudflare") or {} if app else {}
-        if cf.get("tunnel_token") and cf.get("hostname"):
-            out.append(f"Da fuori casa:   https://{cf['hostname']}")
+        base = indirizzo_pubblico(app.cfg.leggi()) if app else ""
+        if base:
+            out.append(f"Da internet:     {base}")
     except Exception:
         pass
     return out
@@ -137,7 +137,7 @@ def main(argv=None, base=AQUI):
     if not cfg.esiste():
         cfg.crea_modello()
         print(f"Ho creato config.json (vuoto) in:\n  {base}\n"
-              "Aprilo con il Blocco note, compila almeno la sezione smartthings (e netatmo), poi rilancia.")
+              "Aprilo con un editor di testo, compila almeno la sezione smartthings (e netatmo), poi rilancia.")
         if not a.demo:
             return 0
     imposta_log(base)
@@ -219,7 +219,6 @@ def main(argv=None, base=AQUI):
             log.error(msg)
             app.ferma()
             return 1
-        avvia_tunnel_se_serve(app)
         try:
             n_plugin = plugin_ricarica(app)
             if n_plugin:
@@ -237,6 +236,7 @@ def main(argv=None, base=AQUI):
             print("ATTENZIONE: manca la password. Lancia:  python pdc_pannello.py imposta-password")
         if hasattr(signal, "SIGHUP"):          # solo Linux/macOS: su Windows non esiste, resta il pulsante nella pagina
             signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=aggiorna_da_segnale, args=(app,), daemon=True).start())
+        signal.signal(signal.SIGTERM, signal.default_int_handler)     # «stop» del sistema (systemd): si chiude come con Ctrl+C
         try:
             while True:
                 time.sleep(1)
@@ -247,8 +247,6 @@ def main(argv=None, base=AQUI):
             plugin_ferma_tutti()
         except Exception:
             log.exception("arresto dei plugin")
-        if getattr(app, "tunnel", None):
-            app.tunnel.chiudi_con_il_pannello()
         if getattr(app, "telegram", None):
             app.telegram.ferma()
             app.sentinella.fermo.set()

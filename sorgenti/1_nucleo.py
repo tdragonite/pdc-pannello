@@ -7,7 +7,7 @@ Cosa fa:
   - legge a intervalli SmartThings (pompa) e Netatmo (Smarther) e salva tutto in SQLite (dati/pdc.db)
   - decodifica i dati "ehsCycleData" (mandata, ritorno, esterna, portata, Hz, pompa)
   - serve il pannello web (Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni, Changelog)
-  - avvisi Telegram, tunnel Cloudflare, plugin (Alexa, widget), backup e compattazione notturni
+  - avvisi Telegram, plugin (Alexa, widget), backup e compattazione notturni
   - configurazione in config.json (stesso file di pdc_strumenti.py)
 
 Solo libreria standard di Python (3.10 o piu' recente). Tutto vive nella cartella dello script.
@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.26.2"
+VERSIONE = "0.27.0"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -252,10 +252,11 @@ def iso_a_epoch(s):
 # ==========================================================================
 
 TEMPLATE = {
-    "_nota": "File di configurazione: modificalo con il Blocco note e salva; la maggior parte delle "
+    "_nota": "File di configurazione: modificalo con un editor di testo e salva; la maggior parte delle "
              "modifiche vale subito, senza riavviare. Non condividerlo mai (contiene password e token).",
     "generale": {
         "porta": 7000,
+        "indirizzo_pubblico": "",      # es. https://pdc.esempio.it: dove il pannello si raggiunge da internet (dietro un reverse proxy)
         "host": "0.0.0.0",
         "porta_lock": 7099,
         "intervallo_pdc_secondi": 60,
@@ -291,6 +292,7 @@ TEMPLATE = {
         "_nota": "Scrivi utente e password in chiaro qui, al prossimo avvio vengono trasformati in un hash "
                  "e la password in chiaro viene cancellata. Oppure: python pdc_pannello.py imposta-password",
         "utente": "", "password": "", "password_hash": "",
+        "chiave_proxy": "",      # facoltativa (almeno 32 caratteri): login gia' fatto dal reverse proxy, vedi accesso_dal_proxy()
     },
     "smartthings": {
         "device_id": "",
@@ -308,13 +310,12 @@ TEMPLATE = {
                 "expires_at": 0, "home_id": "", "room_id": "",
                 "webhook_attivo": True, "webhook_segreto": ""},
     "dispositivi": {
-        "_nota": "Facoltativo. Gli IP servono solo per mostrare l'IP e ricavare il MAC nella pagina Dispositivi. "
+        "_nota": "Facoltativo. IP e MAC si scrivono a mano e servono solo per mostrarli nella pagina Dispositivi. "
                  "I loghi si mettono nella cartella 'dati/loghi' (smarther.svg, samsung.svg, ...).",
-        "ip_pdc": "", "ip_smarther": "", "modello_smarther": "", "loghi_bianchi": False,
+        "ip_pdc": "", "ip_smarther": "", "mac_pdc": "", "mac_smarther": "", "modello_smarther": "", "loghi_bianchi": False,
     },
     "telegram": {},        # riempito sotto da TELEGRAM_DEFAULT (parte Telegram)
     "allarmi": {},         # idem da ALLARMI_DEFAULT
-    "cloudflare": {},      # idem da CLOUDFLARE_DEFAULT
     "plugin": {},          # una sottosezione per plugin (cartella plugin): {"nome": {"attivo": false, ...}}
     "mappa_ciclo": MAPPA_CICLO_DEFAULT,
 }
@@ -324,7 +325,12 @@ def aggiungi_default_pezzi():
     """I valori predefiniti di Telegram e allarmi sono definiti nella loro parte del file."""
     TEMPLATE["telegram"] = copy.deepcopy(TELEGRAM_DEFAULT)
     TEMPLATE["allarmi"] = copy.deepcopy(ALLARMI_DEFAULT)
-    TEMPLATE["cloudflare"] = copy.deepcopy(CLOUDFLARE_DEFAULT)
+
+
+def indirizzo_pubblico(cfg):
+    """L'indirizzo da internet scritto in config.json (generale.indirizzo_pubblico), senza barra finale; '' se manca o non e' https."""
+    u = str((cfg.get("generale") or {}).get("indirizzo_pubblico") or "").strip().rstrip("/")
+    return u if u.startswith("https://") else ""
 
 
 def unisci(base, extra):
@@ -1225,8 +1231,8 @@ WH_ATTESA_CONFERMA = 15        # secondi: dopo due eventi di setpoint non ordina
 
 
 class WebhookNT(threading.Thread):
-    """Webhook Netatmo: registra il nostro indirizzo (quello del tunnel Cloudflare) e controlla ogni minuto che ci resti.
-    Se qualcosa non va (tunnel spento, registrazione persa, dati che non tornano) il pannello fa come prima: legge lo Smarther
+    """Webhook Netatmo: registra il nostro indirizzo pubblico e controlla ogni due minuti che ci resti.
+    Se qualcosa non va (indirizzo mancante, registrazione persa, dati che non tornano) il pannello fa come prima: legge lo Smarther
     a intervalli. Il silenzio di Netatmo NON e' un problema (gli eventi arrivano solo quando qualcosa cambia): a controllare i dati
     resta sempre la lettura vera ogni 15 minuti."""
 
@@ -1324,12 +1330,9 @@ class WebhookNT(threading.Thread):
         n = self._cfg()
         if not n.get("webhook_attivo", True):
             return self._fuori("spenti nelle impostazioni")
-        tun = tunnel(self.app).stato()
-        if not tun["configurato"]:
-            return self._fuori("tunnel Cloudflare non configurato")
-        if not tun["collegato"]:
-            return self._fuori("tunnel Cloudflare non collegato")
-        base = tun["indirizzo"]
+        base = indirizzo_pubblico(self.app.cfg.leggi())
+        if not base:
+            return self._fuori("manca generale.indirizzo_pubblico (https://...) in config.json")
         url = f"{base}/nt/{self.segreto()}"
         testo = json.dumps(self._api("GET"))
         if url not in testo:

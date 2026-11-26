@@ -8,7 +8,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 
 ## Per cominciare
 
-1. Serve un PC che resta acceso (qui si parla di Windows) con **Python 3.10 o più recente** e un account SmartThings con la pompa dentro. Facoltativi: Netatmo (Smarther), un bot Telegram, un dominio Cloudflare.
+1. Serve un PC che resta acceso (qui si parla di Windows) con **Python 3.10 o più recente** e un account SmartThings con la pompa dentro. Facoltativi: Netatmo (Smarther), un bot Telegram, un reverse proxy per usarlo da fuori.
 2. Metti `pdc_pannello.py` e `pdc_strumenti.py` in una cartella, per esempio `C:\pdc`.
 3. Per provarlo subito con dati finti: `python pdc_pannello.py --demo --porta 7010`, poi apri `http://localhost:7010`.
 4. Per usarlo davvero, segui [docs/installazione.md](docs/installazione.md): collegare SmartThings e Netatmo, scegliere la password, avviarlo.
@@ -20,7 +20,7 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 | [Installazione e primo avvio](docs/installazione.md) | Cosa serve, primo avvio, prova con i dati finti, SmartThings (PAT o OAuth), Netatmo, password, avvio senza finestra |
 | [Le pagine del pannello](docs/pagine.md) | Come leggere Dashboard, Analisi, Efficienza, Dispositivi, Impostazioni e Changelog; usarlo su iPhone |
 | [Comandi e regolazioni](docs/comandi-e-regolazioni.md) | Accendere e spegnere dal pannello, regolazioni della pompa (FSV, acqua calda, boost) |
-| [Telegram e accesso da fuori casa](docs/telegram-e-cloudflare.md) | Gli avvisi su Telegram e il tunnel Cloudflare |
+| [Telegram e accesso da fuori casa](docs/telegram-e-accesso.md) | Gli avvisi su Telegram e l'accesso da internet con un reverse proxy |
 | [Comandi del programma e config.json](docs/configurazione.md) | Tutti i comandi da riga di comando e il file di configurazione spiegato |
 | [Manutenzione, problemi e sicurezza](docs/manutenzione-e-problemi.md) | Cartelle, backup, aggiornamenti, se qualcosa non va, sicurezza |
 | [Plugin, Alexa e widget](docs/plugin.md) | Integrazioni, Routine Alexa, widget per iPhone |
@@ -36,6 +36,6 @@ Tutto sta in **un solo file Python** (`pdc_pannello.py`), senza installare nulla
 - **[pookey/samsung-heatpump-smartthings](https://github.com/pookey/samsung-heatpump-smartthings)**: gli script da cui è partito il progetto.
 - **[Open-Meteo](https://open-meteo.com)**: le previsioni del meteo di oggi (dati con licenza CC BY 4.0), con i modelli ICON-2I ed ECMWF.
 - **WeatherLink**: la pagina pubblica della stazione meteo vicina da cui si legge l'umidità esterna.
-- **Servizi e programmi usati**: SmartThings (Samsung), Netatmo e lo Smarther 2 (BTicino), Telegram, Cloudflare e il suo `cloudflared`, Alexa (Amazon) e l'app Scriptable per il widget.
+- **Servizi e programmi usati**: SmartThings (Samsung), Netatmo e lo Smarther 2 (BTicino), Telegram, Alexa (Amazon) e l'app Scriptable per il widget.
 
 I nomi e i marchi appartengono ai rispettivi proprietari; questo progetto non è affiliato a nessuno di loro.
