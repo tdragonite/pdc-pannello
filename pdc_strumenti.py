@@ -581,6 +581,18 @@ class _DbSolaLettura:
         import sqlite3
         return sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
 
+    def tutti(self, sql, *args):
+        """Restituisce tutte le righe di una query."""
+        from contextlib import closing
+        with closing(self._c()) as c:
+            return c.execute(sql, args).fetchall()
+
+    def uno(self, sql, *args):
+        """Restituisce la prima riga di una query."""
+        from contextlib import closing
+        with closing(self._c()) as c:
+            return c.execute(sql, args).fetchone()
+
 
 def _db_leggibile(path):
     """Apre il database in sola lettura (anche con il pannello acceso); se non si riesce, lavora su una copia temporanea,
