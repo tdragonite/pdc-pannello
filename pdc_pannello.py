@@ -24,7 +24,7 @@ Comandi:
     python pdc_pannello.py esporta-diagnostica  crea diagnostica.json (da allegare in chat se serve)
 """
 
-VERSIONE = "0.27.0"
+VERSIONE = "0.27.1"
 PASSWORD_MIN = 10        # lunghezza minima della password del pannello
 
 import argparse
@@ -3337,13 +3337,16 @@ window.addEventListener('scroll', chiudiPannelli, {passive: true});
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
+  ['server', 'Il pannello su un server', 'Non serve più un PC acceso in casa: gira su un server Linux, senza tunnel Cloudflare, e le regolazioni della pompa si cambiano solo dal tunnel SSH.'],
   ['webhook', 'Smarther in tempo reale', 'Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
   ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
   ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo dal tunnel SSH, con lucchetto e conferma.'],
-  ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
+const CL_IC = {server: '☁', euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
+  {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro di avvio più pulito', righe: [
+    ['m', 'Righe di avvio', 'Via il blocco senza data con «localhost»: l’avvio finisce con una sola riga, «Pannello pronto», con l’indirizzo pubblico (o quello locale se non c’è). I plugin avviati stanno in una riga sola.'],
+  ]},
   {v: '0.27.0', quando: '26 novembre 2026', titolo: 'Versione per il server', righe: [
     ['m', 'Niente più tunnel Cloudflare', 'Il pannello gira su un server dietro un reverse proxy: tolti la procedura guidata, i comandi del tunnel e il programma cloudflared.'],
     ['m', 'IP e MAC scritti a mano', 'Il server non è nella rete di casa: il MAC non si cerca più, si scrive in Impostazioni → Dispositivi accanto all’IP.'],
@@ -8237,9 +8240,9 @@ def avvia_telegram_e_sentinella(app):
     app.sentinella.start()
     ok, err = (app.telegram.attivo(), app.telegram.credenziali()[2])
     if app.cfg.leggi()["telegram"]["abilitato"] and not ok:
-        log.info("Telegram non attivo: %s", err)
+        log.info("Telegram: avvisi non attivi (%s)", err)
     elif ok:
-        log.info("Telegram attivo.")
+        log.info("Telegram: avvisi attivi")
 
 #@@PARTE impostazioni@@
 # ==========================================================================
@@ -10664,7 +10667,6 @@ def _avvia_plugin(app, p):
         p.stato, p.errore, p.avviato = "errore", esito["errore"], False
         return
     p.ctx, p.avviato, p.stato, p.errore = ctx, True, "attivo", ""
-    log.info("Plugin %s avviato", p.nome)
 
 
 def _ferma_plugin(p):
@@ -10688,16 +10690,21 @@ def plugin_sincronizza(app):
     """Accende i plugin con l'interruttore su «attivo», spegne gli altri."""
     with _lock_plugin:
         sal = app.cfg.leggi().get("plugin") or {}
+        nuovi = []
         for p in PLUGIN.values():
             if p.modulo is None:
                 continue
             voglio = bool((sal.get(p.nome) or {}).get("attivo"))
             if voglio and not p.avviato:
                 _avvia_plugin(app, p)
+                if p.avviato:
+                    nuovi.append(p.nome)
             elif not voglio and p.avviato:
                 _ferma_plugin(p)
             elif not voglio and p.stato == "errore" and p.modulo is not None:
                 p.stato, p.errore = "spento", ""
+        if nuovi:
+            log.info("Plugin avviati (%d): %s", len(nuovi), ", ".join(nuovi))
 
 
 def plugin_ferma_tutti():
@@ -11081,10 +11088,16 @@ def cmd_imposta_password(app):
     print(f"Fatto: utente '{utente}' e password salvati (la password e' conservata solo come hash).")
 
 
-def indirizzi(host, porta, app=None):
-    """Righe da mostrare all'avvio: la rete locale e, se c'e', l'indirizzo pubblico.
+def riga_pronto(host, porta, app=None):
+    """L'ultima riga dell'avvio: l'indirizzo pubblico se impostato, altrimenti quello della rete locale (o di questo computer).
     L'IP 'di rete' si ricava dalla route verso internet (niente pacchetti inviati davvero), cosi' si evitano
     gli adattatori virtuali di WSL/Hyper-V/VPN."""
+    try:
+        base = indirizzo_pubblico(app.cfg.leggi()) if app else ""
+    except Exception:
+        base = ""
+    if base:
+        return f"Pannello pronto: {base} (porta interna {porta})"
     ip = None
     if host not in ("127.0.0.1", "localhost", "::1"):  # in ascolto solo su questo computer: la rete di casa non arriva
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -11097,14 +11110,7 @@ def indirizzi(host, porta, app=None):
             s.close()
         if ip and ip.startswith(("127.", "169.254.")):
             ip = None
-    out = [f"Rete di casa:    http://{ip}:{porta}" if ip else f"Su questo computer: http://localhost:{porta}"]
-    try:
-        base = indirizzo_pubblico(app.cfg.leggi()) if app else ""
-        if base:
-            out.append(f"Da internet:     {base}")
-    except Exception:
-        pass
-    return out
+    return f"Pannello pronto: http://{ip or 'localhost'}:{porta}"
 
 
 def main(argv=None, base=AQUI):
@@ -11214,9 +11220,7 @@ def main(argv=None, base=AQUI):
             app.ferma()
             return 1
         try:
-            n_plugin = plugin_ricarica(app)
-            if n_plugin:
-                log.info("Plugin trovati: %d", n_plugin)
+            plugin_ricarica(app)
         except Exception:
             log.exception("caricamento dei plugin fallito (il pannello parte lo stesso)")
         try:
@@ -11224,10 +11228,9 @@ def main(argv=None, base=AQUI):
         except Exception:
             log.exception("boost: ripresa dopo il riavvio")
         porta = srv.server_address[1]
-        log.info("Interfaccia web attiva sulla porta %s", porta)
-        print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))
+        log.info("%s", riga_pronto(srv.server_address[0], porta, app))
         if not a.demo and not accesso_configurato(app):
-            print("ATTENZIONE: manca la password. Lancia:  python pdc_pannello.py imposta-password")
+            log.warning("Manca la password del pannello. Si imposta con:  python3 pdc_pannello.py imposta-password")
         if hasattr(signal, "SIGHUP"):          # solo Linux/macOS: su Windows non esiste, resta il pulsante nella pagina
             signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=aggiorna_da_segnale, args=(app,), daemon=True).start())
         signal.signal(signal.SIGTERM, signal.default_int_handler)     # «stop» del sistema (systemd): si chiude come con Ctrl+C

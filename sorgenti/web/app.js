@@ -1128,13 +1128,16 @@ window.addEventListener('scroll', chiudiPannelli, {passive: true});
 // Ogni riga: [tipo, titoletto, frase]  con tipo n = Novità, m = Migliorato, s = Sistemato. Una frase sola.
 const CL_TIPI = {n: 'Novità', m: 'Migliorato', s: 'Sistemato'};
 const CL_BREVE = [
+  ['server', 'Il pannello su un server', 'Non serve più un PC acceso in casa: gira su un server Linux, senza tunnel Cloudflare, e le regolazioni della pompa si cambiano solo dal tunnel SSH.'],
   ['webhook', 'Smarther in tempo reale', 'Netatmo avvisa il pannello appena lo Smarther cambia: i valori arrivano in circa un secondo e le letture a vuoto spariscono.'],
   ['fin', 'Finestre aperte', 'Analisi: il pannello riconosce da solo i cali da finestra aperta, li segna con una fascia verde e impara dalle tue conferme.'],
   ['reg', 'Regolazioni della pompa', 'Dispositivi → Regolazioni: cambi gli FSV, l’acqua calda e il modo della pompa, solo dal tunnel SSH, con lucchetto e conferma.'],
-  ['boost', 'Boost acqua calda', 'Con un tocco porta l’acqua all’obiettivo, poi ripristina le impostazioni di prima.'],
 ];
-const CL_IC = {euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
+const CL_IC = {server: '☁', euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
+  {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro di avvio più pulito', righe: [
+    ['m', 'Righe di avvio', 'Via il blocco senza data con «localhost»: l’avvio finisce con una sola riga, «Pannello pronto», con l’indirizzo pubblico (o quello locale se non c’è). I plugin avviati stanno in una riga sola.'],
+  ]},
   {v: '0.27.0', quando: '26 novembre 2026', titolo: 'Versione per il server', righe: [
     ['m', 'Niente più tunnel Cloudflare', 'Il pannello gira su un server dietro un reverse proxy: tolti la procedura guidata, i comandi del tunnel e il programma cloudflared.'],
     ['m', 'IP e MAC scritti a mano', 'Il server non è nella rete di casa: il MAC non si cerca più, si scrive in Impostazioni → Dispositivi accanto all’IP.'],

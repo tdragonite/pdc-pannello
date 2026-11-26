@@ -87,10 +87,16 @@ def cmd_imposta_password(app):
     print(f"Fatto: utente '{utente}' e password salvati (la password e' conservata solo come hash).")
 
 
-def indirizzi(host, porta, app=None):
-    """Righe da mostrare all'avvio: la rete locale e, se c'e', l'indirizzo pubblico.
+def riga_pronto(host, porta, app=None):
+    """L'ultima riga dell'avvio: l'indirizzo pubblico se impostato, altrimenti quello della rete locale (o di questo computer).
     L'IP 'di rete' si ricava dalla route verso internet (niente pacchetti inviati davvero), cosi' si evitano
     gli adattatori virtuali di WSL/Hyper-V/VPN."""
+    try:
+        base = indirizzo_pubblico(app.cfg.leggi()) if app else ""
+    except Exception:
+        base = ""
+    if base:
+        return f"Pannello pronto: {base} (porta interna {porta})"
     ip = None
     if host not in ("127.0.0.1", "localhost", "::1"):  # in ascolto solo su questo computer: la rete di casa non arriva
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -103,14 +109,7 @@ def indirizzi(host, porta, app=None):
             s.close()
         if ip and ip.startswith(("127.", "169.254.")):
             ip = None
-    out = [f"Rete di casa:    http://{ip}:{porta}" if ip else f"Su questo computer: http://localhost:{porta}"]
-    try:
-        base = indirizzo_pubblico(app.cfg.leggi()) if app else ""
-        if base:
-            out.append(f"Da internet:     {base}")
-    except Exception:
-        pass
-    return out
+    return f"Pannello pronto: http://{ip or 'localhost'}:{porta}"
 
 
 def main(argv=None, base=AQUI):
@@ -220,9 +219,7 @@ def main(argv=None, base=AQUI):
             app.ferma()
             return 1
         try:
-            n_plugin = plugin_ricarica(app)
-            if n_plugin:
-                log.info("Plugin trovati: %d", n_plugin)
+            plugin_ricarica(app)
         except Exception:
             log.exception("caricamento dei plugin fallito (il pannello parte lo stesso)")
         try:
@@ -230,10 +227,9 @@ def main(argv=None, base=AQUI):
         except Exception:
             log.exception("boost: ripresa dopo il riavvio")
         porta = srv.server_address[1]
-        log.info("Interfaccia web attiva sulla porta %s", porta)
-        print("Interfaccia web pronta:\n  " + "\n  ".join(indirizzi(srv.server_address[0], porta, app)))
+        log.info("%s", riga_pronto(srv.server_address[0], porta, app))
         if not a.demo and not accesso_configurato(app):
-            print("ATTENZIONE: manca la password. Lancia:  python pdc_pannello.py imposta-password")
+            log.warning("Manca la password del pannello. Si imposta con:  python3 pdc_pannello.py imposta-password")
         if hasattr(signal, "SIGHUP"):          # solo Linux/macOS: su Windows non esiste, resta il pulsante nella pagina
             signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=aggiorna_da_segnale, args=(app,), daemon=True).start())
         signal.signal(signal.SIGTERM, signal.default_int_handler)     # «stop» del sistema (systemd): si chiude come con Ctrl+C

@@ -188,7 +188,6 @@ def _avvia_plugin(app, p):
         p.stato, p.errore, p.avviato = "errore", esito["errore"], False
         return
     p.ctx, p.avviato, p.stato, p.errore = ctx, True, "attivo", ""
-    log.info("Plugin %s avviato", p.nome)
 
 
 def _ferma_plugin(p):
@@ -212,16 +211,21 @@ def plugin_sincronizza(app):
     """Accende i plugin con l'interruttore su «attivo», spegne gli altri."""
     with _lock_plugin:
         sal = app.cfg.leggi().get("plugin") or {}
+        nuovi = []
         for p in PLUGIN.values():
             if p.modulo is None:
                 continue
             voglio = bool((sal.get(p.nome) or {}).get("attivo"))
             if voglio and not p.avviato:
                 _avvia_plugin(app, p)
+                if p.avviato:
+                    nuovi.append(p.nome)
             elif not voglio and p.avviato:
                 _ferma_plugin(p)
             elif not voglio and p.stato == "errore" and p.modulo is not None:
                 p.stato, p.errore = "spento", ""
+        if nuovi:
+            log.info("Plugin avviati (%d): %s", len(nuovi), ", ".join(nuovi))
 
 
 def plugin_ferma_tutti():

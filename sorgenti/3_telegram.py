@@ -727,7 +727,7 @@ def avvia_telegram_e_sentinella(app):
     app.sentinella.start()
     ok, err = (app.telegram.attivo(), app.telegram.credenziali()[2])
     if app.cfg.leggi()["telegram"]["abilitato"] and not ok:
-        log.info("Telegram non attivo: %s", err)
+        log.info("Telegram: avvisi non attivi (%s)", err)
     elif ok:
-        log.info("Telegram attivo.")
+        log.info("Telegram: avvisi attivi")
 
