@@ -3347,6 +3347,7 @@ const CL_BREVE = [
 const CL_IC = {server: '☁', euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
   {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro più chiaro', righe: [
+    ['s', 'Finto «Riposo» nella barra', 'Quando la pompa passava dall’acqua calda al riscaldamento, il pannello poteva scartare un dato buono del compressore e mostrare 5 minuti di riposo mai avvenuti. Corretto anche nei giorni passati (28 novembre).'],
     ['m', 'Righe di avvio', 'Via il blocco senza data con «localhost»: l’avvio finisce con una sola riga, «Pannello pronto», con l’indirizzo pubblico (o quello locale se non c’è). I plugin avviati stanno in una riga sola.'],
     ['s', 'Iscrizione ai webhook', 'All’avvio il registro dice anche quando l’iscrizione a Netatmo c’è già («iscrizione già presente»): prima scriveva qualcosa solo quando doveva iscriversi.'],
   ]},
@@ -4891,8 +4892,9 @@ MODI = ("casa", "acs", "riposo", "nodati")
 
 def campioni_freq(db, da, a, soglia=5.0):
     """{ts: Hz} del compressore, senza i campioni 'fantasma': ogni tanto SmartThings consegna un campione di ciclo con Hz>0
-    e mandata alta mentre l'acqua dell'impianto (INDOOR, in tempo reale) dice che la pdc e' ferma da minuti. Se la mandata del
-    campione e' lontana piu' di 'soglia' gradi dall'acqua misurata nello stesso momento, il campione con Hz>0 si scarta."""
+    e mandata alta mentre l'acqua dell'impianto (INDOOR, in tempo reale) dice che la pdc e' ferma da minuti. Il campione con
+    Hz>0 si scarta se la sua mandata e' lontana piu' di 'soglia' gradi da TUTTE le letture dell'acqua nei 2 minuti prima e dopo.
+    Una sola lettura non basta: quando la valvola cambia, l'acqua crolla di 15 gradi in pochi secondi."""
     freq = dict(q_serie(db, "ciclo.freq_compressore", da, a))
     if not any(v > 0 for v in freq.values()):
         return freq
@@ -4904,12 +4906,8 @@ def campioni_freq(db, da, a, soglia=5.0):
     for ts, hz in list(freq.items()):
         if hz <= 0 or ts not in mandata:
             continue
-        i = bisect.bisect_left(at, ts)
-        vicini = [acqua[j] for j in (i - 1, i) if 0 <= j < len(acqua) and abs(acqua[j][0] - ts) <= 120]
-        if not vicini:
-            continue
-        v = min(vicini, key=lambda x: abs(x[0] - ts))[1]
-        if abs(mandata[ts] - v) > soglia:
+        vicine = [v for _, v in acqua[bisect.bisect_left(at, ts - 120):bisect.bisect_right(at, ts + 120)]]
+        if vicine and all(abs(mandata[ts] - v) > soglia for v in vicine):
             freq[ts] = 0.0
     return freq
 

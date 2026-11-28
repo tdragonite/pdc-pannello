@@ -20,7 +20,7 @@ SmartThings, due componenti: `main` (ACS/sistema) e `INDOOR` (circuito riscaldam
   - outdoor_28: 0-1 Hz compressore, 2-3 Hz target, **4 gas di scarico** (0.22.2), 6 evaporazione, 7 aspirazione, 8 esterna.
   - indoor_31: 2 ritorno, 3 mandata, 6-7 portata (16 bit, /10 L/min; sopra 60 L/min = campione corrotto, scartato), 8 velocita' pompa %, 27 bollitore.
   - Non decifrati: outdoor 9-19, 22-27; indoor 0-1, 4-5, 9-26, 28-30. Il «target» mandata non e' visibile da SmartThings (servirebbe leggere il bus NASA con ESP32+RS485: non ora).
-  - Campioni «fantasma»: Hz > 0 con mandata lontana di >4-5 gradi dall'acqua misurata; `campioni_freq` li azzera (non nei grafici di Analisi, che mostrano il grezzo).
+  - Campioni «fantasma»: Hz > 0 con mandata lontana di >5 gradi da tutte le letture dell'acqua nei 2 minuti prima e dopo; `campioni_freq` li azzera (non nei grafici di Analisi, che mostrano il grezzo).
 - Netatmo (Smarther BNS, una stanza): `therm_measured_temperature`, `therm_setpoint_temperature`, `humidity`, `heating_power_request`, `therm_setpoint_mode`, `boiler_status`. Spento in due modi (casa `hg` dal pannello, stanza `hg` dall'app). Comandi: spegni = `setthermmode hg`; accendi = `schedule` + stanza `home`, sempre verificati dopo 3 s. Il refresh token ruota.
 - Serie nel DB: `misure` (acs.*, risc.*, pot.watt, en.*, ciclo.*, casa.*), `stati` (cambi testuali: pdc.*, risc.*, casa.modo, fsv.NNNN, registri `cmd.*`, `fsvmod.*`, `regmod.*`, `boost.attivo`), `ultimo`, `ciclo` (blob grezzi), `eventi`, `sessioni`, `meta`.
 

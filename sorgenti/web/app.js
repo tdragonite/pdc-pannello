@@ -1136,6 +1136,7 @@ const CL_BREVE = [
 const CL_IC = {server: '☁', euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
   {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro più chiaro', righe: [
+    ['s', 'Finto «Riposo» nella barra', 'Quando la pompa passava dall’acqua calda al riscaldamento, il pannello poteva scartare un dato buono del compressore e mostrare 5 minuti di riposo mai avvenuti. Corretto anche nei giorni passati (28 novembre).'],
     ['m', 'Righe di avvio', 'Via il blocco senza data con «localhost»: l’avvio finisce con una sola riga, «Pannello pronto», con l’indirizzo pubblico (o quello locale se non c’è). I plugin avviati stanno in una riga sola.'],
     ['s', 'Iscrizione ai webhook', 'All’avvio il registro dice anche quando l’iscrizione a Netatmo c’è già («iscrizione già presente»): prima scriveva qualcosa solo quando doveva iscriversi.'],
   ]},
