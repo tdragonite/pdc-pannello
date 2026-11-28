@@ -173,8 +173,7 @@ def main(argv=None, base=AQUI):
         cmd_compatta(app)
         return 0
     if a.comando == "backup":
-        cmd_backup(app)
-        return 0
+        return cmd_backup(app)
     if a.comando == "ripristina":
         return cmd_ripristina(app)
     if a.comando == "telegram-prova":

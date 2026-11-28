@@ -159,10 +159,10 @@ def schema_impostazioni():
          "il calo di temperatura di notte in watt.", "campi": [
             _c("bollitore.litri", "int", "Litri del bollitore", "Per es. 300.", min=50, max=2000),
         ]},
-        {"id": "backup", "titolo": "Backup", "nota": "Ogni notte il pannello copia database e config.json nella cartella \"dati/backup\". "
-         " Per rimettere una copia: python pdc_pannello.py ripristina (a pannello fermo).", "campi": [
+        {"id": "backup", "titolo": "Backup", "nota": "Ogni notte il pannello fa un pacchetto .tar.xz con database, config.json, plugin e loghi nella cartella \"dati/backup\"; "
+         "se in config.json è indicato un bucket lo carica lì e cancella la copia locale. Per rimettere una copia: python pdc_pannello.py ripristina (a pannello fermo).", "campi": [
             _c("backup.attivo", "bool", "Backup automatico notturno"),
-            _c("backup.copie", "int", "Quante copie tenere", "Le più vecchie vengono cancellate.", min=1, max=60),
+            _c("backup.copie", "int", "Quante copie tenere sul disco", "Le più vecchie vengono cancellate. Con il bucket è il tetto delle copie non ancora caricate (la scadenza di quelle caricate la decide il bucket).", min=1, max=60),
         ]},
         {"id": "storico", "titolo": "Storico dei dati", "nota": "Più indietro dei giorni indicati tengo una media ogni N "
          "minuti invece di un punto al minuto: i grafici vecchi restano ma il database non cresce all'infinito.", "campi": [
@@ -472,12 +472,13 @@ def api_registro(app, q):
     dbp = str(app.db.path)
     cfg_b = app.cfg.leggi().get("backup") or {}
     cart = cartella_backup(app)
-    copie = sorted(cart.glob("pdc-*.db")) if cart.is_dir() else []
+    copie = pacchetti(cart) if cart.is_dir() else []
     return {
         "righe": leggi_coda_log(base / "log" / "pdc_pannello.log", n),
         "db_byte": peso(dbp) + peso(dbp + "-wal"), "log_byte": peso(base / "log" / "pdc_pannello.log"),
         "backup_ts": float(app.db.meta_get("backup_ts", 0) or 0) or None,
-        "backup_copie": len(copie), "backup_attivo": bool(cfg_b.get("attivo", True)),
+        "backup_copie": len(copie), "backup_bucket": bool(cfg_b.get("bucket")),
+        "backup_errore": float(app.db.meta_get("backup_errore", 0) or 0) or None, "backup_attivo": bool(cfg_b.get("attivo", True)),
         "versione": VERSIONE, "avviato": int(AVVIO), "ora": int(time.time()),
     }
 
@@ -499,13 +500,14 @@ def reset_database(app, corpo, h):
         time.sleep(1.0)
         return {"ok": False, "messaggio": "La password non è corretta: non ho cancellato niente."}
     cart = cartella_backup(app)
-    copia = cart / f"prima-del-reset-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    copia = cart / f"prima-del-reset-{time.strftime('%d-%m-%Y-%H%M%S')}.db"
     try:
         cart.mkdir(parents=True, exist_ok=True)
         with closing(app.db._c()) as src, closing(sqlite3.connect(str(copia))) as dst:
             src.backup(dst)
         if not copia.exists() or copia.stat().st_size < 4096:
             raise OSError("la copia è vuota")
+        copia = comprimi_db(copia)
     except Exception as e:
         copia.unlink(missing_ok=True)
         log.error("Reset database annullato: copia non riuscita (%s)", e)

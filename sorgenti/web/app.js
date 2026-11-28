@@ -948,7 +948,9 @@ const righeRegistro = d => d.righe.filter(r => !S.solo || ['WARNING', 'ERROR', '
 function disegnaRegistro() {
   const box = $('#reg'), d = S.reg; if (!box || !d) return;
   const righe = righeRegistro(d);
-  const bk = !d.backup_attivo ? 'spento' : d.backup_ts ? `${esc(dataLunga(d.backup_ts))} · ${d.backup_copie} copie` : 'ancora nessuno';
+  const dove = d.backup_bucket ? `nel bucket${d.backup_copie ? ` · ${d.backup_copie} in attesa` : ''}` : `${d.backup_copie} copie`;
+  const bk = !d.backup_attivo ? 'spento' : (d.backup_ts ? `${esc(dataLunga(d.backup_ts))} · ${dove}` : 'ancora nessuno')
+    + (d.backup_errore ? ` · <b>NON riuscito ${esc(dataLunga(d.backup_errore))}</b>` : '');
   const sc = box.querySelector('.reg-log'), inFondo = !sc || sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 24;
   box.innerHTML = `<article class="card"><div class="ch"><h2>Registro del pannello</h2>
       <div class="azioni-t"><button type="button" class="sec" id="reg-agg">Aggiorna</button><button type="button" class="sec" id="reg-copia">Copia</button></div></div>
@@ -1136,6 +1138,7 @@ const CL_BREVE = [
 const CL_IC = {server: '☁', euro: '€', refresh: '↻', ora: '◷', tipici: '≈', avviso: '!', sbr: '❄', login: '🔑', plugin: '🧩', reg: '✎', boost: '⚡', indietro: '⇤', fin: '▣', webhook: '⇄'};
 const CHANGELOG = [
   {v: '0.27.1', quando: '26 novembre 2026', titolo: 'Registro più chiaro', righe: [
+    ['m', 'Backup più piccoli, anche nel cloud', 'Il backup notturno è un solo pacchetto .tar.xz (database, impostazioni, plugin e loghi), grande circa un decimo del database. Si può indicare un bucket (con rclone): il pacchetto va lì, il primo del mese anche in «mensili», e la copia sul disco si cancella; se non riesce resta e si riprova. Registro e pagina Registro dicono dove è finito o perché non è riuscito. Anche le copie fatte prima di un reset o di un ripristino sono compresse. Le copie .db di prima non si ripristinano più da qui (28 novembre).'],
     ['s', 'Finto «Riposo» nella barra', 'Quando la pompa passava dall’acqua calda al riscaldamento, il pannello poteva scartare un dato buono del compressore e mostrare 5 minuti di riposo mai avvenuti. Corretto anche nei giorni passati (28 novembre).'],
     ['m', 'Righe di avvio', 'Via il blocco senza data con «localhost»: l’avvio finisce con una sola riga, «Pannello pronto», con l’indirizzo pubblico (o quello locale se non c’è). I plugin avviati stanno in una riga sola.'],
     ['s', 'Iscrizione ai webhook', 'All’avvio il registro dice anche quando l’iscrizione a Netatmo c’è già («iscrizione già presente»): prima scriveva qualcosa solo quando doveva iscriversi.'],

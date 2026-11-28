@@ -11,7 +11,7 @@ python pdc_pannello.py stato                ultimi valori salvati e anomalie ape
 python pdc_pannello.py imposta-password     scegli utente e password
 python pdc_pannello.py telegram-prova       manda un messaggio di prova
 python pdc_pannello.py compatta             compatta ora lo storico vecchio
-python pdc_pannello.py backup               copia ora database e config.json nella cartella dati/backup
+python pdc_pannello.py backup               fa ora il pacchetto di backup (.tar.xz) e, se c’è un bucket, lo carica
 python pdc_pannello.py ripristina           rimette una copia di backup o una fatta prima di un reset (a pannello fermo)
 python pdc_pannello.py ridecodifica         rifà la lettura dei dati grezzi del ciclo
 python pdc_pannello.py esporta-diagnostica  crea un file di diagnosi da mandare a chi ti aiuta
@@ -42,7 +42,7 @@ I comandi «da guardare» (`stato`, `telegram-prova`…) si lanciano a mano con 
 | `umidita` | `giallo` (60), `rosso` (70), `minuti` (30), `rientro_punti` (2): le soglie dell'umidità, uniche per Telegram, Dashboard e grafico |
 | `tariffa` | `prezzo_kwh`: euro per kWh (0 = non mostrare i costi) |
 | `bollitore` | `litri` (300): serve per la salute del bollitore |
-| `backup` | `attivo`, `cartella` (`dati/backup`), `copie` (quante tenerne, 7) |
+| `backup` | `attivo`, `cartella` (`dati/backup`), `copie` (copie sul disco, 7), `bucket` (destinazione di rclone, vuoto = solo disco), `rclone_config` |
 | `conservazione` | quanti giorni di dati dettagliati tenere (365) e ogni quanti minuti fare la media dopo (15); `elimina_dati_grezzi_ciclo` (sì) toglie i byte grezzi del ciclo quando compatta |
 | `plugin` | un riquadro per plugin: `attivo` (spento di partenza) e i campi che il plugin dichiara. Per Alexa: `segreto`, `skill_id`, `verifica_firma` (vedi [plugin.md](plugin.md)). Si cambiano da *Impostazioni → Integrazioni* |
 | `mappa_ciclo` | come si leggono i dati grezzi del compressore (non toccarla se non te lo chiede chi ti aiuta) |
